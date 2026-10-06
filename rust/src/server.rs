@@ -64,20 +64,6 @@ impl Tools {
             false,
         );
         add(
-            "get_memo",
-            "Read an explicitly saved session memo.",
-            json!({"session_id":sid}),
-            &["session_id"],
-            true,
-        );
-        add(
-            "set_memo",
-            "Replace the explicit session memo, up to 64 KiB.",
-            json!({"session_id":sid,"text":string}),
-            &["session_id", "text"],
-            false,
-        );
-        add(
             "run_command",
             "Run persistent argv in this session; omitted command reuses its interactive shell. Selects the returned job for session-only stdin/output/stop. Other commands keep running. FULL service-user filesystem/network access without sandbox or approval. Use execute for sandboxed commands.",
             json!({"session_id":sid,"command":{"type":"array","items":string,"minItems":1,"maxItems":256},"cwd":string,"max_output_bytes":output}),
@@ -106,8 +92,15 @@ impl Tools {
             false,
         );
         add(
+            "resize_command",
+            "Resize the selected command terminal in this session (optional job_id). Does not restart the command.",
+            json!({"session_id":sid,"job_id":sid,"rows":{"type":"integer","minimum":1,"maximum":1000},"cols":{"type":"integer","minimum":1,"maximum":1000}}),
+            &["session_id", "rows", "cols"],
+            false,
+        );
+        add(
             "close_session",
-            "Stop all managed terminals/commands in this session and remove session/memo metadata. Other sessions remain. Refuses while ordinary sandboxed jobs remain tracked.",
+            "Stop all managed terminals/commands in this session and remove session metadata. Other sessions remain. Refuses while ordinary sandboxed jobs remain tracked.",
             json!({"session_id":sid}),
             &["session_id"],
             false,
@@ -198,7 +191,7 @@ impl ServerHandler for Tools {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-            .with_instructions("Create or connect a session; its persistent terminal is managed automatically. Use session_id with run_command, read_output, send_stdin and stop_command. Omit command in run_command to reuse the interactive shell. The most recent run selects the default job; use job_id for concurrent commands. These terminal tools have full OS-user/filesystem/network rights without a sandbox or approval. execute/start_command keep their sandbox contract and process-local job handles. Save a memo for handover; close_session ends all terminals in that session.")
+            .with_instructions("Create or connect a session; its persistent terminal is managed automatically. Use session_id with run_command, read_output, send_stdin and stop_command. Omit command in run_command to reuse the interactive shell. The most recent run selects the default job; use job_id for concurrent commands. These terminal tools have full OS-user/filesystem/network rights without a sandbox or approval. execute/start_command keep their sandbox contract and process-local job handles. Use ordinary files for handover; close_session ends all terminals in that session.")
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tools.iter().find(|t| t.name == name).cloned()

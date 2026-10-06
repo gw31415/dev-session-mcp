@@ -1,14 +1,16 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.54s
-     Running tests/stdio_smoke.rs (vendor/local-mcp/target/debug/deps/stdio_smoke-8a04cf7da51648bc)
+   Compiling dev-session-mcp v0.2.0 (/workspace/dev-session-mcp/rust)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.52s
+     Running tests/stdio_smoke.rs (vendor/local-mcp/target/debug/deps/stdio_smoke-a40ce5685066b5be)
 
 running 1 test
-PASS actual dev-session-mcp stdio identity and official Rust SDK: 20 tools; no Node/HTTP/OAuth fixture
-PASS stdio session/memo and real sandbox command/file read-write-edit
+PASS actual dev-session-mcp stdio identity and official Rust SDK: 19 tools; no Node/HTTP/OAuth fixture
+PASS stdio session/files and real sandbox command/file read-write-edit
 PASS automatic session shell/reuse, session-only stdin/output, separate sessions and multiple in-flight commands without cross-talk
-PASS Rust stdio actual exit/replacement, session/memo/tmux reconnect, live stdin and stop
+PASS private PTY holder survives real frontend exit; detached completion retains final output/exit 9 and reconnect never reexecutes command; real resize verified
+PASS Rust stdio actual exit/replacement, session/PTY broker reconnect, live stdin and stop
 PASS individual command stop preserves other work; session close isolates other sessions; closed-session calls and stale job IDs rejected after recreate
 PASS stdio output cap/exit, clean shell environment, explicit close and transport-env rejection
 PASS real clean-env launcher body starts Rust stdio with incoming fake Tunnel credentials removed; UID transition not tested
 test rust_stdio_tools_and_reconnect_without_node_or_oauth ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.50s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.63s

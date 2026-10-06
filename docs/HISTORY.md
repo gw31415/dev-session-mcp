@@ -13,6 +13,7 @@ git show 5c2749d847bd853d2767d170eb9fb24b27d0b9ad:docs/LEGACY-TUNNEL-INSTALL.md
 | --- | --- |
 | `866b626` | `74303524a3f3e7b21f40d42984da097c7cb12683` |
 | `a72421f` | `8954503323f7c71015931aff4f84b9077d1c1947` |
+| `7045bd0`（名称・自動session API、tmux時点） | `a91389cd8859016e8e9c9d8c70c760789979029e` |
 
 整理後の唯一の推奨導入は [Rust stdio + Secure MCP Tunnel](../deploy/INSTALL.md)。旧版を必要時に復元して使う場合はその時点の手順を参照し、同じstateのbackendを重複起動しません。旧Library bootstrapの1297a1b指定手順は現行導入に使いません。
 

@@ -1,0 +1,23 @@
+# File exchange: current boundary and next implementation
+
+2026-10-06 UTC。現在提供するファイル道具は上流のread_file/write_file/get_image/list_directoryです。小さなテキスト編集や画像参照に使えます。大きなbinary/archiveのdotへのupload/downloadは、まだ実装・実接続確認していません。
+
+## Tunnel/MCPだけで保証できること
+
+[公式Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) は外向き443でMCPを転送し、stdio serverを包めます。この説明から任意ファイルのダウンロード画面・Libraryへの保存が自動成立するとは確認できません。
+
+[MCP resources仕様](https://modelcontextprotocol.io/specification/2026-07-28/server/resources) はホストが表示方法を決める設計で、binary resourceはBase64 blobです。file URIはresourceの識別子です。VPS上のfile URIやlocalhost URLを返しても、dotから届くdownload URLになる保証はありません。resource対応とユーザー向けdownload対応はクライアント側の実確認が必要、という設計上の判断です。
+
+大容量Base64をLLMのtool本文へ載せる方法は採用しません。MCPの制御結果にはpath、size、SHA256、状態など短いmetadataだけを出し、実byteはモデルcontextを通さず転送する構成が必要です。
+
+## 既存経路を使う最小案
+
+本人の既存SSH/SFTP接続が使えるnative端末から、既存Tailscale経路で独立projectへupload/downloadする案が最小です。新HTTP公開・新key/grant・firewall変更は不要です。SFTP実接続は本環境では未確認です。SSHのホスト鍵検証を維持し、秘密鍵をchatやtool本文へ渡しません。
+
+uploadは転送先ディレクトリ内の一時ファイルへ送信し、size/SHA256を両端で照合してから同一filesystemのrenameで配置します。既存ファイルを上書きするかは呼出側が明示的に決めます。downloadもローカルの一時ファイルで受けて照合します。resumeできるクライアントを使い、不一致を成功と報告しません。これらは次の転送実装の要件で、現サーバーの新ツールではありません。
+
+## dotだけで完結するために残る確認
+
+dotのauthorized client/実行環境がVPSへ届く既存SSH/SFTP経路を持つか、またはクライアントが対応する正式なファイル転送APIが必要です。dotへ添付されたファイルのauthorized downloadと、返却ファイルのupload/Library保存はクライアント側の正式経路で行い、VPSへLibraryの認証情報を持ち込まない設計にします。サーバーからLibrary IDや保存成功を捏造しません。
+
+次に必要なのは「どのauthorized client経路が使えるか」の特定と、小さい実ファイルの往復・size/hash・ユーザー側downloadの確認です。それが確認できればbyte転送を実装できます。TunnelのMCP転送だけで大容量download UIがあるとは仮定しません。新しい認証付きHTTP/object storage経路を選ぶ場合は、その具体的な認証と公開範囲を別途確認してから配置します。

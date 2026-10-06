@@ -1,15 +1,21 @@
-# Persistent terminal backend options — investigation
+# Persistent terminal backend selection
 
-2026-10-06 UTC。現実装はtmuxを保持し、callerの通常APIはsession_idによるrun_command/read_output/send_stdin/stop_commandへ整理済みです。依存置換は未実施です。
+2026-10-06 UTC。採用済みbackendは **pty-process 0.5.3 + 同一binaryの独立PTY broker** です。tmux/shpoolはruntime依存にしません。通常APIはsession_idによるrun_command/read_output/send_stdin/resize_command/stop_commandです。
 
-候補は [shpool/libshpool](https://github.com/shell-pool/shpool)。named shellの永続化・再attachに特化し、画面分割/レイアウトはありません。公開 [libshpool API](https://docs.rs/libshpool/latest/libshpool/) はArgs/Commands/run/Hooks中心です。[runの安全条件](https://docs.rs/libshpool/latest/libshpool/fn.run.html) により、MCPの多thread runtime内へ直接混在させず、同一binaryの専用サブコマンドを別processで保持する案が適切と判断します。
+## libshpoolの実probe
 
-[shpool-protocol](https://docs.rs/shpool-protocol/latest/shpool_protocol/) にはattach、入力/出力stream、resize、list/kill向けの型があります。通常toolからこのprivate Unix socketへadapterを付ける最小案です。1 sessionにつきactive attachmentが1つという制約、切断中にcommandが終了した場合の最終output/exit code保持、bounded履歴の取得は採用前に実確認が必要です。libraryのrunだけでMCPのjob管理APIが完成するわけではありません。
+[shell-pool/shpool](https://github.com/shell-pool/shpool) revision `3c41df9a610428b6c1766d78d36d3fefd5685c3b`、libshpool/shpool 0.11.5、protocol 0.4.3をLinuxの一時HOME/private socketで実buildし、headless attach、stdin/output、detach/reattach、exit 7、別session、named stopを確認しました。[probeログ](../evidence/shpool-spike.log) を保存しています。
 
-[portable-pty](https://docs.rs/portable-pty/latest/portable_pty/) はPTYの生成、子process、入力/出力、resizeの基盤です。独立broker、session/job対応、再接続、bounded output、終了結果の保存、socket認証/permissionをこちらで実装する必要があります。完成した永続session poolとして紹介しません。
+切断中に終了したcommandへ同じ名前でattachすると新commandがCreatedとなり、counterが2になりました。最終状態の取得でcommandを再実行する挙動はMCP jobの契約に合わないため採用しません。これは実probeで確認した結果です。ライブラリ全般の欠陥や全ケースの出力欠落と断定しません。
 
-必須のstdio/Tunnel frontend切断・再起動越しの継続は、PTY所有processを独立して生かす設計で満たせます。ただしPTY所有daemon自体が停止すると、上の最小案では再attachできるPTYを失います。brokerの再起動も越える必要があれば、session別keeperがPTYを保持し、再起動するbrokerは再発見/ルーティングだけを担当する追加設計が必要です。これも未実装です。
+公開 [libshpool API](https://docs.rs/libshpool/latest/libshpool/) はArgs/Commands/run/Hooks中心で、[runの安全条件](https://docs.rs/libshpool/latest/libshpool/fn.run.html) はthread開始前のforkを要求します。また[開発文書](https://github.com/shell-pool/shpool/blob/master/HACKING.md) は内部protocolのsemver互換を保証しません。MCPのjob結果を安定保持するには追加adapterが必要です。
 
-従来の実testが確認したのはMCP stdio processの終了/再起動です。tmux server自体の再起動は確認していません。[tmux公式manual](https://raw.githubusercontent.com/tmux/tmux/master/tmux.1) のkill-serverも全sessionを破棄します。この条件をdaemon再起動耐性の証拠として扱いません。
+## 採用した最小構成
 
-比較の結論: 既製の永続shell poolを使うならlibshpoolが有力候補です。MCP向けのjob結果保持やbroker再起動耐性まで独自に揃えるならportable-pty + session keeperは制御しやすい一方、独自実装量が増えます。選定と実backendの疎通は未完了で、現在の機能・依存は削除していません。
+[pty-process](https://docs.rs/pty-process/latest/pty_process/) のasync機能でPTY生成、child process、stdin/stdout、resizeを使います。このcrateは完成済みsession poolではありません。brokerのprivate socket、session/job対応、出力上限、終了結果、stdin routing、個別停止、metadata再発見はこちらの追加実装です。
+
+brokerは作業UIDの別processとして自動起動し、frontend再起動から独立してPTYとjobごとの直近64 KiB、status/exit codeを保持します。socketは0600、双方で同一UIDを確認し、frameと応答時間を制限します。終了時は最終出力をdrainしてからcompletedを公開します。stopはjobのprocess groupを停止し、stoppedの出力を保持します。job数や長時間稼働全体の負荷試験は実施していません。
+
+broker自体の終了/ホスト再起動では保持PTYと出力を失います。この条件はユーザーが許容した範囲です。session別keeperによるbroker再起動越しの復旧は実装していません。[tmuxのkill-server](https://raw.githubusercontent.com/tmux/tmux/master/tmux.1) も全sessionを破棄しますが、それを独自brokerの試験証拠には使いません。
+
+実stdio frontendの終了/別PIDでの再起動、切断中に終了したjobの最終出力/exit 9、counter=1で再実行しないこと、live stdin/resize/stopを確認済みです。詳細は [VALIDATION](../VALIDATION.md)。OCI/ARM64/Tunnel実接続は未確認です。

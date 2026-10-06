@@ -46,7 +46,7 @@ async fn owner_and_discovery_real_processes() -> Result<()> {
                 .as_array()
                 .unwrap()
                 .len()
-                == 20,
+                == 19,
             "wrong tool count"
         );
         let other = fixture.token(json!({"sub":"other"}))?;

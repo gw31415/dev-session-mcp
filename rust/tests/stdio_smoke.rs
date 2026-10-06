@@ -4,7 +4,8 @@ use anyhow::{Context, Result, ensure};
 use common::{Client, call, raw, result_text, until};
 use rmcp::{ServiceExt, model::ClientConfig, transport::TokioChildProcess};
 use serde_json::json;
-use std::{collections::HashMap, path::PathBuf, process::Stdio, time::Duration};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 // This fixture does not start HTTP or an OAuth server and has no Tunnel key.
@@ -33,10 +34,6 @@ impl StdioFixture {
             (
                 "DEV_SESSION_MCP_STATE_DIR".into(),
                 home.path().join("state").display().to_string(),
-            ),
-            (
-                "DEV_SESSION_MCP_TMUX_BIN".into(),
-                std::env::var("DEV_SESSION_MCP_TMUX_BIN").unwrap_or("tmux".into()),
             ),
         ]);
         let binary = std::env::var_os("DEV_SESSION_MCP_RUST_BIN")
@@ -81,13 +78,8 @@ impl StdioFixture {
 }
 impl Drop for StdioFixture {
     fn drop(&mut self) {
-        let _ = std::process::Command::new(&self.env["DEV_SESSION_MCP_TMUX_BIN"])
-            .args(["-S"])
-            .arg(self.home.path().join("state/tmux.sock"))
-            .arg("kill-server")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        common::shutdown_backend(&self.home.path().join("state"));
+        common::shutdown_backend(&self.home.path().join(".local/state/dev-session-mcp"));
     }
 }
 
@@ -105,9 +97,32 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
             .name
             == "dev-session-mcp"
     );
-    ensure!(client.list_tools(None).await?.tools.len() == 20);
+    ensure!(client.list_tools(None).await?.tools.len() == 19);
+    let tools = client.list_tools(None).await?.tools;
+    for name in [
+        "session_info",
+        "read_file",
+        "get_image",
+        "list_directory",
+        "write_file",
+        "execute",
+        "start_command",
+        "poll_job",
+        "stop_job",
+        "without_sandbox",
+    ] {
+        ensure!(
+            tools.iter().any(|tool| tool.name == name),
+            "missing upstream tool {name}"
+        );
+    }
+    ensure!(
+        !tools
+            .iter()
+            .any(|tool| ["get_memo", "set_memo"].contains(&tool.name.as_ref()))
+    );
     println!(
-        "PASS actual dev-session-mcp stdio identity and official Rust SDK: 20 tools; no Node/HTTP/OAuth fixture"
+        "PASS actual dev-session-mcp stdio identity and official Rust SDK: 19 tools; no Node/HTTP/OAuth fixture"
     );
 
     let sid = "stdio-check";
@@ -139,9 +154,19 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
     );
     call(
         &client,
-        "set_memo",
-        json!({"session_id":sid,"text":"Purpose: Tunnel stdio\nNext: reconnect"}),
+        "resize_command",
+        json!({"session_id":sid,"rows":75,"cols":199}),
     )
+    .await?;
+    call(
+        &client,
+        "send_stdin",
+        json!({"session_id":sid,"text":"stty size\n"}),
+    )
+    .await?;
+    until(&client, json!({"session_id":sid}), |r| {
+        r["output"].as_str().unwrap().contains("75 199")
+    })
     .await?;
     let result = raw(
         &client,
@@ -175,7 +200,73 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
             .await?
         )? == "after\n"
     );
-    println!("PASS stdio session/memo and real sandbox command/file read-write-edit");
+    println!("PASS stdio session/files and real sandbox command/file read-write-edit");
+
+    let approval_job = created["jobs"]
+        .as_array()
+        .context("missing jobs")?
+        .iter()
+        .find(|job| job["kind"] == "approvals")
+        .context("missing approval terminal")?;
+    ensure!(
+        raw(
+            &client,
+            "send_stdin",
+            json!({"session_id":sid,"job_id":approval_job["job_id"],"text":"y\n"})
+        )
+        .await?
+        .is_error
+            == Some(true)
+    );
+    let mut console = Command::new(&fixture.binary)
+        .args(["approval-console", sid])
+        .env_clear()
+        .envs(&fixture.env)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut console_input = console.stdin.take().context("missing console stdin")?;
+    let mut console_output = console.stdout.take().context("missing console stdout")?;
+    let (denied, human) = tokio::join!(
+        raw(
+            &client,
+            "without_sandbox",
+            json!({"session_id":sid,"command":["/bin/sh","-c","printf MUST_NOT_RUN > denied-marker"]})
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut output = Vec::new();
+                let mut chunk = [0; 1024];
+                while !String::from_utf8_lossy(&output).contains("Allow without sandbox? [y/N]") {
+                    let count = console_output.read(&mut chunk).await?;
+                    ensure!(
+                        count > 0 && output.len() < 65536,
+                        "approval console closed before prompt"
+                    );
+                    output.extend_from_slice(&chunk[..count]);
+                }
+                console_input.write_all(b"n\n").await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("approval prompt timed out")?
+        }
+    );
+    human?;
+    let denied = denied?;
+    ensure!(denied.is_error == Some(true) && result_text(&denied)?.contains("user denied"));
+    ensure!(!fixture.cwd.join("denied-marker").exists());
+    drop(console_input);
+    ensure!(
+        tokio::time::timeout(Duration::from_secs(2), console.wait())
+            .await??
+            .success()
+    );
+    println!(
+        "PASS local human approval console receives real without_sandbox request; denial prevents execution; MCP stdin rejects approval terminal; console detach preserves session"
+    );
 
     let other_sid = "stdio-other";
     let other_cwd = fixture.cwd.join("other-project");
@@ -252,13 +343,51 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
     println!(
         "PASS automatic session shell/reuse, session-only stdin/output, separate sessions and multiple in-flight commands without cross-talk"
     );
+    let finished_sid = "finished-detached";
+    call(
+        &client,
+        "create_session",
+        json!({"session_id":finished_sid,"cwd":fixture.cwd}),
+    )
+    .await?;
+    let finished = call(&client, "run_command", json!({"session_id":finished_sid,"command":["/bin/bash","-c","printf run >> completed-counter; printf DETACHED_READY; sleep .3; printf DETACHED_FINAL; exit 9"]})).await?;
+    ensure!(
+        until(&client, json!({"session_id":finished_sid}), |r| r["output"]
+            .as_str()
+            .unwrap()
+            .contains("DETACHED_READY"))
+        .await?["status"]
+            == "running"
+    );
     client.cancel().await?;
     StdioFixture::wait_exit(first_pid).await?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
     let (client, second_pid) = fixture.connect().await?;
     ensure!(second_pid != first_pid, "stdio child was not replaced");
     let sessions = call(&client, "list_sessions", json!({})).await?;
-    ensure!(sessions["sessions"].as_array().unwrap().len() == 2);
+    ensure!(sessions["sessions"].as_array().unwrap().len() == 3);
+    call(
+        &client,
+        "connect_session",
+        json!({"session_id":finished_sid}),
+    )
+    .await?;
+    let completed = call(&client, "read_output", json!({"session_id":finished_sid})).await?;
+    ensure!(
+        completed["job_id"] == finished["job_id"]
+            && completed["status"] == "completed"
+            && completed["exit_code"] == 9
+            && completed["output"]
+                .as_str()
+                .unwrap()
+                .contains("DETACHED_FINAL")
+    );
+    ensure!(tokio::fs::read_to_string(fixture.cwd.join("completed-counter")).await? == "run");
+    call(&client, "close_session", json!({"session_id":finished_sid})).await?;
+    println!(
+        "PASS private PTY holder survives real frontend exit; detached completion retains final output/exit 9 and reconnect never reexecutes command; real resize verified"
+    );
     let info = call(&client, "connect_session", json!({"session_id":sid})).await?;
     ensure!(
         info["jobs"]
@@ -268,12 +397,6 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
             .any(|v| v["job_id"] == job["job_id"])
     );
     ensure!(info["active_job_id"] == job["job_id"] && info["terminal_job_id"] == shell);
-    ensure!(
-        call(&client, "get_memo", json!({"session_id":sid})).await?["text"]
-            .as_str()
-            .unwrap()
-            .contains("reconnect")
-    );
     call(
         &client,
         "send_stdin",
@@ -288,7 +411,7 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
             == "running"
     );
     call(&client, "stop_command", args.clone()).await?;
-    ensure!(call(&client, "read_output", args).await?["status"] == "unavailable");
+    ensure!(call(&client, "read_output", args).await?["status"] == "stopped");
     ensure!(call(&client, "read_output", parallel_args.clone()).await?["status"] == "running");
     call(&client, "stop_command", parallel_args).await?;
     ensure!(
@@ -304,7 +427,7 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
         call(&client, "read_output", json!({"session_id":other_sid})).await?["status"] == "running"
     );
     println!(
-        "PASS Rust stdio actual exit/replacement, session/memo/tmux reconnect, live stdin and stop"
+        "PASS Rust stdio actual exit/replacement, session/PTY broker reconnect, live stdin and stop"
     );
 
     let job = call(
@@ -339,7 +462,15 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
             .iter()
             .any(|marker| output.contains(marker))
     );
+    let legacy_note = fixture
+        .home
+        .path()
+        .join("state/sessions")
+        .join(sid)
+        .join("memo.md");
+    tokio::fs::write(&legacy_note, "existing user note\n").await?;
     call(&client, "close_session", json!({"session_id":sid})).await?;
+    ensure!(tokio::fs::read_to_string(&legacy_note).await? == "existing user note\n");
     ensure!(
         raw(&client, "read_output", json!({"session_id":sid}))
             .await?
@@ -403,20 +534,12 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
     let shell_path = |value: &std::path::Path| {
         format!("'{}'", value.display().to_string().replace('\'', "'\\''"))
     };
-    let tmux_dir = PathBuf::from(&fixture.env["DEV_SESSION_MCP_TMUX_BIN"])
-        .parent()
-        .context("tmux path needs a directory")?
-        .to_owned();
     let launcher = include_str!("../../deploy/dev-session-mcp-stdio")
         .replace("/home/devmcp/projects", &shell_path(&fixture.cwd))
         .replace("/home/devmcp", &shell_path(fixture.home.path()))
         .replace(
             "/opt/dev-session-mcp/bin/dev-session-mcp",
             &shell_path(&fixture.binary),
-        )
-        .replace(
-            "PATH=/usr/local/bin:/usr/bin:/bin",
-            &format!("PATH='{}:/usr/bin:/bin'", tmux_dir.display()),
         );
     let path = fixture.home.path().join("launcher.sh");
     tokio::fs::write(&path, launcher).await?;
@@ -428,7 +551,7 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
         .env("CONTROL_PLANE_API_KEY", fake_key)
         .env("CREDENTIALS_DIRECTORY", "/fixture-only-credential-dir");
     let (client, pid) = fixture.connect_command(command).await?;
-    ensure!(client.list_tools(None).await?.tools.len() == 20);
+    ensure!(client.list_tools(None).await?.tools.len() == 19);
     client.cancel().await?;
     StdioFixture::wait_exit(pid).await?;
     println!(

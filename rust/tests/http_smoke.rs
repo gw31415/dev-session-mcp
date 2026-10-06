@@ -159,7 +159,7 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
             .as_array()
             .unwrap()
             .len()
-            == 20,
+            == 19,
         "wrong current tool count"
     );
     let result = fixture
@@ -175,10 +175,10 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
     );
     let mut client = fixture.connect(&access).await?;
     ensure!(
-        client.list_tools(None).await?.tools.len() == 20,
+        client.list_tools(None).await?.tools.len() == 19,
         "official Rust client tool count"
     );
-    println!("PASS current stateless HTTP and official Rust SDK client: 20 tools");
+    println!("PASS current stateless HTTP and official Rust SDK client: 19 tools");
     let sid = format!("rust.{}", uuid::Uuid::new_v4());
     let session = call(
         &client,
@@ -197,19 +197,6 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
             .len()
             == 1,
         "session missing"
-    );
-    call(
-        &client,
-        "set_memo",
-        json!({"session_id":sid,"text":"Purpose: Rust suite\nNext: reconnect"}),
-    )
-    .await?;
-    ensure!(
-        call(&client, "get_memo", json!({"session_id":sid})).await?["text"]
-            .as_str()
-            .unwrap()
-            .contains("reconnect"),
-        "memo missing"
     );
     let result = raw(
         &client,
@@ -252,7 +239,7 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
         modern["resultType"] == "complete" && modern["content"][0]["text"] == "after\n",
         "current read failed"
     );
-    println!("PASS Rust session/list/memo and embedded sandbox exec/read/write/edit");
+    println!("PASS Rust session/list/files and embedded sandbox exec/read/write/edit");
     let upstream=call(&client,"start_command",json!({"session_id":sid,"command":["/bin/sh","-c","sleep 2; printf UPSTREAM_RUST_RECONNECT"]})).await?;
     let job=call(&client,"run_command",json!({"session_id":sid,"command":["/bin/bash","-c","read value; printf 'STDIN:%s\\n' \"$value\"; sleep 30"]})).await?;
     let job_args = json!({"session_id":sid,"job_id":job["job_id"]});
@@ -308,7 +295,7 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
     );
     call(&client, "stop_command", job_args.clone()).await?;
     ensure!(
-        call(&client, "read_output", job_args).await?["status"] == "unavailable",
+        call(&client, "read_output", job_args).await?["status"] == "stopped",
         "stop failed"
     );
     let output=call(&client,"run_command",json!({"session_id":sid,"command":["/bin/bash","-c","for i in {1..300}; do printf '%0100d\\n' \"$i\"; done; exit 7"]})).await?;
@@ -374,14 +361,7 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
         call(&client, "read_output", durable_args).await?["status"] == "running",
         "restart lost process"
     );
-    ensure!(
-        call(&client, "get_memo", json!({"session_id":sid})).await?["text"]
-            .as_str()
-            .unwrap()
-            .contains("reconnect"),
-        "restart lost memo"
-    );
-    println!("PASS actual Rust server restart retains tmux process and memo");
+    println!("PASS actual Rust server restart retains PTY process");
     let environment = call(
         &client,
         "run_command",
@@ -415,12 +395,12 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
     ensure!(!server.stderr()?.contains(&access), "bearer logged");
     let stdio = fixture.stdio().await?;
     ensure!(
-        stdio.list_tools(None).await?.tools.len() == 20,
+        stdio.list_tools(None).await?.tools.len() == 19,
         "Rust stdio failed"
     );
     stdio.cancel().await?;
     println!(
-        "PASS clean environment, explicit close, credential rejection, no bearer logs and official Rust stdio: 20 tools"
+        "PASS clean environment, explicit close, credential rejection, no bearer logs and official Rust stdio: 19 tools"
     );
     Ok(())
 }

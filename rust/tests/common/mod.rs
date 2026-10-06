@@ -264,10 +264,6 @@ impl Fixture {
                 "DEV_SESSION_MCP_STATE_DIR".into(),
                 home.path().join("state").display().to_string(),
             ),
-            (
-                "DEV_SESSION_MCP_TMUX_BIN".into(),
-                std::env::var("DEV_SESSION_MCP_TMUX_BIN").unwrap_or("tmux".into()),
-            ),
         ]);
         let binary = std::env::var_os("DEV_SESSION_MCP_RUST_BIN")
             .map(PathBuf::from)
@@ -498,13 +494,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.issuer_task.abort();
-        let _ = std::process::Command::new(&self.env["DEV_SESSION_MCP_TMUX_BIN"])
-            .arg("-S")
-            .arg(Path::new(&self.env["DEV_SESSION_MCP_STATE_DIR"]).join("tmux.sock"))
-            .arg("kill-server")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        shutdown_backend(Path::new(&self.env["DEV_SESSION_MCP_STATE_DIR"]));
     }
 }
 pub async fn raw(client: &Client, name: &str, args: Value) -> Result<CallToolResult> {
@@ -546,4 +536,18 @@ pub async fn until(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     anyhow::bail!("terminal wait expired");
+}
+
+pub fn shutdown_backend(state: &Path) {
+    use std::io::Write;
+    if let Ok(mut socket) = std::os::unix::net::UnixStream::connect(state.join("broker.sock")) {
+        let _ = socket.set_write_timeout(Some(Duration::from_secs(1)));
+        let _ = socket.write_all(b"{\"op\":\"shutdown\"}\n");
+    }
+    for _ in 0..100 {
+        if !state.join("broker.pid").exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

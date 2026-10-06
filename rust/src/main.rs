@@ -1,6 +1,7 @@
 #[path = "../../vendor/local-mcp/src/approvals.rs"]
 mod approvals;
 mod auth;
+mod broker;
 #[path = "../../vendor/local-mcp/src/config.rs"]
 mod config;
 mod server;
@@ -32,10 +33,14 @@ enum Command {
     },
     /// Stdio MCP for the credential-separated Secure MCP Tunnel deployment.
     Stdio,
-    /// Local session approval terminal (normally started inside tmux).
+    /// Local session approval terminal (normally held by the private PTY broker).
     Start { session_id: String },
+    /// Attach a local human console to an existing session's approval terminal.
+    ApprovalConsole { session_id: String },
     #[command(hide = true)]
     Worker { spec: PathBuf },
+    #[command(hide = true)]
+    Broker { state: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -72,6 +77,10 @@ fn main() -> Result<()> {
                     Command::Serve { config } => server::http(config).await,
                     Command::Stdio => server::stdio().await,
                     Command::Start { session_id } => approvals::start(Some(&session_id)).await,
+                    Command::ApprovalConsole { session_id } => {
+                        broker::approval_console(&session_id).await
+                    }
+                    Command::Broker { state } => broker::run(state).await,
                     Command::Worker { .. } => unreachable!(),
                 }
             }),

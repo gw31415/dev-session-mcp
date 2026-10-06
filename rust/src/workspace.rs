@@ -8,9 +8,17 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, process::Command};
 
 pub const MAX_OUTPUT: usize = 65536;
+pub fn state_dir() -> Result<PathBuf> {
+    Ok(std::env::var_os("DEV_SESSION_MCP_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(
+            dirs::home_dir()
+                .context("HOME is required")?
+                .join(".local/state/dev-session-mcp"),
+        ))
+}
 #[derive(Serialize, Deserialize)]
 pub struct WorkerSpec {
     pub command: Vec<String>,
@@ -20,9 +28,7 @@ pub struct WorkerSpec {
 pub struct Workspace {
     state: PathBuf,
     cwd: PathBuf,
-    tmux: String,
-    socket: PathBuf,
-    tmux_config: PathBuf,
+    broker: crate::broker::Client,
     _backend: std::fs::File,
     session_operations: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -116,11 +122,9 @@ impl Workspace {
     pub async fn new() -> Result<Self> {
         clean_environment()?;
         let home = dirs::home_dir().context("HOME is required")?;
-        let state = std::env::var_os("DEV_SESSION_MCP_STATE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or(home.join(".local/state/dev-session-mcp"));
+        let state = state_dir()?;
         ensure!(state.is_absolute(), "state directory must be absolute");
-        let socket = state.join("tmux.sock");
+        let socket = state.join("broker.sock");
         ensure!(
             socket.as_os_str().len() <= 100,
             "state path exceeds Unix socket limit"
@@ -139,28 +143,16 @@ impl Workspace {
             unsafe { libc::flock(backend.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "Rust backend already running for this state directory"
         );
-        let tmux_config = state.join("tmux.conf");
-        tokio::fs::write(&tmux_config, "set -g history-limit 10000\nset -g remain-on-exit on\nset -g status off\nset -g default-shell /bin/bash\n").await?;
-        let result = Self {
+        let broker = crate::broker::Client::new(&state).await?;
+        Ok(Self {
             state,
-            socket,
-            tmux_config,
+            broker,
             _backend: backend,
             session_operations: tokio::sync::Mutex::new(HashMap::new()),
             cwd: std::env::var_os("DEV_SESSION_MCP_DEFAULT_CWD")
                 .map(PathBuf::from)
                 .unwrap_or(home),
-            tmux: std::env::var("DEV_SESSION_MCP_TMUX_BIN").unwrap_or("tmux".into()),
-        };
-        let check = Command::new(&result.tmux)
-            .arg("-V")
-            .env_clear()
-            .envs(safe_environment())
-            .output()
-            .await
-            .context("tmux is required")?;
-        ensure!(check.status.success(), "tmux is unavailable");
-        Ok(result)
+        })
     }
     fn session_dir(&self, id: &str) -> Result<PathBuf> {
         config::validate_session_id(id)?;
@@ -203,7 +195,7 @@ impl Workspace {
     async fn ensure_terminal(&self, id: &str, cwd: &Path) -> Result<String> {
         let previous = self.pointer(id, "terminal").await?;
         if let Some(job) = &previous {
-            if self.status(job).await?["status"] == "running" {
+            if self.status(id, job).await?["status"] == "running" {
                 return Ok(job.clone());
             }
         }
@@ -245,84 +237,15 @@ impl Workspace {
         resolved["job_id"] = json!(job);
         Ok(resolved)
     }
-    async fn tmux(
-        &self,
-        args: Vec<String>,
-        input: Option<&[u8]>,
-        allow_failure: bool,
-    ) -> Result<std::process::Output> {
-        use std::process::Stdio;
-        let mut command = Command::new(&self.tmux);
-        command
-            .args(["-S"])
-            .arg(&self.socket)
-            .arg("-f")
-            .arg(&self.tmux_config)
-            .args(args)
-            .env_clear()
-            .envs(safe_environment())
-            .kill_on_drop(true)
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn()?;
-        if let Some(data) = input {
-            if let Some(mut stream) = child.stdin.take() {
-                stream.write_all(data).await?;
-            }
-        }
-        let out = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
-            .await
-            .context("tmux operation timed out")??;
-        // capture-pane is independently bounded by history and terminal width.
-        ensure!(
-            out.stdout.len() <= 4 * 1024 * 1024,
-            "tmux response exceeded internal limit"
-        );
-        ensure!(
-            allow_failure || out.status.success(),
-            "tmux operation failed"
-        );
-        Ok(out)
-    }
-    async fn status(&self, job: &str) -> Result<Value> {
-        config::validate_session_id(job)?;
-        let exists = self
-            .tmux(
-                vec!["has-session".into(), "-t".into(), format!("=odm_{job}")],
-                None,
-                true,
-            )
+    async fn status(&self, id: &str, job: &str) -> Result<Value> {
+        let mut result = self
+            .broker
+            .call(json!({"op":"status","session_id":id,"job_id":job}))
             .await?;
-        if !exists.status.success() {
-            return Ok(json!({"status":"unavailable", "exit_code":null}));
+        for key in ["output", "output_bytes", "truncated"] {
+            result.as_object_mut().unwrap().remove(key);
         }
-        let out = self
-            .tmux(
-                vec![
-                    "display-message".into(),
-                    "-p".into(),
-                    "-t".into(),
-                    format!("odm_{job}:0.0"),
-                    "#{pane_dead}|#{pane_dead_status}|#{pane_pid}|#{history_size}".into(),
-                ],
-                None,
-                true,
-            )
-            .await?;
-        if !out.status.success() {
-            return Ok(json!({"status":"unavailable", "exit_code":null}));
-        }
-        let body = String::from_utf8_lossy(&out.stdout);
-        let fields: Vec<_> = body.trim().split('|').collect();
-        ensure!(fields.len() == 4, "invalid tmux status");
-        Ok(
-            json!({"status":if fields[0]=="1" {"completed"} else {"running"},"exit_code":if fields[0]=="1" {fields[1].parse::<i32>().ok()} else {None},"pid":fields[2].parse::<u32>().ok(),"history_lines":fields[3].parse::<u32>().ok()}),
-        )
+        Ok(result)
     }
     async fn start(&self, id: &str, kind: &str, command: Vec<String>, cwd: &Path) -> Result<Value> {
         ensure!(
@@ -338,36 +261,14 @@ impl Workspace {
         tokio::fs::create_dir_all(&dir).await?;
         let record = json!({"session_id":id,"job_id":job,"kind":kind,"created_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"cwd":cwd});
         tokio::fs::write(dir.join("job.json"), serde_json::to_vec(&record)?).await?;
-        let spec = dir.join("spec.json");
-        tokio::fs::write(
-            &spec,
-            serde_json::to_vec(&WorkerSpec {
-                command,
-                cwd: cwd.into(),
-                env: safe_environment(),
-            })?,
-        )
-        .await?;
-        self.tmux(
-            vec![
-                "new-session".into(),
-                "-d".into(),
-                "-s".into(),
-                format!("odm_{job}"),
-                "-x".into(),
-                "160".into(),
-                "-y".into(),
-                "40".into(),
-                "-c".into(),
-                cwd.display().to_string(),
-                std::env::current_exe()?.display().to_string(),
-                "worker".into(),
-                spec.display().to_string(),
-            ],
-            None,
-            false,
-        )
-        .await?;
+        if let Err(error) = self
+            .broker
+            .call(json!({"op":"start","session_id":id,"job_id":job,"command":command,"cwd":cwd}))
+            .await
+        {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            return Err(error);
+        }
         Ok(json!({"session_id":id,"job_id":job}))
     }
     async fn job(&self, id: &str, job: &str) -> Result<Value> {
@@ -386,7 +287,7 @@ impl Workspace {
                 record
                     .as_object_mut()
                     .unwrap()
-                    .extend(self.status(&job).await?.as_object().unwrap().clone());
+                    .extend(self.status(id, &job).await?.as_object().unwrap().clone());
                 jobs.push(record);
             }
         }
@@ -401,10 +302,6 @@ impl Workspace {
         object.insert(
             "active_job_id".into(),
             json!(self.pointer(id, "current").await?),
-        );
-        object.insert(
-            "memo_available".into(),
-            json!(self.session_dir(id)?.join("memo.md").is_file()),
         );
         Ok(result)
     }
@@ -474,25 +371,8 @@ impl Workspace {
                 self.ensure_terminal(id, &session.cwd).await?;
                 self.session_info(id).await
             }
-            "get_memo" => {
-                let path = self.session_dir(id)?.join("memo.md");
-                let memo = if path.exists() {
-                    tokio::fs::read_to_string(path).await?
-                } else {
-                    String::new()
-                };
-                Ok(json!({"session_id":id,"text":memo}))
-            }
-            "set_memo" => {
-                let memo = text(a, "text")?;
-                let dir = self.session_dir(id)?;
-                tokio::fs::create_dir_all(&dir).await?;
-                let temporary = dir.join(format!("memo-{}.tmp", uuid::Uuid::new_v4()));
-                tokio::fs::write(&temporary, memo).await?;
-                tokio::fs::rename(&temporary, dir.join("memo.md")).await?;
-                Ok(json!({"session_id":id,"saved":true,"bytes":memo.len()}))
-            }
             "run_command" => {
+                output_limit(a)?;
                 let job = match a.get("command") {
                     None => {
                         ensure!(a.get("cwd").is_none(), "cwd requires command argv");
@@ -516,90 +396,39 @@ impl Workspace {
                 self.poll(&args).await
             }
             "read_output" => self.poll(&self.command_args(id, a).await?).await,
-            "send_stdin" => {
-                let args = self.command_args(id, a).await?;
-                let job = text(&args, "job_id")?;
-                ensure!(
-                    self.status(job).await?["status"] == "running",
-                    "terminal is not running"
-                );
-                if a.get("text").is_some() {
-                    let data = text(a, "text")?;
-                    // Paste a private tmux buffer: no key interpretation or shell interpolation.
-                    let buffer = format!("odm_{}", uuid::Uuid::new_v4());
-                    self.tmux(
-                        vec![
-                            "load-buffer".into(),
-                            "-b".into(),
-                            buffer.clone(),
-                            "-".into(),
-                        ],
-                        Some(data.as_bytes()),
-                        false,
-                    )
-                    .await?;
-                    self.tmux(
-                        vec![
-                            "paste-buffer".into(),
-                            "-d".into(),
-                            "-b".into(),
-                            buffer,
-                            "-t".into(),
-                            format!("odm_{job}:0.0"),
-                        ],
-                        None,
-                        false,
-                    )
-                    .await?;
-                }
-                if let Some(keys) = a.get("keys") {
-                    let keys: Vec<String> = serde_json::from_value(keys.clone())?;
-                    ensure!(
-                        keys.len() <= 16
-                            && keys.iter().all(|k| [
-                                "Enter", "C-c", "C-d", "Escape", "Tab", "Up", "Down", "Left",
-                                "Right"
-                            ]
-                            .contains(&k.as_str())),
-                        "invalid terminal key"
-                    );
-                    if !keys.is_empty() {
-                        let mut args =
-                            vec!["send-keys".into(), "-t".into(), format!("odm_{job}:0.0")];
-                        args.extend(keys);
-                        self.tmux(args, None, false).await?;
-                    }
-                }
+            "send_stdin" | "resize_command" | "stop_command" => {
+                output_limit(a)?;
+                let mut args = self.command_args(id, a).await?;
+                args["op"] = json!(match name {
+                    "send_stdin" => "send",
+                    "resize_command" => "resize",
+                    _ => "stop",
+                });
+                self.broker.call(args.clone()).await?;
                 self.poll(&args).await
-            }
-            "stop_command" => {
-                let args = self.command_args(id, a).await?;
-                let job = text(&args, "job_id")?;
-                let mut before = self.poll(&args).await?;
-                self.tmux(
-                    vec!["kill-session".into(), "-t".into(), format!("=odm_{job}")],
-                    None,
-                    true,
-                )
-                .await?;
-                before["status"] = json!("stopped");
-                before["exit_code"] = Value::Null;
-                Ok(before)
             }
             "close_session" => {
                 let info = self.session_info(id).await?;
                 for job in info["jobs"].as_array().unwrap() {
                     let job = job["job_id"].as_str().unwrap();
-                    self.tmux(
-                        vec!["kill-session".into(), "-t".into(), format!("=odm_{job}")],
-                        None,
-                        true,
-                    )
-                    .await?;
+                    self.broker
+                        .call(json!({"op":"forget","session_id":id,"job_id":job}))
+                        .await?;
                 }
                 tokio::fs::remove_file(config::session_path(id)?).await?;
                 let dir = self.session_dir(id)?;
-                if dir.exists() {
+                if dir.join("memo.md").exists() {
+                    // Removing the memo API must not delete existing users' notes.
+                    if dir.join("jobs").exists() {
+                        tokio::fs::remove_dir_all(dir.join("jobs")).await?;
+                    }
+                    for name in ["terminal.json", "current.json"] {
+                        let path = dir.join(name);
+                        if path.exists() {
+                            tokio::fs::remove_file(path).await?;
+                        }
+                    }
+                } else if dir.exists() {
                     tokio::fs::remove_dir_all(dir).await?;
                 }
                 Ok(json!({"session_id":id,"status":"closed"}))
@@ -611,44 +440,9 @@ impl Workspace {
         let id = text(args, "session_id")?;
         let job = text(args, "job_id")?;
         self.job(id, job).await?;
-        let status = self.status(job).await?;
-        let mut result =
-            json!({"session_id":id,"job_id":job,"output":"","output_bytes":0,"truncated":false});
-        result
-            .as_object_mut()
-            .unwrap()
-            .extend(status.as_object().unwrap().clone());
-        if status["status"] == "unavailable" {
-            return Ok(result);
-        }
-        let out = self
-            .tmux(
-                vec![
-                    "capture-pane".into(),
-                    "-p".into(),
-                    "-J".into(),
-                    "-t".into(),
-                    format!("odm_{job}:0.0"),
-                    "-S".into(),
-                    "-10000".into(),
-                ],
-                None,
-                true,
-            )
-            .await?;
-        if !out.status.success() {
-            result["status"] = json!("unavailable");
-            result["exit_code"] = Value::Null;
-            return Ok(result);
-        }
-        let (output, truncated) = bounded(
-            &String::from_utf8_lossy(&out.stdout),
-            output_limit(args)?,
-            true,
-        );
-        result["output_bytes"] = json!(output.len());
-        result["output"] = json!(output);
-        result["truncated"] = json!(truncated);
+        let mut result = self.broker.call(json!({"op":"poll","session_id":id,"job_id":job,"max_output_bytes":output_limit(args)?})).await?;
+        result["session_id"] = json!(id);
+        result["job_id"] = json!(job);
         Ok(result)
     }
 }

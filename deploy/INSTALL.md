@@ -12,7 +12,7 @@ cargo build --release --locked --manifest-path rust/Cargo.toml
 ./rust/target/release/dev-session-mcp --version
 ```
 
-preflightはaarch64/arm64をARM64、x86_64/amd64をAMD64として検出します。Rust 1.96+、cc/make/perl/pkg-config、tmux、bubblewrap、CA証明書と動的ライブラリが必要です。不足は実OSのパッケージマネージャで導入します。Nodeは不要。低メモリならbuildに `CARGO_BUILD_JOBS=1` を付けます。
+preflightはaarch64/arm64をARM64、x86_64/amd64をAMD64として検出します。Rust 1.96+、cc/make/perl/pkg-config、bubblewrap、CA証明書と動的ライブラリが必要です。不足は実OSのパッケージマネージャで導入します。Nodeは不要。低メモリならbuildに `CARGO_BUILD_JOBS=1` を付けます。
 
 任意のローカルstdio確認は、Node不要の `cargo test --locked --manifest-path rust/Cargo.toml --test stdio_smoke -- --nocapture`。このtestは一時HOME/state/projectで実サーバーを起動し、作業プロジェクトを変更しません。namespace制約でsandboxが失敗したら原因を報告し、通常executeのsandboxを無効化しません。
 
@@ -48,7 +48,7 @@ sudo install -o root -g root -m 0644 deploy/dev-session-mcp-tunnel.service /etc/
 
 config.yamlのTunnel IDを実値へ置換します。MCP commandは `sudo -n -u devmcp -- /usr/local/libexec/dev-session-mcp-stdio`。sudoersはこの固定wrapperの**引数なし**だけを許可します。wrapperはsudoを再実行せず `env -i` でRust stdioを起動します。binary/wrapperと親ディレクトリはroot所有・作業UIDから変更不可にします。
 
-Rust stdioはTunnelのchildとして常駐するため別workerサービスやUnix RPC brokerは不要です。上流session metadataは `/home/devmcp/.local/state/local-mcp/sessions`、拡張session/memo/tmuxは `/home/devmcp/.local/state/dev-session-mcp`。パス変更時はwrapperのHOME/XDG_STATE_HOME/DEV_SESSION_MCP_STATE_DIRを揃えます。
+Rust stdioはTunnelのchildとして常駐し、同一binaryのprivate PTY brokerを作業UIDで別processとして自動起動します。broker専用unitは不要です。上流session metadataは `/home/devmcp/.local/state/local-mcp/sessions`、拡張session/job metadataとbroker.sock/broker.pidは `/home/devmcp/.local/state/dev-session-mcp`。broker.sockは0600、stateは0700で同一UIDを確認します。パス変更時はwrapperのHOME/XDG_STATE_HOME/DEV_SESSION_MCP_STATE_DIRを揃えます。
 
 ## 4. 既存runtime keyを安全に配置して起動
 
@@ -64,7 +64,7 @@ curl -fsS http://127.0.0.1:8080/readyz
 
 同じTunnel IDのclientは1個だけにします。既存client/別Rust backendが動いていれば、重複起動せず現状を確認して停止対象を決めます。必要な外向き接続は `api.openai.com:443`、既存control-plane mTLSを使う場合は `mtls.api.openai.com:443`。inbound portは開けません。health/UIはloopbackのみ。既存Tailscale/firewallを変更しません。
 
-このunitは `KillMode=process` でtmuxをTunnelの停止/restartから残します。Rust stdioが終了すれば通常jobの追跡handleは失われます。生存が必要な作業は通常の `run_command` / `send_stdin` で開始します。Tunnel停止を全作業の終了と取り違えないでください。
+このunitは `KillMode=process` でPTY brokerをTunnelの停止/restartから残します。broker自体の終了/ホスト再起動ではPTYと保持出力を失います。Rust stdioが終了すれば通常の上流jobの追跡handleは失われます。生存が必要な作業は通常の `run_command` / `send_stdin` で開始します。Tunnel停止を全作業の終了と取り違えないでください。
 
 ## 5. ChatGPT/dotで既存Tunnelを接続
 
@@ -72,6 +72,10 @@ clientの健康状態を確認したうえで、ChatGPTのAdd custom MCP server�
 
 最小確認: `list_sessions` → `create_session` → execute/read/write → `run_command/send_stdin/read_output` → 接続を切って同じsessionへ再接続 → `stop_command/close_session`。実ホスト・認証・dotでここまで通って初めて「接続済み」と報告します。legacy MCP clientはchildが置き換わったときinitialize/initializedを再送します。現行2026-07-28の自己完結requestもRust SDK/Tunnelで扱います。
 
-終了は `stop_command` / `close_session`。全tmux作業を明示的に終了するならdevmcpとして `tmux -S /home/devmcp/.local/state/dev-session-mcp/tmux.sock kill-server`。closeはmemoも削除し、daemon化した子孫はプロジェクト側のプロセス管理で停止します。without_sandboxの承認端末はconnect_sessionのkind=approvalsのjob_idから、devmcpで同じsocketの `odm_JOB_ID` sessionへattachします。
+終了は `stop_command` / `close_session`。旧memo.mdがある場合はcloseでも保持し、daemon化した子孫はプロジェクト側で管理します。without_sandboxの承認は既存SSH経路で作業UIDになり、同じHOME/XDG_STATE_HOME/DEV_SESSION_MCP_STATE_DIRで `/opt/dev-session-mcp/bin/dev-session-mcp approval-console SESSION_ID` を実行します。Ctrl-C/stdin EOFはconsoleのdetachだけです。人が内容を読んでy/nを入力します。この手順はyoloや永続許可を新設しません。
+
+全作業を終了/upgradeする場合、まず全sessionをcloseし、管理者が当該stateのbroker.pidとprocessのUID/argvを照合して、そのbrokerへSIGTERMを送ります。brokerは保持jobを停止してsocket/pid fileを除去します。PID fileだけを盲信してkillしません。Tunnel restartだけで古いbroker/binaryが更新されるとは仮定しません。これらは実機で対象を確認して行う操作です。
+
+大きな成果物の交換は [ファイル転送設計](../docs/FILE-TRANSFER.md) を参照します。現在は既存SSH/SFTPまたは正式なclient側転送連携が必要で、MCPにfile URIを返すだけでdotからdownloadできるとは報告しません。
 
 現在、ARM64実機（OCIを含む）・release build・実Tunnel認証・dot接続・systemd実配置は未確認です。旧Node版はGit履歴で復元でき、ソースは非公開GitHubへ保存します。詳細は [stdio検証](../VALIDATION.md)。

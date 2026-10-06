@@ -1,29 +1,32 @@
-# Validation — Rust stdio + Secure MCP Tunnel
+# Validation — private PTY broker + Rust MCP
 
-2026-10-06 UTC、独立した `/workspace/dev-session-mcp`、Debian 13 x86_64、Rust/Cargo 1.98.1、実tmux 3.5a、bubblewrap 0.12.0で検証しています。推奨導入はRust stdio + 公式Secure MCP Tunnelのみです。現backendはtmux。軽量Rust backendへの置換・resize APIは未実装です。
+2026-10-06 UTC。独立した `/workspace/dev-session-mcp`、Debian 13 x86_64、Rust/Cargo 1.98.1、bubblewrap 0.12.0で確認しました。推奨導入は公式Secure MCP Tunnel + Rust stdioです。runtimeにNode/tmux/shpoolは不要です。
 
 ```sh
-cargo test --locked --manifest-path rust/Cargo.toml --test stdio_smoke -- --nocapture
+cargo test --locked --manifest-path rust/Cargo.toml --test stdio_smoke --test http_smoke -- --nocapture
 ```
 
-名称変更・session端末の自動対応後に再buildし、実stdio testはexit 0、1 passed、0 failed（1.50秒）でした。公式Rust MCP SDK clientで実Rust binaryを別processとして起動します。HTTP/OAuth fixtureやNodeを起動せず、一時HOME/state/projectと専用tmux socketを使います。実行ログは [evidence/rust-stdio-smoke.log](evidence/rust-stdio-smoke.log)。
+PTY brokerとローカルapproval-console追加後に再buildし、既存2 integration testsは各exit 0、各1 passed/0 failedでした。stdio 1.95秒、保留HTTP互換fixture 10.02秒。実ログは [evidence/rust-pty-smoke.log](evidence/rust-pty-smoke.log)。前段のPTY stdio実testも1 passed/0 failed、1.63秒で [evidence/rust-stdio-smoke.log](evidence/rust-stdio-smoke.log) に保存しています。
 
-確認済み動作:
+stdioは公式Rust MCP SDK clientで実Rust binaryを別processとして起動し、一時HOME/state/projectで検証しました。HTTP/OAuth serverやNode/tmuxを起動しません。
 
-- 新MCP製品名と20ツール取得、session作成/一覧/接続、明示memo保存。
-- 自動端末の作成/再利用、session_idだけでstdin/output/stop、2つのsession間でjob/output/inputを混同しないこと。
-- 複数in-flight command、stdio再起動後の選択job復帰、個別stopで他commandを維持、closeで他sessionを維持、close後/再作成後の古いjob ID拒否。
-- 組込みCodex sandboxでコマンドとファイル読取/書込/上書き編集。
-- stdio processの実終了、別PIDで再起動、session/memo/tmux jobの再発見、継続中のstdin送信、停止。
-- 1024-byte出力上限・truncated・exit 7、shellへのtransport秘密環境非継承、明示close、秘密env混入時の起動拒否。
-- fixture pathに替えた実clean-env wrapper本体で、fake Tunnel envを除去しRust stdioの20ツール取得。実UID切替の成功証拠ではありません。
+確認した動作:
 
-この環境では外側sandboxが内側bubblewrapのsynthetic-mount lockをread-onlyにするため、実testは承認された制約外ローカルexecで実行します。通常executeのsandboxは有効のままです。
+- MCP製品名dev-session-mcpと19ツール取得。上流10ツール全てを保持しget_memo/set_memoは不存在。
+- session作成/一覧/接続、自動shellの作成/再利用、session_idだけのstdin/output/stop、別sessionと複数in-flight commandの分離。
+- 実stdio processの終了/別PIDでの再起動、同一PTYへの再接続。切断中に終了したjobの最終出力/exit 9、counter=1で再実行しないこと。
+- resize_commandの実stty size=75 199、live stdin、個別stopが他jobを保つこと、closeが他sessionを保つこと、closed session/再作成後の古いjob ID拒否。
+- executeの実Codex sandbox、write_file/read_fileによる作成/上書き編集。通常shellの強い権限と上流sandbox契約を混同しないこと。
+- ローカルapproval-consoleへ実without_sandbox要求が届き、nの拒否でcommandが未実行であること。MCP stdinではapproval jobを指定できず、console detach後もsessionが存続。新しい許可/grantは作成していません。
+- 1024-byte出力上限/truncated/exit 7、clean shell環境、transport秘密env混入時の起動拒否、明示終了、旧memo.mdがclose後も残ること。
+- 一時pathに置き換えた実clean-env wrapper本体でfake Tunnel envを除去しstdioの19ツール取得。実UID切替の成功証拠ではありません。
 
-wrapper/preflightのshell構文と実OS/CPU/build依存検出は確認済み。wrapperの引数拒否は終了code 64。systemd unitの配置先tunnel-clientはこの環境に無く、sudo/visudoも未導入なので、実service起動・sudoers/UID移行は未確認です。これを通すためのOS変更は実施していません。
+保留HTTP/OAuth fixtureも既存契約の回帰確認として実行しました。上流start_command/poll_job/stop_job、close guard、実server再起動後のPTY継続、認証/Origin/Host拒否を確認しました。認証fixtureは一時のtest用で、実Tunnel login、実workspace grant、外部OAuth連携を意味しません。Tunnel導入ではHTTP機能を使いません。
 
-旧Node実装・JS test・npm依存/cache・旧worker/wrapper・重複手順と古いログは整理しました。旧版の復元元と保全するcheckpointは [docs/HISTORY.md](docs/HISTORY.md)。元vendor source/ライセンスと既存mycastは変更しません。
+libshpoolの小さな実probeは [evidence/shpool-spike.log](evidence/shpool-spike.log)。切断中に終了したcommandの同名attachがCreatedで再実行counter=2になる結果を受け、pty-process 0.5.3 + 独立brokerを選びました。[選定記録](docs/BACKEND-OPTIONS.md)。
 
-Rust HTTP/OAuth実装と対応するRust test/過去ログは保留機能として残しています。過去HTTPログには当時の旧名が含まれます。Tunnel導入・stdio testでは使用せず、機能追加もしていません。本番ASや認証/ログイン成功の証拠として扱いません。
+外側sandboxが内側bubblewrap mount lockをread-onlyにするため、実testは承認された制約外のローカルexecで実行しています。executeのsandboxは有効です。通常のtestsのために実ホストのOSやnetwork設定は変更していません。大規模負荷試験やcoverage目標は追加していません。
 
-未確認: ARM64実機（OCIを含む）、release build、実Tunnel認証、実ChatGPT/dot接続、systemd/sudoers/UIDの実配置。新規実鍵/grant、実ホストdeploy、OS/network/Tailscale変更は今回の承認範囲に含めず実施していません。導入手順は [INSTALL](deploy/INSTALL.md)、Linuxホスト側の準備依頼は [BOOTSTRAP](deploy/BOOTSTRAP.md)。
+未確認: ARM64実機（OCIを含む）、release build、実Tunnel認証、実ChatGPT/dot接続、systemd/sudoers/UIDの実配置、大容量file upload/download。PTY broker終了/ホスト再起動を越える作業復旧は提供しません。新しい実key/grant、実deploy、OS/network/Tailscale変更は実施していません。
+
+vendor source/ライセンスと既存mycastは変更していません。過去checkpointと旧Node版は [HISTORY](docs/HISTORY.md) で保全しています。実機準備は [INSTALL](deploy/INSTALL.md)、[BOOTSTRAP](deploy/BOOTSTRAP.md)。

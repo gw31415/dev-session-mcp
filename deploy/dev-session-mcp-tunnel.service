@@ -14,7 +14,7 @@ ExecStart=/usr/local/bin/tunnel-client run --config /etc/dev-session-mcp-tunnel/
 Restart=on-failure
 RestartSec=5
 UMask=0077
-# tmux must survive Tunnel/Rust child replacement. Stop its jobs explicitly.
+# The private PTY holder must survive Tunnel/Rust child replacement. Stop jobs explicitly.
 KillMode=process
 StandardOutput=journal
 StandardError=journal

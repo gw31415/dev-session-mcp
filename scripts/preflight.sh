@@ -11,8 +11,7 @@ case "$cpu_name" in
 esac
 printf 'Detected OS/CPU: %s %s (%s native build)\n' "$os_name" "$cpu_name" "$runtime_arch"
 if test -r /etc/os-release; then sed -n '/^PRETTY_NAME=/p' /etc/os-release; fi
-for executable in tmux bwrap; do command -v "$executable" >/dev/null || { printf 'Missing runtime dependency: %s\n' "$executable" >&2; exit 1; }; done
-tmux -V
+for executable in bwrap; do command -v "$executable" >/dev/null || { printf 'Missing runtime dependency: %s\n' "$executable" >&2; exit 1; }; done
 bwrap --version
 if test "${1:-}" = --build; then
   for executable in cargo rustc cc make perl pkg-config; do command -v "$executable" >/dev/null || { printf 'Missing build dependency: %s\n' "$executable" >&2; exit 1; }; done
