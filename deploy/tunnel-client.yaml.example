@@ -5,7 +5,7 @@ control_plane:
 mcp:
   commands:
     - channel: main
-      command: /usr/bin/sudo -n -u devmcp -- /usr/local/libexec/oci-dev-rust-stdio
+      command: /usr/bin/sudo -n -u devmcp -- /usr/local/libexec/dev-session-mcp-stdio
   max_concurrent_requests: 4
 health:
   listen_addr: 127.0.0.1:8080

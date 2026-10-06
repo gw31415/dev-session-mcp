@@ -254,13 +254,13 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
     );
     println!("PASS Rust session/list/memo and embedded sandbox exec/read/write/edit");
     let upstream=call(&client,"start_command",json!({"session_id":sid,"command":["/bin/sh","-c","sleep 2; printf UPSTREAM_RUST_RECONNECT"]})).await?;
-    let job=call(&client,"mux_open",json!({"session_id":sid,"command":["/bin/bash","-c","read value; printf 'STDIN:%s\\n' \"$value\"; sleep 30"]})).await?;
+    let job=call(&client,"run_command",json!({"session_id":sid,"command":["/bin/bash","-c","read value; printf 'STDIN:%s\\n' \"$value\"; sleep 30"]})).await?;
     let job_args = json!({"session_id":sid,"job_id":job["job_id"]});
     client.cancel().await?;
     client = fixture.connect(&access).await?;
     let info = call(&client, "connect_session", json!({"session_id":sid})).await?;
     ensure!(
-        info["mux_jobs"]
+        info["jobs"]
             .as_array()
             .unwrap()
             .iter()
@@ -277,7 +277,7 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
     );
     call(
         &client,
-        "mux_send",
+        "send_stdin",
         json!({"session_id":sid,"job_id":job["job_id"],"text":"hello","keys":["Enter"]}),
     )
     .await?;
@@ -306,12 +306,12 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
     println!(
         "PASS official Rust client disconnect/reconnect, job discovery, live stdin and ordinary job continuation"
     );
-    call(&client, "mux_stop", job_args.clone()).await?;
+    call(&client, "stop_command", job_args.clone()).await?;
     ensure!(
-        call(&client, "mux_poll", job_args).await?["status"] == "unavailable",
+        call(&client, "read_output", job_args).await?["status"] == "unavailable",
         "stop failed"
     );
-    let output=call(&client,"mux_open",json!({"session_id":sid,"command":["/bin/bash","-c","for i in {1..300}; do printf '%0100d\\n' \"$i\"; done; exit 7"]})).await?;
+    let output=call(&client,"run_command",json!({"session_id":sid,"command":["/bin/bash","-c","for i in {1..300}; do printf '%0100d\\n' \"$i\"; done; exit 7"]})).await?;
     let capped = until(
         &client,
         json!({"session_id":sid,"job_id":output["job_id"],"max_output_bytes":1024}),
@@ -355,7 +355,7 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
         "upstream stop failed"
     );
     println!("PASS Rust terminal/upstream output bounds, exit, stop and close guard");
-    let durable=call(&client,"mux_open",json!({"session_id":sid,"command":["/bin/bash","-c","printf RUST_SERVER_RESTART_OK; sleep 30"]})).await?;
+    let durable=call(&client,"run_command",json!({"session_id":sid,"command":["/bin/bash","-c","printf RUST_SERVER_RESTART_OK; sleep 30"]})).await?;
     let durable_args = json!({"session_id":sid,"job_id":durable["job_id"]});
     until(&client, durable_args.clone(), |r| {
         r["output"]
@@ -371,7 +371,7 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
     fixture.ready(&mut server).await?;
     client = fixture.connect(&access).await?;
     ensure!(
-        call(&client, "mux_poll", durable_args).await?["status"] == "running",
+        call(&client, "read_output", durable_args).await?["status"] == "running",
         "restart lost process"
     );
     ensure!(
@@ -384,7 +384,7 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
     println!("PASS actual Rust server restart retains tmux process and memo");
     let environment = call(
         &client,
-        "mux_open",
+        "run_command",
         json!({"session_id":sid,"command":["/usr/bin/env"]}),
     )
     .await?;

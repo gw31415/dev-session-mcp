@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{io::AsyncWriteExt, process::Command};
@@ -23,7 +24,7 @@ pub struct Workspace {
     socket: PathBuf,
     tmux_config: PathBuf,
     _backend: std::fs::File,
-    create_session: tokio::sync::Mutex<()>,
+    session_operations: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 pub fn clean_environment() -> Result<()> {
@@ -95,7 +96,7 @@ pub fn bounded(text: &str, limit: usize, from_end: bool) -> (String, bool) {
         }
         (text[start..].into(), true)
     } else {
-        let marker = "\n[output truncated by oci-dev-mcp]";
+        let marker = "\n[output truncated by dev-session-mcp]";
         let mut end = limit.saturating_sub(marker.len());
         while !text.is_char_boundary(end) {
             end -= 1;
@@ -115,9 +116,9 @@ impl Workspace {
     pub async fn new() -> Result<Self> {
         clean_environment()?;
         let home = dirs::home_dir().context("HOME is required")?;
-        let state = std::env::var_os("OCI_DEV_STATE_DIR")
+        let state = std::env::var_os("DEV_SESSION_MCP_STATE_DIR")
             .map(PathBuf::from)
-            .unwrap_or(home.join(".local/state/oci-dev-mcp"));
+            .unwrap_or(home.join(".local/state/dev-session-mcp"));
         ensure!(state.is_absolute(), "state directory must be absolute");
         let socket = state.join("tmux.sock");
         ensure!(
@@ -145,11 +146,11 @@ impl Workspace {
             socket,
             tmux_config,
             _backend: backend,
-            create_session: tokio::sync::Mutex::new(()),
-            cwd: std::env::var_os("OCI_DEV_DEFAULT_CWD")
+            session_operations: tokio::sync::Mutex::new(HashMap::new()),
+            cwd: std::env::var_os("DEV_SESSION_MCP_DEFAULT_CWD")
                 .map(PathBuf::from)
                 .unwrap_or(home),
-            tmux: std::env::var("OCI_DEV_TMUX_BIN").unwrap_or("tmux".into()),
+            tmux: std::env::var("DEV_SESSION_MCP_TMUX_BIN").unwrap_or("tmux".into()),
         };
         let check = Command::new(&result.tmux)
             .arg("-V")
@@ -168,6 +169,81 @@ impl Workspace {
     fn job_dir(&self, id: &str, job: &str) -> Result<PathBuf> {
         config::validate_session_id(job)?;
         Ok(self.session_dir(id)?.join("jobs").join(job))
+    }
+    async fn operation_lock(&self, id: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        config::validate_session_id(id)?;
+        Ok(self
+            .session_operations
+            .lock()
+            .await
+            .entry(id.into())
+            .or_default()
+            .clone())
+    }
+    async fn pointer(&self, id: &str, name: &str) -> Result<Option<String>> {
+        let path = self.session_dir(id)?.join(format!("{name}.json"));
+        match tokio::fs::read(path).await {
+            Ok(bytes) => {
+                let record: Value = serde_json::from_slice(&bytes)?;
+                let job = text(&record, "job_id")?.to_owned();
+                self.job(id, &job).await?;
+                Ok(Some(job))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+    async fn select(&self, id: &str, name: &str, job: &str) -> Result<()> {
+        let dir = self.session_dir(id)?;
+        let temporary = dir.join(format!("{name}-{}.tmp", uuid::Uuid::new_v4()));
+        tokio::fs::write(&temporary, serde_json::to_vec(&json!({"job_id":job}))?).await?;
+        tokio::fs::rename(temporary, dir.join(format!("{name}.json"))).await?;
+        Ok(())
+    }
+    async fn ensure_terminal(&self, id: &str, cwd: &Path) -> Result<String> {
+        let previous = self.pointer(id, "terminal").await?;
+        if let Some(job) = &previous {
+            if self.status(job).await?["status"] == "running" {
+                return Ok(job.clone());
+            }
+        }
+        let active = self.pointer(id, "current").await?;
+        let job = self
+            .start(
+                id,
+                "shell",
+                vec![
+                    "/bin/bash".into(),
+                    "--noprofile".into(),
+                    "--norc".into(),
+                    "-i".into(),
+                ],
+                cwd,
+            )
+            .await?;
+        let job = text(&job, "job_id")?.to_owned();
+        self.select(id, "terminal", &job).await?;
+        if active.is_none() || active == previous {
+            self.select(id, "current", &job).await?;
+        }
+        Ok(job)
+    }
+    async fn command_args(&self, id: &str, args: &Value) -> Result<Value> {
+        let job = match args.get("job_id") {
+            Some(_) => text(args, "job_id")?.to_owned(),
+            None => self
+                .pointer(id, "current")
+                .await?
+                .context("no active command; connect_session or run_command first")?,
+        };
+        let record = self.job(id, &job).await?;
+        ensure!(
+            record["kind"] != "approvals",
+            "approval terminal is not a command job"
+        );
+        let mut resolved = args.clone();
+        resolved["job_id"] = json!(job);
+        Ok(resolved)
     }
     async fn tmux(
         &self,
@@ -317,7 +393,15 @@ impl Workspace {
         let mut result = serde_json::to_value(session)?;
         let object = result.as_object_mut().unwrap();
         object.insert("session_id".into(), json!(id));
-        object.insert("mux_jobs".into(), json!(jobs));
+        object.insert("jobs".into(), json!(jobs));
+        object.insert(
+            "terminal_job_id".into(),
+            json!(self.pointer(id, "terminal").await?),
+        );
+        object.insert(
+            "active_job_id".into(),
+            json!(self.pointer(id, "current").await?),
+        );
         object.insert(
             "memo_available".into(),
             json!(self.session_dir(id)?.join("memo.md").is_file()),
@@ -343,13 +427,14 @@ impl Workspace {
             return Ok(json!({"sessions":sessions}));
         }
         if name == "create_session" {
-            let _creating = self.create_session.lock().await;
             let id = a
                 .get("session_id")
                 .map(|_| text(a, "session_id").map(str::to_owned))
                 .transpose()?
                 .unwrap_or(uuid::Uuid::new_v4().to_string());
             config::validate_session_id(&id)?;
+            let operation = self.operation_lock(&id).await?;
+            let _operation = operation.lock().await;
             ensure!(
                 !config::session_path(&id)?.exists(),
                 "session already exists; use connect_session"
@@ -373,6 +458,7 @@ impl Workspace {
             .await?;
             for _ in 0..50 {
                 if config::session_path(&id)?.is_file() {
+                    self.ensure_terminal(&id, &cwd).await?;
                     return self.session_info(&id).await;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -380,9 +466,14 @@ impl Workspace {
             anyhow::bail!("session terminal did not create metadata");
         }
         let id = text(a, "session_id")?;
+        let operation = self.operation_lock(id).await?;
+        let _operation = operation.lock().await;
         let session = config::load_session(id).await?;
         match name {
-            "connect_session" => self.session_info(id).await,
+            "connect_session" => {
+                self.ensure_terminal(id, &session.cwd).await?;
+                self.session_info(id).await
+            }
             "get_memo" => {
                 let path = self.session_dir(id)?.join("memo.md");
                 let memo = if path.exists() {
@@ -401,29 +492,33 @@ impl Workspace {
                 tokio::fs::rename(&temporary, dir.join("memo.md")).await?;
                 Ok(json!({"session_id":id,"saved":true,"bytes":memo.len()}))
             }
-            "mux_open" => {
-                let command = match a.get("command") {
-                    Some(v) => serde_json::from_value(v.clone())?,
-                    None => vec![
-                        "/bin/bash".into(),
-                        "--noprofile".into(),
-                        "--norc".into(),
-                        "-i".into(),
-                    ],
+            "run_command" => {
+                let job = match a.get("command") {
+                    None => {
+                        ensure!(a.get("cwd").is_none(), "cwd requires command argv");
+                        self.ensure_terminal(id, &session.cwd).await?
+                    }
+                    Some(value) => {
+                        let command = serde_json::from_value(value.clone())?;
+                        let path = a
+                            .get("cwd")
+                            .map(|_| text(a, "cwd").map(PathBuf::from))
+                            .transpose()?
+                            .unwrap_or(PathBuf::from("."));
+                        let cwd = config::canonical_directory(&session.cwd.join(path))?;
+                        let job = self.start(id, "terminal", command, &cwd).await?;
+                        text(&job, "job_id")?.to_owned()
+                    }
                 };
-                let path = a
-                    .get("cwd")
-                    .map(|_| text(a, "cwd").map(PathBuf::from))
-                    .transpose()?
-                    .unwrap_or(PathBuf::from("."));
-                let cwd = config::canonical_directory(&session.cwd.join(path))?;
-                let job = self.start(id, "terminal", command, &cwd).await?;
-                self.poll(&job).await
+                self.select(id, "current", &job).await?;
+                let mut args = a.clone();
+                args["job_id"] = json!(job);
+                self.poll(&args).await
             }
-            "mux_poll" => self.poll(a).await,
-            "mux_send" => {
-                let job = text(a, "job_id")?;
-                self.job(id, job).await?;
+            "read_output" => self.poll(&self.command_args(id, a).await?).await,
+            "send_stdin" => {
+                let args = self.command_args(id, a).await?;
+                let job = text(&args, "job_id")?;
                 ensure!(
                     self.status(job).await?["status"] == "running",
                     "terminal is not running"
@@ -475,11 +570,12 @@ impl Workspace {
                         self.tmux(args, None, false).await?;
                     }
                 }
-                self.poll(a).await
+                self.poll(&args).await
             }
-            "mux_stop" => {
-                let job = text(a, "job_id")?;
-                let mut before = self.poll(a).await?;
+            "stop_command" => {
+                let args = self.command_args(id, a).await?;
+                let job = text(&args, "job_id")?;
+                let mut before = self.poll(&args).await?;
                 self.tmux(
                     vec!["kill-session".into(), "-t".into(), format!("=odm_{job}")],
                     None,
@@ -492,7 +588,7 @@ impl Workspace {
             }
             "close_session" => {
                 let info = self.session_info(id).await?;
-                for job in info["mux_jobs"].as_array().unwrap() {
+                for job in info["jobs"].as_array().unwrap() {
                     let job = job["job_id"].as_str().unwrap();
                     self.tmux(
                         vec!["kill-session".into(), "-t".into(), format!("=odm_{job}")],

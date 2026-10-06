@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenAI Secure MCP Tunnel for development tools
+Description=dev-session-mcp via OpenAI Secure MCP Tunnel
 After=network-online.target
 Wants=network-online.target
 
@@ -9,8 +9,8 @@ User=mcp-tunnel
 Group=mcp-tunnel
 Environment=HOME=/var/lib/mcp-tunnel
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-LoadCredential=runtime-key:/etc/oci-dev-tunnel/runtime-key
-ExecStart=/usr/local/bin/tunnel-client run --config /etc/oci-dev-tunnel/config.yaml --control-plane.api-key=file:%d/runtime-key
+LoadCredential=runtime-key:/etc/dev-session-mcp-tunnel/runtime-key
+ExecStart=/usr/local/bin/tunnel-client run --config /etc/dev-session-mcp-tunnel/config.yaml --control-plane.api-key=file:%d/runtime-key
 Restart=on-failure
 RestartSec=5
 UMask=0077

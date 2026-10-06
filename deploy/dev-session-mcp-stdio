@@ -10,6 +10,6 @@ cd /home/devmcp/projects
 exec /usr/bin/env -i \
   HOME=/home/devmcp PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
   XDG_STATE_HOME=/home/devmcp/.local/state \
-  OCI_DEV_STATE_DIR=/home/devmcp/.local/state/oci-dev-mcp \
-  OCI_DEV_DEFAULT_CWD=/home/devmcp/projects \
-  /opt/oci-dev-mcp/bin/oci-dev-mcp stdio
+  DEV_SESSION_MCP_STATE_DIR=/home/devmcp/.local/state/dev-session-mcp \
+  DEV_SESSION_MCP_DEFAULT_CWD=/home/devmcp/projects \
+  /opt/dev-session-mcp/bin/dev-session-mcp stdio

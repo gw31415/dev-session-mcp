@@ -1,11 +1,11 @@
 [package]
-name = "oci-dev-mcp"
+name = "dev-session-mcp"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
 description = "Persistent Rust stdio development MCP for Secure MCP Tunnel"
-default-run = "oci-dev-mcp"
+default-run = "dev-session-mcp"
 
 [dependencies]
 axum = "0.8"

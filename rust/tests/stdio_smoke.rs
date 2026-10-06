@@ -18,7 +18,7 @@ struct StdioFixture {
 impl StdioFixture {
     async fn new() -> Result<Self> {
         let home = tempfile::Builder::new()
-            .prefix("odm-stdio-")
+            .prefix("dsm-stdio-")
             .tempdir_in("/tmp")?;
         let cwd = home.path().join("project");
         tokio::fs::create_dir(&cwd).await?;
@@ -31,17 +31,17 @@ impl StdioFixture {
                 home.path().join("xdg").display().to_string(),
             ),
             (
-                "OCI_DEV_STATE_DIR".into(),
+                "DEV_SESSION_MCP_STATE_DIR".into(),
                 home.path().join("state").display().to_string(),
             ),
             (
-                "OCI_DEV_TMUX_BIN".into(),
-                std::env::var("OCI_DEV_TMUX_BIN").unwrap_or("tmux".into()),
+                "DEV_SESSION_MCP_TMUX_BIN".into(),
+                std::env::var("DEV_SESSION_MCP_TMUX_BIN").unwrap_or("tmux".into()),
             ),
         ]);
-        let binary = std::env::var_os("OCI_DEV_RUST_BIN")
+        let binary = std::env::var_os("DEV_SESSION_MCP_RUST_BIN")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_oci-dev-mcp")));
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_dev-session-mcp")));
         Ok(Self {
             home,
             cwd,
@@ -81,7 +81,7 @@ impl StdioFixture {
 }
 impl Drop for StdioFixture {
     fn drop(&mut self) {
-        let _ = std::process::Command::new(&self.env["OCI_DEV_TMUX_BIN"])
+        let _ = std::process::Command::new(&self.env["DEV_SESSION_MCP_TMUX_BIN"])
             .args(["-S"])
             .arg(self.home.path().join("state/tmux.sock"))
             .arg("kill-server")
@@ -95,16 +95,48 @@ impl Drop for StdioFixture {
 async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
     let fixture = StdioFixture::new().await?;
     let (client, first_pid) = fixture.connect().await?;
+    ensure!(
+        client
+            .peer_info()
+            .context("missing initialize result")?
+            .server_info
+            .as_ref()
+            .context("missing MCP server identity")?
+            .name
+            == "dev-session-mcp"
+    );
     ensure!(client.list_tools(None).await?.tools.len() == 20);
-    println!("PASS actual Rust stdio and official Rust SDK: 20 tools; no Node/HTTP/OAuth fixture");
+    println!(
+        "PASS actual dev-session-mcp stdio identity and official Rust SDK: 20 tools; no Node/HTTP/OAuth fixture"
+    );
 
     let sid = "stdio-check";
-    call(
+    let created = call(
         &client,
         "create_session",
         json!({"session_id":sid,"cwd":fixture.cwd}),
     )
     .await?;
+    let shell = created["terminal_job_id"]
+        .as_str()
+        .context("automatic terminal missing")?
+        .to_owned();
+    ensure!(created["active_job_id"] == shell);
+    ensure!(call(&client, "run_command", json!({"session_id":sid})).await?["job_id"] == shell);
+    call(
+        &client,
+        "send_stdin",
+        json!({"session_id":sid,"text":"printf 'AUTO_%s\\n' 'SHELL_OK'\n"}),
+    )
+    .await?;
+    until(&client, json!({"session_id":sid}), |r| {
+        r["output"].as_str().unwrap().contains("AUTO_SHELL_OK")
+    })
+    .await?;
+    ensure!(
+        call(&client, "connect_session", json!({"session_id":sid})).await?["terminal_job_id"]
+            == shell
+    );
     call(
         &client,
         "set_memo",
@@ -145,32 +177,97 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
     );
     println!("PASS stdio session/memo and real sandbox command/file read-write-edit");
 
+    let other_sid = "stdio-other";
+    let other_cwd = fixture.cwd.join("other-project");
+    tokio::fs::create_dir_all(&other_cwd).await?;
+    call(
+        &client,
+        "create_session",
+        json!({"session_id":other_sid,"cwd":other_cwd}),
+    )
+    .await?;
+    let other = call(&client, "run_command", json!({"session_id":other_sid,"command":["/bin/bash","-c","printf SECOND_READY; read value; printf 'SECOND:%s\n' \"$value\"; sleep 30"]})).await?;
+    until(&client, json!({"session_id":other_sid}), |r| {
+        r["output"].as_str().unwrap().contains("SECOND_READY")
+    })
+    .await?;
+    let parallel = call(&client, "run_command", json!({"session_id":sid,"command":["/bin/bash","-c","printf PARALLEL_READY; read value; printf 'PARALLEL:%s\n' \"$value\"; sleep 30"]})).await?;
+    let parallel_args = json!({"session_id":sid,"job_id":parallel["job_id"]});
+    until(&client, parallel_args.clone(), |r| {
+        r["output"].as_str().unwrap().contains("PARALLEL_READY")
+    })
+    .await?;
     let job = call(
         &client,
-        "mux_open",
+        "run_command",
         json!({"session_id":sid,"command":["/bin/bash","-c","printf STDIO_READY; read value; printf 'STDIN:%s\n' \"$value\"; sleep 30"]}),
     )
     .await?;
-    let args = json!({"session_id":sid,"job_id":job["job_id"]});
+    let args = json!({"session_id":sid});
     until(&client, args.clone(), |r| {
         r["output"].as_str().unwrap().contains("STDIO_READY")
     })
     .await?;
+    ensure!(call(&client, "read_output", args.clone()).await?["job_id"] == job["job_id"]);
+    ensure!(
+        raw(
+            &client,
+            "read_output",
+            json!({"session_id":sid,"job_id":other["job_id"]})
+        )
+        .await?
+        .is_error
+            == Some(true)
+    );
+    ensure!(
+        raw(
+            &client,
+            "send_stdin",
+            json!({"session_id":other_sid,"job_id":job["job_id"],"text":"WRONG","keys":["Enter"]})
+        )
+        .await?
+        .is_error
+            == Some(true)
+    );
+    call(
+        &client,
+        "send_stdin",
+        json!({"session_id":other_sid,"text":"other-only","keys":["Enter"]}),
+    )
+    .await?;
+    let second_output = until(&client, json!({"session_id":other_sid}), |r| {
+        r["output"].as_str().unwrap().contains("SECOND:other-only")
+    })
+    .await?;
+    ensure!(!second_output["output"].as_str().unwrap().contains("WRONG"));
+    call(&client, "send_stdin", json!({"session_id":sid,"job_id":parallel["job_id"],"text":"parallel-only","keys":["Enter"]})).await?;
+    until(&client, parallel_args.clone(), |r| {
+        r["output"]
+            .as_str()
+            .unwrap()
+            .contains("PARALLEL:parallel-only")
+    })
+    .await?;
+    ensure!(call(&client, "read_output", args.clone()).await?["job_id"] == job["job_id"]);
+    println!(
+        "PASS automatic session shell/reuse, session-only stdin/output, separate sessions and multiple in-flight commands without cross-talk"
+    );
     client.cancel().await?;
     StdioFixture::wait_exit(first_pid).await?;
 
     let (client, second_pid) = fixture.connect().await?;
     ensure!(second_pid != first_pid, "stdio child was not replaced");
     let sessions = call(&client, "list_sessions", json!({})).await?;
-    ensure!(sessions["sessions"].as_array().unwrap().len() == 1);
+    ensure!(sessions["sessions"].as_array().unwrap().len() == 2);
     let info = call(&client, "connect_session", json!({"session_id":sid})).await?;
     ensure!(
-        info["mux_jobs"]
+        info["jobs"]
             .as_array()
             .unwrap()
             .iter()
             .any(|v| v["job_id"] == job["job_id"])
     );
+    ensure!(info["active_job_id"] == job["job_id"] && info["terminal_job_id"] == shell);
     ensure!(
         call(&client, "get_memo", json!({"session_id":sid})).await?["text"]
             .as_str()
@@ -179,8 +276,8 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
     );
     call(
         &client,
-        "mux_send",
-        json!({"session_id":sid,"job_id":job["job_id"],"text":"hello","keys":["Enter"]}),
+        "send_stdin",
+        json!({"session_id":sid,"text":"hello","keys":["Enter"]}),
     )
     .await?;
     ensure!(
@@ -190,15 +287,29 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
         .await?["status"]
             == "running"
     );
-    call(&client, "mux_stop", args.clone()).await?;
-    ensure!(call(&client, "mux_poll", args).await?["status"] == "unavailable");
+    call(&client, "stop_command", args.clone()).await?;
+    ensure!(call(&client, "read_output", args).await?["status"] == "unavailable");
+    ensure!(call(&client, "read_output", parallel_args.clone()).await?["status"] == "running");
+    call(&client, "stop_command", parallel_args).await?;
+    ensure!(
+        call(
+            &client,
+            "read_output",
+            json!({"session_id":sid,"job_id":shell})
+        )
+        .await?["status"]
+            == "running"
+    );
+    ensure!(
+        call(&client, "read_output", json!({"session_id":other_sid})).await?["status"] == "running"
+    );
     println!(
         "PASS Rust stdio actual exit/replacement, session/memo/tmux reconnect, live stdin and stop"
     );
 
     let job = call(
         &client,
-        "mux_open",
+        "run_command",
         json!({"session_id":sid,"command":["/bin/bash","-c","for i in {1..300}; do printf '%0100d\n' \"$i\"; done; exit 7"]}),
     )
     .await?;
@@ -212,7 +323,7 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
     ensure!(capped["truncated"] == true && capped["exit_code"] == 7);
     let job = call(
         &client,
-        "mux_open",
+        "run_command",
         json!({"session_id":sid,"command":["/usr/bin/env"]}),
     )
     .await?;
@@ -230,10 +341,47 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
     );
     call(&client, "close_session", json!({"session_id":sid})).await?;
     ensure!(
+        raw(&client, "read_output", json!({"session_id":sid}))
+            .await?
+            .is_error
+            == Some(true)
+    );
+    ensure!(
+        raw(&client, "run_command", json!({"session_id":sid}))
+            .await?
+            .is_error
+            == Some(true)
+    );
+    ensure!(
+        call(&client, "read_output", json!({"session_id":other_sid})).await?["status"] == "running"
+    );
+    let recreated = call(
+        &client,
+        "create_session",
+        json!({"session_id":sid,"cwd":fixture.cwd}),
+    )
+    .await?;
+    ensure!(recreated["terminal_job_id"] != shell);
+    ensure!(
+        raw(
+            &client,
+            "read_output",
+            json!({"session_id":sid,"job_id":job["job_id"]})
+        )
+        .await?
+        .is_error
+            == Some(true)
+    );
+    call(&client, "close_session", json!({"session_id":sid})).await?;
+    call(&client, "close_session", json!({"session_id":other_sid})).await?;
+    ensure!(
         call(&client, "list_sessions", json!({})).await?["sessions"]
             .as_array()
             .unwrap()
             .is_empty()
+    );
+    println!(
+        "PASS individual command stop preserves other work; session close isolates other sessions; closed-session calls and stale job IDs rejected after recreate"
     );
     client.cancel().await?;
     StdioFixture::wait_exit(second_pid).await?;
@@ -255,15 +403,15 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
     let shell_path = |value: &std::path::Path| {
         format!("'{}'", value.display().to_string().replace('\'', "'\\''"))
     };
-    let tmux_dir = PathBuf::from(&fixture.env["OCI_DEV_TMUX_BIN"])
+    let tmux_dir = PathBuf::from(&fixture.env["DEV_SESSION_MCP_TMUX_BIN"])
         .parent()
         .context("tmux path needs a directory")?
         .to_owned();
-    let launcher = include_str!("../../deploy/oci-dev-rust-stdio")
+    let launcher = include_str!("../../deploy/dev-session-mcp-stdio")
         .replace("/home/devmcp/projects", &shell_path(&fixture.cwd))
         .replace("/home/devmcp", &shell_path(fixture.home.path()))
         .replace(
-            "/opt/oci-dev-mcp/bin/oci-dev-mcp",
+            "/opt/dev-session-mcp/bin/dev-session-mcp",
             &shell_path(&fixture.binary),
         )
         .replace(

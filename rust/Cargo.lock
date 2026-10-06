@@ -2901,7 +2901,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "oci-dev-mcp"
+name = "dev-session-mcp"
 version = "0.2.0"
 dependencies = [
  "allocative",

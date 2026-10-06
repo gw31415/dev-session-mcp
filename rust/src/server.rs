@@ -51,17 +51,17 @@ impl Tools {
         );
         add(
             "create_session",
-            "Create a local-mcp session in tmux. Existing IDs are not overwritten.",
+            "Create a development session with an automatically managed persistent terminal. Existing IDs are not overwritten.",
             json!({"session_id":sid,"cwd":string}),
             &[],
             false,
         );
         add(
             "connect_session",
-            "Reconnect and discover persistent job IDs. No exclusive ownership or editing lock.",
+            "Reconnect a session and automatically reuse or restore its persistent terminal. Discover command job IDs; no editing lock.",
             json!({"session_id":sid}),
             &["session_id"],
-            true,
+            false,
         );
         add(
             "get_memo",
@@ -78,36 +78,36 @@ impl Tools {
             false,
         );
         add(
-            "mux_open",
-            "Open persistent argv or interactive bash in tmux. FULL service-user filesystem/network access without a sandbox or approval prompt. Use execute for sandboxed commands.",
-            json!({"session_id":sid,"command":{"type":"array","items":string,"minItems":1,"maxItems":256},"cwd":string}),
+            "run_command",
+            "Run persistent argv in this session; omitted command reuses its interactive shell. Selects the returned job for session-only stdin/output/stop. Other commands keep running. FULL service-user filesystem/network access without sandbox or approval. Use execute for sandboxed commands.",
+            json!({"session_id":sid,"command":{"type":"array","items":string,"minItems":1,"maxItems":256},"cwd":string,"max_output_bytes":output}),
             &["session_id"],
             false,
         );
         add(
-            "mux_poll",
-            "Return bounded merged terminal output and exit status. Repeated terminal snapshot, not a stream.",
+            "read_output",
+            "Read bounded merged terminal output and exit status for this session's selected command. Optional job_id selects another command belonging to this session. Repeated terminal snapshot, not a stream.",
             json!({"session_id":sid,"job_id":sid,"max_output_bytes":output}),
-            &["session_id", "job_id"],
+            &["session_id"],
             true,
         );
         add(
-            "mux_send",
-            "Send literal stdin text and terminal keys; Enter submits, C-c interrupts, C-d sends EOF.",
+            "send_stdin",
+            "Send literal stdin to this session's selected command, with optional job_id for another command in this session. FULL service-user rights without sandbox or approval. Enter submits; C-c interrupts; C-d sends EOF.",
             json!({"session_id":sid,"job_id":sid,"text":string,"keys":{"type":"array","maxItems":16,"items":{"type":"string","enum":["Enter","C-c","C-d","Escape","Tab","Up","Down","Left","Right"]}},"max_output_bytes":output}),
-            &["session_id", "job_id"],
+            &["session_id"],
             false,
         );
         add(
-            "mux_stop",
-            "Stop a tmux terminal. Detached/daemonized descendants need explicit process management.",
+            "stop_command",
+            "Stop only the selected command (optional job_id) in this session. Other commands and the session remain. Detached/daemonized descendants need explicit process management.",
             json!({"session_id":sid,"job_id":sid}),
-            &["session_id", "job_id"],
+            &["session_id"],
             false,
         );
         add(
             "close_session",
-            "Stop persistent terminals and remove session/memo metadata. Refuses while ordinary upstream jobs remain tracked.",
+            "Stop all managed terminals/commands in this session and remove session/memo metadata. Other sessions remain. Refuses while ordinary sandboxed jobs remain tracked.",
             json!({"session_id":sid}),
             &["session_id"],
             false,
@@ -197,7 +197,8 @@ impl Tools {
 impl ServerHandler for Tools {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Use list_sessions, create_session or connect_session. Persist work with tmux mux tools; save an explicit memo for handover. Ordinary execute jobs survive HTTP disconnect, but require this server process. mux tools have full OS-user and network rights.")
+            .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+            .with_instructions("Create or connect a session; its persistent terminal is managed automatically. Use session_id with run_command, read_output, send_stdin and stop_command. Omit command in run_command to reuse the interactive shell. The most recent run selects the default job; use job_id for concurrent commands. These terminal tools have full OS-user/filesystem/network rights without a sandbox or approval. execute/start_command keep their sandbox contract and process-local job handles. Save a memo for handover; close_session ends all terminals in that session.")
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tools.iter().find(|t| t.name == name).cloned()
@@ -296,7 +297,7 @@ pub async fn http(path: PathBuf) -> Result<()> {
         .merge(protected);
     let listener = tokio::net::TcpListener::bind(auth.settings.listen).await?;
     eprintln!(
-        "oci-dev-mcp listening on loopback {} (OAuth required)",
+        "dev-session-mcp listening on loopback {} (OAuth required)",
         auth.settings.listen
     );
     axum::serve(listener, app)

@@ -219,7 +219,7 @@ pub struct Fixture {
 impl Fixture {
     pub async fn new() -> Result<Self> {
         let home = tempfile::Builder::new()
-            .prefix("odm-rust-")
+            .prefix("dsm-rust-")
             .tempdir_in("/tmp")?;
         let cwd = home.path().join("project");
         tokio::fs::create_dir(&cwd).await?;
@@ -261,17 +261,17 @@ impl Fixture {
                 home.path().join("xdg").display().to_string(),
             ),
             (
-                "OCI_DEV_STATE_DIR".into(),
+                "DEV_SESSION_MCP_STATE_DIR".into(),
                 home.path().join("state").display().to_string(),
             ),
             (
-                "OCI_DEV_TMUX_BIN".into(),
-                std::env::var("OCI_DEV_TMUX_BIN").unwrap_or("tmux".into()),
+                "DEV_SESSION_MCP_TMUX_BIN".into(),
+                std::env::var("DEV_SESSION_MCP_TMUX_BIN").unwrap_or("tmux".into()),
             ),
         ]);
-        let binary = std::env::var_os("OCI_DEV_RUST_BIN")
+        let binary = std::env::var_os("DEV_SESSION_MCP_RUST_BIN")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_oci-dev-mcp")));
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_dev-session-mcp")));
         Ok(Self {
             home,
             cwd,
@@ -498,9 +498,9 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.issuer_task.abort();
-        let _ = std::process::Command::new(&self.env["OCI_DEV_TMUX_BIN"])
+        let _ = std::process::Command::new(&self.env["DEV_SESSION_MCP_TMUX_BIN"])
             .arg("-S")
-            .arg(Path::new(&self.env["OCI_DEV_STATE_DIR"]).join("tmux.sock"))
+            .arg(Path::new(&self.env["DEV_SESSION_MCP_STATE_DIR"]).join("tmux.sock"))
             .arg("kill-server")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -539,7 +539,7 @@ pub async fn until(
     predicate: impl Fn(&Value) -> bool,
 ) -> Result<Value> {
     for _ in 0..100 {
-        let result = call(client, "mux_poll", args.clone()).await?;
+        let result = call(client, "read_output", args.clone()).await?;
         if predicate(&result) {
             return Ok(result);
         }
