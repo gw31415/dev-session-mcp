@@ -1,0 +1,8 @@
+node_modules/
+.state/
+.test-*/
+*.tgz
+*.env
+library-identity.json
+target/
+vendor/local-mcp/.github/

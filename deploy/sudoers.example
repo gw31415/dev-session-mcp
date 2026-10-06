@@ -1,0 +1,4 @@
+# root:root 0440 at /etc/sudoers.d/oci-dev-mcp; validate using visudo -cf.
+# Empty argument string permits this exact wrapper with NO arguments only.
+Defaults:mcp-tunnel !requiretty
+mcp-tunnel ALL=(devmcp) NOPASSWD: /usr/local/libexec/oci-dev-mcp-stdio ""

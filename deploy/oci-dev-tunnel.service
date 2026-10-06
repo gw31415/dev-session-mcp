@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenAI Secure MCP Tunnel for development tools
+After=network-online.target oci-dev-worker.service
+Wants=network-online.target oci-dev-worker.service
+
+[Service]
+Type=simple
+User=mcp-tunnel
+Group=mcp-tunnel
+Environment=HOME=/var/lib/mcp-tunnel
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+LoadCredential=runtime-key:/etc/oci-dev-tunnel/runtime-key
+ExecStart=/usr/local/bin/tunnel-client run --config /etc/oci-dev-tunnel/config.yaml --control-plane.api-key=file:%d/runtime-key
+Restart=on-failure
+RestartSec=5
+UMask=0077
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+# Do not enable NoNewPrivileges here: the fixed sudo UID transition needs it off.
+
+[Install]
+WantedBy=multi-user.target
