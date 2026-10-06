@@ -43,3 +43,12 @@ codex-linux-sandbox = { git = "https://github.com/openai/codex", rev = "20fedaff
 
 [profile.release]
 strip = true
+
+[dev-dependencies]
+# Test clients and ephemeral OAuth fixtures only; no Node runtime/test runner.
+rmcp = { version = "=3.5.1", features = ["client", "transport-streamable-http-client-reqwest", "transport-child-process"] }
+test-http = { package = "reqwest", version = "0.13.2", default-features = false, features = ["json", "query"] }
+rsa = "0.9"
+rand = "0.8"
+sha2 = "0.10"
+tempfile = "3"
