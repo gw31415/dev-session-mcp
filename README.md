@@ -53,13 +53,13 @@ Tunnel/Rust stdioの終了・再起動を越えてtmuxとmemoは保持できま�
 
 runtime keyは `/etc/oci-dev-tunnel/runtime-key` のroot専用0600ファイルへ置き、systemd `LoadCredential` からTunnel専用UIDだけへ渡します。admin keyは常駐clientに使いません。Tunnel UIDと作業UIDを分離し、固定root所有wrapperのみをsudoersで許可します。wrapperはenvを空にしてRust stdioを起動し、keyやcredential directoryを作業shellへ渡しません。stdioプロセスもtransport envの混入を拒否します。
 
-同じTunnel IDのactive tunnel-clientは1個だけ、同じstateのRust backendも1個だけです。既存Node worker、別stdio、HTTP backendを同じstateで併用しません。MCP通信にTCP/Unix brokerは増設せず、専用 `tmux.sock` はtmux制御のためだけに使います。[公式stdio運用制限](https://github.com/openai/tunnel-client/blob/master/docs/configuration.md#stdio-deployment-limits)
+同じTunnel IDのactive tunnel-clientは1個だけ、同じstateのRust backendも1個だけです。MCP通信にTCP/Unix brokerは増設せず、専用 `tmux.sock` はtmux制御のためだけに使います。[公式stdio運用制限](https://github.com/openai/tunnel-client/blob/master/docs/configuration.md#stdio-deployment-limits)
 
 ## 確認状況と保存
 
-Rust stdioのローカル実検証は [docs/TUNNEL-STDIO-VALIDATION.md](docs/TUNNEL-STDIO-VALIDATION.md)。以前のHTTP実装/検証はソースと過去文書へ残していますが、今回の導入では起動しません。旧Nodeも削除の本人確認待ちで保持しており、今回の起動経路からは参照しません。
+Rust stdioのローカル実検証は [VALIDATION.md](VALIDATION.md)。旧Node実装・JS test・npm依存・旧配布例は整理済みで、旧版は [Git履歴](docs/HISTORY.md) から復元できます。既存のRust HTTP/OAuthコードとRust検証は保留機能として残していますが、Tunnel導入では使わず機能追加もしていません。
 
-**OCI ARM64、実Tunnel認証、実ChatGPT/dot接続、systemd実配置は未確認です。** ローカルMCP疎通と実機接続を区別します。`866b626`のソースarchive/patchはローカル保存済みですが、Library転送はForbiddenで未完了、GitHub mainへの保存も本人確認待ちです。
+**OCI ARM64、実Tunnel認証、実ChatGPT/dot接続、systemd実配置は未確認です。** ソースの保存先は本人の非公開GitHub repositoryです。ローカルMCP疎通と実機接続を区別します。
 
 再利用元は [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp)、revision `21025d048f54cc9f948c26ac42fa36183dc453c2`。vendor原本は変更せず、build.rsでtool dispatcherの可視性と同一binaryのsandbox helper呼出を調整します。上流LICENSEはMIT、Cargo欄はApache-2.0で不一致があるため双方を保持します。追加コードはMIT、推移的依存は各ライセンスに従います。
 

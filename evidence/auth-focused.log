@@ -1,5 +1,0 @@
-PASS startup rejects empty/multiple/duplicate/blank allowed_subjects before discovery or HTTP bind
-PASS oauth discovery priority, single-owner HTTP tools, different-sub/proxy-header/opaque-token rejection
-PASS oidc-inserted discovery priority, single-owner HTTP tools, different-sub/proxy-header/opaque-token rejection
-PASS oidc-appended discovery priority, single-owner HTTP tools, different-sub/proxy-header/opaque-token rejection
-PASS oidc-trailing discovery priority, single-owner HTTP tools, different-sub/proxy-header/opaque-token rejection

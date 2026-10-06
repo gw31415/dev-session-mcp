@@ -48,7 +48,7 @@ sudo install -o root -g root -m 0644 deploy/oci-dev-tunnel.service /etc/systemd/
 
 config.yamlのTunnel IDを実値へ置換します。MCP commandは `sudo -n -u devmcp -- /usr/local/libexec/oci-dev-rust-stdio`。sudoersはこの固定wrapperの**引数なし**だけを許可します。wrapperはsudoを再実行せず `env -i` でRust stdioを起動します。binary/wrapperと親ディレクトリはroot所有・作業UIDから変更不可にします。
 
-Node worker、HTTP service、Caddyはこの構成では配置/起動しません。Rust stdioはTunnelのchildとして常駐するため別workerサービスやUnix RPC brokerは不要です。上流session metadataは `/home/devmcp/.local/state/local-mcp/sessions`、拡張session/memo/tmuxは `/home/devmcp/.local/state/oci-dev-mcp`。パス変更時はwrapperのHOME/XDG_STATE_HOME/OCI_DEV_STATE_DIRを揃えます。
+Rust stdioはTunnelのchildとして常駐するため別workerサービスやUnix RPC brokerは不要です。上流session metadataは `/home/devmcp/.local/state/local-mcp/sessions`、拡張session/memo/tmuxは `/home/devmcp/.local/state/oci-dev-mcp`。パス変更時はwrapperのHOME/XDG_STATE_HOME/OCI_DEV_STATE_DIRを揃えます。
 
 ## 4. 既存runtime keyを安全に配置して起動
 
@@ -62,7 +62,7 @@ curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
-同じTunnel IDのclientは1個だけにします。手動runや旧Node worker/別Rust backendが同じstateで動いていれば、重複起動せず現状を確認して停止対象を決めます。必要な外向き接続は `api.openai.com:443`、既存control-plane mTLSを使う場合は `mtls.api.openai.com:443`。inbound portは開けません。health/UIはloopbackのみ。既存Tailscale/firewallを変更しません。
+同じTunnel IDのclientは1個だけにします。既存client/別Rust backendが動いていれば、重複起動せず現状を確認して停止対象を決めます。必要な外向き接続は `api.openai.com:443`、既存control-plane mTLSを使う場合は `mtls.api.openai.com:443`。inbound portは開けません。health/UIはloopbackのみ。既存Tailscale/firewallを変更しません。
 
 このunitは `KillMode=process` でtmuxをTunnelの停止/restartから残します。Rust stdioが終了すれば通常jobの追跡handleは失われます。生存が必要な作業はmux toolsで開始します。Tunnel停止を全作業の終了と取り違えないでください。
 
@@ -74,4 +74,4 @@ clientの健康状態を確認したうえで、ChatGPTのAdd custom MCP server�
 
 終了は `mux_stop` / `close_session`。全tmux作業を明示的に終了するならdevmcpとして `tmux -S /home/devmcp/.local/state/oci-dev-mcp/tmux.sock kill-server`。closeはmemoも削除し、daemon化した子孫はプロジェクト側のプロセス管理で停止します。without_sandboxの承認端末はconnect_sessionのkind=approvalsのjob_idから、devmcpで同じsocketの `odm_JOB_ID` sessionへattachします。
 
-現在、OCI ARM64・release build・実Tunnel認証・dot接続・systemd実配置は未確認です。旧JS削除とGitHub main保存は本人確認待ち。詳細は [stdio検証](../docs/TUNNEL-STDIO-VALIDATION.md)。
+現在、OCI ARM64・release build・実Tunnel認証・dot接続・systemd実配置は未確認です。旧Node版はGit履歴で復元でき、ソースは非公開GitHubへ保存します。詳細は [stdio検証](../VALIDATION.md)。

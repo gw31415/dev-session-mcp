@@ -1,9 +1,0 @@
-{
-  "listen": "127.0.0.1:8765",
-  "resource": "https://dev.example.com/mcp",
-  "issuer": "https://YOUR-TENANT.auth0.com/",
-  "allowed_subjects": ["auth0|REPLACE-WITH-YOUR-ACTUAL-USER-ID"],
-  "scope": "mcp:tools",
-  "allowed_origins": ["https://chatgpt.com:443"],
-  "local_fixture": false
-}

@@ -25,12 +25,12 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// OAuth-protected Streamable HTTP. Listens on loopback behind HTTPS.
+    /// Retained optional OAuth HTTP mode; unused by the Tunnel deployment.
     Serve {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Optional local stdio MCP, suitable for a credential-separated Tunnel.
+    /// Stdio MCP for the credential-separated Secure MCP Tunnel deployment.
     Stdio,
     /// Local session approval terminal (normally started inside tmux).
     Start { session_id: String },

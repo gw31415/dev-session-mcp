@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
-description = "OAuth-protected persistent development MCP server"
+description = "Persistent Rust stdio development MCP for Secure MCP Tunnel"
 default-run = "oci-dev-mcp"
 
 [dependencies]

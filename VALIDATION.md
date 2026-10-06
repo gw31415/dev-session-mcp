@@ -1,42 +1,27 @@
-# Validation — Rust HTTP 0.2.0
+# Validation — Rust stdio + Secure MCP Tunnel
 
-2026-10-06 UTC、独立した /workspace/oci-dev-mcp、Debian 13 x86_64。Rust/Cargo 1.98.1、Node 24.19.0（検証clientだけ）、実tmux 3.5a（task-local抽出）、bubblewrap 0.12.0。
-
-`cargo build --locked --manifest-path rust/Cargo.toml` 成功。debug executableは1ファイル、Codex Linux sandbox helperを組込み。localではCargo target cacheを共有したため実ファイルはvendor/local-mcp/target/debug/oci-dev-mcpに生成。通常buildではrust/target/debug/oci-dev-mcpに生成されます。release profile/OCI ARM64のbuildは未実施です。
-
-実fixtureのコマンド:
+2026-10-06 UTC、独立した `/workspace/oci-dev-mcp`、Debian 13 x86_64、Rust/Cargo 1.98.1、実tmux 3.5a、bubblewrap 0.12.0で検証しています。推奨導入はRust stdio + 公式Secure MCP Tunnelのみです。
 
 ```sh
-OCI_DEV_RUST_BIN=/workspace/oci-dev-mcp/vendor/local-mcp/target/debug/oci-dev-mcp \
-OCI_DEV_TMUX_BIN=/workspace/scratch/oci-dev-reference/tmux/usr/bin/tmux \
-node test/http-smoke.mjs
+cargo test --locked --manifest-path rust/Cargo.toml --test stdio_smoke -- --nocapture
 ```
 
-終了code 0。証拠は [evidence/http-smoke.log](evidence/http-smoke.log)。本番サーバー、公式MCP client、実tmux、実sandboxを使います。OAuth認可サーバーだけはloopbackのfixtureで、RS256鍵は実行時メモリ内に生成し、保存/外部登録しません。authorization/token交換はテストコードが手書きで行い、取得済みBearerを公式MCP clientへ直接渡しています。公式clientの自動OAuth discovery・client登録・外部AS linking、実IdPの本人ログイン、ChatGPT consentの成功証拠ではありません。
+旧Node削除後に再buildし、実stdio testはexit 0、1 passed、0 failed（0.66秒）でした。公式Rust MCP SDK clientで実Rust binaryを別processとして起動します。HTTP/OAuth fixtureやNodeを起動せず、一時HOME/state/projectと専用tmux socketを使います。実行ログは [evidence/rust-stdio-smoke.log](evidence/rust-stdio-smoke.log)。
 
-通過項目:
+確認済み動作:
 
-- サーバーのOAuth resource metadata・401 WWW-Authenticate・AS discovery/JWKSと、手書きfixture clientによるauthorization-code + PKCE S256 + resource交換。違うverifier/resourceはfixture ASが拒否。
-- JWT署名、issuer、audience、exp、nbf、kid、本人sub、scopeを検証。none/HS256、query token、悪意あるOrigin/Hostを拒否。
-- 現行2026-07-28 stateless HTTPのserver/discover、tools/list、tools/call。protocol metadata、Mcp-Method/Mcp-Name、session headerなし、resultType completeを確認。
-- 公式Node client 2.3.1の旧版互換HTTP initialize/tools/listで20ツール（本体10+追加10）。
-- 実local-mcp session作成/一覧/接続、明示メモ、組込みCodex sandbox execute、ファイル読取/書込/編集。現行HTTPでも上流read_fileを実行。
-- HTTPクライアント実切断/再作成後のupstream job継続、job再発見、live stdin送信。
-- tmux停止、停止後unavailable、1024-byte出力上限/truncated/exit code 7、upstream返却65536-byte上限、stop_job、通常jobがあるとclose拒否。
-- Rust server実終了/再起動後にもtmux processとmemoが維持。
-- shell環境にtransport/token/credentialが含まれないこと、明示close、transport envの起動拒否、server stderrにbearerが出ないこと。
-- 任意Rust stdioでも実MCP initialize/tools/list。
+- 20ツール取得、session作成/一覧/接続、明示memo保存。
+- 組込みCodex sandboxでコマンドとファイル読取/書込/上書き編集。
+- stdio processの実終了、別PIDで再起動、session/memo/tmux jobの再発見、継続中のstdin送信、停止。
+- 1024-byte出力上限・truncated・exit 7、shellへのtransport秘密環境非継承、明示close、秘密env混入時の起動拒否。
+- fixture pathに替えた実clean-env wrapper本体で、fake Tunnel envを除去しRust stdioの20ツール取得。実UID切替の成功証拠ではありません。
 
-独立監査後のfocused実プロセス検証は `test/auth-focused.mjs`、証拠は [evidence/auth-focused.log](evidence/auth-focused.log)、終了code 0。空・複数・重複・空文字subの設定をdiscovery/HTTP bind前に拒否し、本人1件の設定で20ツール取得、他subの拒否を確認しました。path付きissuerのOAuth path-insertion → OIDC path-insertion → OIDC path-appendingの優先順と、末尾slash付きissuerの完全一致も実fixtureで確認。opaque Bearerと`Cf-Access-Jwt-Assertion`単独では認証できないことも確認しました。これはRustサーバー自身のdiscovery/JWT受入テストで、MCP clientの自動OAuth登録/linkingテストではありません。
+この環境では外側sandboxが内側bubblewrapのsynthetic-mount lockをread-onlyにするため、実testは承認された制約外ローカルexecで実行します。通常executeのsandboxは有効のままです。
 
-設定名/CLIは維持し、`allowed_subjects`の要素数を1件へ制約しました。複数ユーザー間のMCPセッション分離を増築していません。Cloudflare Access Managed OAuthのopaque-token方式は現版非対応で、README/INSTALLに明記しています。
+wrapper/preflightのshell構文と実OS/CPU/build依存検出は確認済み。wrapperの引数拒否は終了code 64。systemd unitの配置先tunnel-clientはこの環境に無く、sudo/visudoも未導入なので、実service起動・sudoers/UID移行は未確認です。これを通すためのOS変更は実施していません。
 
-最初の停止後判定の不具合（tmux display-messageの曖昧なtarget）はexact has-session確認とcapture時の終了race処理で修正し、同じ実fixtureで再確認しました。現行discovery応答はsupportedVersionsで、旧initializeのprotocolVersionと区別して検証します。
+旧Node実装・JS test・npm依存/cache・旧worker/wrapper・重複手順と古いログは整理しました。旧版の復元元と保全するcheckpointは [docs/HISTORY.md](docs/HISTORY.md)。元vendor source/ライセンスと既存mycastは変更しません。
 
-この環境では外側sandboxが内側bubblewrapのsynthetic-mount lockをread-onlyにします。fixtureを許可された制約外execで実行しました。通常executeをunsandboxedへ差し替えたり、Codex sandboxを無効化してはいません。
+Rust HTTP/OAuth実装と対応するRust test/過去ログは保留機能として残しています。Tunnel導入・stdio testでは使用せず、機能追加もしていません。本番ASや認証/ログイン成功の証拠として扱いません。
 
-preflightは実OS/CPU/runtime/build依存を検出して通過。shell構文確認済み。systemd/Caddyは設定例のみで、実配置/起動/TLS成功を検証したものではありません。Node版の過去証拠は [docs/LEGACY-VALIDATION.md](docs/LEGACY-VALIDATION.md)。元Nodeコードとvendor Rust原本は未変更です。
-
-未実施: OCI ARM64、公開HTTPS、外部OAuth AS、実ChatGPT/dot/Tunnel接続。新規実OAuth client/key/grant、OSユーザー/サービス/ネットワーク変更、OCIdeployは実施していません。既存mycastのtracked変更なし。private専用GitHubのmainへのソース保存だけを実施しています。
-
-通常upstream jobsはサーバーprocess終了で失われ、tmuxもホスト再起動を越えて継続しません。巨大file/outputの内部メモリ消費は上流のままです。JWT失効照会は未実装で、期限とallowlistを使います。
+未確認: OCI ARM64、release build、実Tunnel認証、実ChatGPT/dot接続、systemd/sudoers/UIDの実配置。新規実鍵/grant、OCI deploy、OS/network/Tailscale変更は今回の承認範囲に含めず実施していません。導入手順は [INSTALL](deploy/INSTALL.md)、OCI側の準備依頼は [BOOTSTRAP](deploy/BOOTSTRAP.md)。
