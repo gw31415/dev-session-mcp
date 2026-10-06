@@ -15,7 +15,9 @@ ChatGPT / dot → HTTPS reverse proxy → 127.0.0.1:8765/mcp
 
 必要な設定は公開HTTPS `/mcp` URL、ASの正確なissuer、許可する本人の`sub`、作業ユーザー/ディレクトリです。scopeは既定 `mcp:tools`。MCPサーバー側にOAuth client secretや署名秘密鍵は不要です。
 
-ASはauthorization-code + **PKCE S256**、discovery/JWKS、`resource`パラメータをauthorization/token両方で受けて同じ値をaccess tokenの`aud`へ入れる設定、scope、ChatGPTのCIMD・DCR・事前登録のいずれかに対応する必要があります。AS側でログイン・同意・クライアント/redirect登録を行います。対応するASを既に持たない場合、この設定が残る運用作業です。fixtureのASは本番用ではありません。
+ASはauthorization-code + **PKCE S256**、discovery/JWKS、**RS256で署名したJWT access tokenをAuthorization: Bearerで渡すこと**、`resource`パラメータをauthorization/token両方で受けて同じ値をaccess tokenの`aud`へ入れる設定、scope、ChatGPTのCIMD・DCR・事前登録のいずれかに対応する必要があります。AS側でログイン・同意・クライアント/redirect登録を行います。対応するASを既に持たない場合、この設定が残る運用作業です。fixtureのASは本番用ではありません。
+
+**Cloudflare Access Managed OAuthは現版では非対応です。** 公式仕様ではopaque access tokenを発行し、originには`Cf-Access-Jwt-Assertion`を渡します。本サーバーはopaque tokenの照会やそのheaderによる認証を実装していないため、issuerだけをCloudflareへ変更しても動きません。[Cloudflareのtoken形式](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/#token-format)
 
 詳細とAuth0の公式手順、systemd/Caddy例は [deploy/INSTALL.md](deploy/INSTALL.md)。バックエンドはloopback以外へのbindを拒否します。公開URLとissuerはHTTPS必須。公開HTTPSのTLS終端はreverse proxyが行います。
 
@@ -52,7 +54,7 @@ HTTP切断で通常ジョブを終了しません。サーバー再起動でもt
 
 ## 権限・認証・秘密の分離
 
-**mux_open/mux_sendはserviceユーザーの全ファイル・network権限で任意コマンドを実行します。sandboxや別承認はありません。** OAuthの同意と本人subのallowlistは、この強い権限を渡してよいユーザーだけに限定してください。複数subを許可すると全員が同じOSユーザー/セッションを共有します。
+**mux_open/mux_sendはserviceユーザーの全ファイル・network権限で任意コマンドを実行します。sandboxや別承認はありません。** 本サーバーは本人1人専用です。`allowed_subjects`は本人の`sub`を1件だけ指定し、空・複数件（重複も含む）は起動時に拒否します。全MCP接続がこの唯一の本人として同じOSユーザー/セッションを使います。複数ユーザー間のセッション分離は提供しません。
 
 ASの署名秘密鍵/client secretはAS側に置きます。HTTPS proxyのTLS秘密鍵や任意Tunnelcredentialは、作業shellと別OSユーザー/別権限へ置いてください。作業shellへbearer/transport環境を渡しません。transport関連envの混入は起動を拒否します。ログにHTTP Authorization/body、コマンド、環境変数を出すdebug設定は使わないでください。上流の承認画面はargvやdiffを表示するため、秘密をargv/file内容に入れないでください。
 

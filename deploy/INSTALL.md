@@ -30,12 +30,14 @@ OCI_DEV_RUST_BIN="$PWD/rust/target/release/oci-dev-mcp" node test/http-smoke.mjs
 OpenAIが案内する [Auth0 MCP設定ガイド](https://github.com/openai/openai-mcpkit/blob/main/python-authenticated-mcp-server-scaffold/README.md) を例に、既存のAuth0等を使います。本プロジェクトはRust resource serverなので、ガイドのPythonサーバーは必要ありません。以下の設定をASの管理画面で行います。
 
 1. API/resource identifierを **`https://実ドメイン/mcp`** にする。access tokenの`aud`とRustのresourceが完全一致すること。resource indicatorをauthorization/tokenの両リクエストで受け取れること。
-2. token署名はRS256、scopeは `mcp:tools`、access-token有効期間は短め（例5–15分）。正規ユーザーだけがこのscopeを得られるようAS側でも制限する。
-3. authorization-code + PKCE S256を有効にし、discoveryに `code_challenge_methods_supported: ["S256"]`、issuer、authorization/token endpoints、JWKSを公開する。issuerは末尾slashも含め正確にコピーする。
+2. access tokenは **RS256署名のJWT** として発行し、clientが `Authorization: Bearer` で渡す。scopeは `mcp:tools`、access-token有効期間は短め（例5–15分）。本人だけがこのscopeを得られるようAS側でも制限する。opaque tokenとproxy専用のidentity headerには対応しない。
+3. authorization-code + PKCE S256を有効にし、discoveryに `code_challenge_methods_supported: ["S256"]`、issuer、authorization/token endpoints、JWKSを公開する。issuerは末尾slashも含め正確にコピーする。path付きissuerのmetadataはOAuth path-insertion → OIDC path-insertion → OIDC path-appendingの順で取得する。[公式discovery規則](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery#authorization-server-metadata-discovery)
 4. ChatGPTのCIMD対応があればそれを使う。対応しない場合はDCRまたはChatGPT管理画面の事前登録clientを使う。**管理画面に表示される正確なclient metadata/redirect URIをコピー**し、推測しない。CIMDでは `none` または `private_key_jwt` とAS policyを合わせる。秘密はAS/ChatGPTの適切な管理画面へ直接入力し、chat/README/shell envへ貼らない。
-5. 許可する本人のユーザーID（JWTの`sub`）をAS管理画面で確認する。表示名や未検証emailで代用しない。
+5. 許可する本人のユーザーID（JWTの`sub`）をAS管理画面で確認し、`allowed_subjects`に**1件だけ**指定する。設定名は既存のまま。空・複数件（重複も含む）は明示的に起動を拒否する。表示名や未検証emailで代用しない。本サーバーは本人専用で、ユーザー間のMCPセッション分離は提供しない。
 
 Rust設定に必要なのはresource/issuer/subで、AS側のprivate keyやclient secretは置きません。新しいtenant/client/grant/実鍵作成はこの実装で自動実行していません。すでに適合するASがなければ、上記の管理画面設定が利用開始前の作業です。OAuth code/token endpointはASが提供し、Rustにログインサーバーを重複実装しません。
+
+**Cloudflare Access Managed OAuthは、このJWT Bearer方式の代替としてそのまま使えません。** [公式token形式](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/#token-format) はopaque access tokenで、originへ`Cf-Access-Jwt-Assertion`を渡す構成です。本サーバーにはopaque-token検証/照会やそのheaderの検証がなく、Cloudflareのissuerを指定するだけでは非対応です。既存ASを選ぶときは上記のRS256 JWT・issuer・aud・scope・sub・PKCE条件を確認してください。
 
 [OpenAIの現行OAuth説明](https://developers.openai.com/plugins/build/auth) と [MCP Authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization) に沿います。
 

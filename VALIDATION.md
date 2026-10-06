@@ -12,11 +12,11 @@ OCI_DEV_TMUX_BIN=/workspace/scratch/oci-dev-reference/tmux/usr/bin/tmux \
 node test/http-smoke.mjs
 ```
 
-終了code 0。証拠は [evidence/http-smoke.log](evidence/http-smoke.log)。本番サーバー、公式MCP client、実tmux、実sandboxを使います。OAuth認可サーバーだけはloopbackのfixtureで、RS256鍵は実行時メモリ内に生成し、保存/外部登録しません。実IdPの本人ログインやChatGPT consentの成功を意味しません。
+終了code 0。証拠は [evidence/http-smoke.log](evidence/http-smoke.log)。本番サーバー、公式MCP client、実tmux、実sandboxを使います。OAuth認可サーバーだけはloopbackのfixtureで、RS256鍵は実行時メモリ内に生成し、保存/外部登録しません。authorization/token交換はテストコードが手書きで行い、取得済みBearerを公式MCP clientへ直接渡しています。公式clientの自動OAuth discovery・client登録・外部AS linking、実IdPの本人ログイン、ChatGPT consentの成功証拠ではありません。
 
 通過項目:
 
-- OAuth resource metadata、401 WWW-Authenticate、AS discovery/JWKS、authorization-code + PKCE S256 + resource交換。違うverifier/resourceは拒否。
+- サーバーのOAuth resource metadata・401 WWW-Authenticate・AS discovery/JWKSと、手書きfixture clientによるauthorization-code + PKCE S256 + resource交換。違うverifier/resourceはfixture ASが拒否。
 - JWT署名、issuer、audience、exp、nbf、kid、本人sub、scopeを検証。none/HS256、query token、悪意あるOrigin/Hostを拒否。
 - 現行2026-07-28 stateless HTTPのserver/discover、tools/list、tools/call。protocol metadata、Mcp-Method/Mcp-Name、session headerなし、resultType completeを確認。
 - 公式Node client 2.3.1の旧版互換HTTP initialize/tools/listで20ツール（本体10+追加10）。
@@ -26,6 +26,10 @@ node test/http-smoke.mjs
 - Rust server実終了/再起動後にもtmux processとmemoが維持。
 - shell環境にtransport/token/credentialが含まれないこと、明示close、transport envの起動拒否、server stderrにbearerが出ないこと。
 - 任意Rust stdioでも実MCP initialize/tools/list。
+
+独立監査後のfocused実プロセス検証は `test/auth-focused.mjs`、証拠は [evidence/auth-focused.log](evidence/auth-focused.log)、終了code 0。空・複数・重複・空文字subの設定をdiscovery/HTTP bind前に拒否し、本人1件の設定で20ツール取得、他subの拒否を確認しました。path付きissuerのOAuth path-insertion → OIDC path-insertion → OIDC path-appendingの優先順と、末尾slash付きissuerの完全一致も実fixtureで確認。opaque Bearerと`Cf-Access-Jwt-Assertion`単独では認証できないことも確認しました。これはRustサーバー自身のdiscovery/JWT受入テストで、MCP clientの自動OAuth登録/linkingテストではありません。
+
+設定名/CLIは維持し、`allowed_subjects`の要素数を1件へ制約しました。複数ユーザー間のMCPセッション分離を増築していません。Cloudflare Access Managed OAuthのopaque-token方式は現版非対応で、README/INSTALLに明記しています。
 
 最初の停止後判定の不具合（tmux display-messageの曖昧なtarget）はexact has-session確認とcapture時の終了race処理で修正し、同じ実fixtureで再確認しました。現行discovery応答はsupportedVersionsで、旧initializeのprotocolVersionと区別して検証します。
 

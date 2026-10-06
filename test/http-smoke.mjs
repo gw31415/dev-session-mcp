@@ -53,6 +53,8 @@ await fs.writeFile(config,JSON.stringify({listen:`127.0.0.1:${port}`,resource,is
 function start(){const p=spawn(binary,['serve','--config',config],{cwd:root,env,stdio:['ignore','ignore','pipe']});p.stderr.on('data',b=>errors+=b.toString());return p;}
 async function ready(){for(let i=0;i<100;i++){if(server.exitCode!==null)throw new Error('Rust server failed: '+errors);try{if((await fetch(resource)).status===401)return;}catch{}await pause(100);}throw new Error('HTTP startup timed out: '+errors);}
 async function authorize({wrongVerifier=false,wrongResource=false}={}) {
+  // Hand-written fixture exchange; this does not exercise an SDK auth provider,
+  // automatic client registration, or external identity-provider linking.
   const verifier=randomBytes(48).toString('base64url'),state=randomBytes(16).toString('hex');
   const url=new URL('authorize',issuer);url.search=new URLSearchParams({response_type:'code',client_id:'fixture-client',redirect_uri:'http://127.0.0.1/callback',scope:'mcp:tools',resource,state,code_challenge:sha(verifier),code_challenge_method:'S256'});
   const result=await fetch(url,{redirect:'manual'});assert.equal(result.status,302);
@@ -80,7 +82,7 @@ try {
   const metadata=await (await fetch(`http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp`)).json();assert.equal(metadata.resource,resource);assert.deepEqual(metadata.authorization_servers,[issuer]);
   assert.equal((await authorize({wrongVerifier:true})).status,400);assert.equal((await authorize({wrongResource:true})).status,400);
   const grant=await authorize();assert.equal(grant.status,200);const access=grant.access_token;
-  console.log('PASS OAuth discovery, 401 challenge, real fixture authorization-code/PKCE S256 + resource binding');
+  console.log('PASS server discovery/401, hand-written fixture code/PKCE S256/resource exchange (not SDK OAuth linking)');
   const wrongKey=generateKeyPairSync('rsa',{modulusLength:2048}).privateKey;
   for(const [label,bearer,status] of [
     ['wrong audience',token({aud:'https://wrong.invalid/mcp'}),401],['wrong issuer',token({iss:'https://wrong.invalid/'}),401],

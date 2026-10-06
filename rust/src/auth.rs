@@ -9,7 +9,6 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jw
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -25,7 +24,8 @@ pub struct Settings {
     pub resource: String,
     /// Exact trusted issuer from the AS discovery document (trailing slash matters).
     pub issuer: String,
-    pub allowed_subjects: HashSet<String>,
+    /// Preserve the configuration name; exactly one owner is supported.
+    pub allowed_subjects: Vec<String>,
     #[serde(default = "default_scope")]
     pub scope: String,
     #[serde(default)]
@@ -91,9 +91,8 @@ impl Auth {
             "HTTP backend must listen on a loopback IP; use an HTTPS reverse proxy"
         );
         ensure!(
-            !settings.allowed_subjects.is_empty()
-                && settings.allowed_subjects.iter().all(|s| !s.is_empty()),
-            "at least one allowed subject is required"
+            settings.allowed_subjects.len() == 1 && !settings.allowed_subjects[0].is_empty(),
+            "allowed_subjects must contain exactly one non-empty subject; this server is single-owner"
         );
         ensure!(
             !settings.scope.is_empty()
@@ -110,19 +109,29 @@ impl Auth {
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        // RFC 8414 inserts the well-known component before an issuer path;
-        // OIDC appends it. Never discover from an unverified token claim.
+        // MCP discovery order: OAuth insertion, OIDC insertion, OIDC appending.
+        // Never discover from an unverified token claim.
         let base = issuer.origin().ascii_serialization();
+        let issuer_path = if issuer.path() == "/" {
+            ""
+        } else {
+            issuer.path()
+        };
         let oauth_url = format!(
             "{base}/.well-known/oauth-authorization-server{}",
-            issuer.path().trim_end_matches('/')
+            issuer_path
         );
-        let oidc_url = format!(
+        let oidc_inserted = format!("{base}/.well-known/openid-configuration{issuer_path}");
+        let oidc_appended = format!(
             "{}/.well-known/openid-configuration",
             settings.issuer.trim_end_matches('/')
         );
+        let mut candidates = vec![oauth_url, oidc_inserted];
+        if !candidates.contains(&oidc_appended) {
+            candidates.push(oidc_appended);
+        }
         let mut found = None;
-        for candidate in [oauth_url, oidc_url] {
+        for candidate in candidates {
             if let Ok(doc) = document(&http, checked_url(&candidate, settings.local_fixture)?).await
             {
                 found = Some(doc);
@@ -222,7 +231,7 @@ impl Auth {
             .claims;
         if !claims["sub"]
             .as_str()
-            .is_some_and(|sub| self.settings.allowed_subjects.contains(sub))
+            .is_some_and(|sub| sub == self.settings.allowed_subjects[0])
         {
             return Err(StatusCode::FORBIDDEN);
         }
