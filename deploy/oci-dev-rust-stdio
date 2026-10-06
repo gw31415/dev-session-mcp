@@ -1,9 +1,15 @@
 #!/bin/sh
-# Optional Tunnel launcher: install root-owned, not writable by either user.
+# Tunnel runs this fixed wrapper as devmcp via the one sudoers UID transition.
+# Install root-owned and non-writable by either service user. No arguments.
 set -eu
+if test "$#" -ne 0; then
+  printf 'This launcher takes no arguments.\n' >&2
+  exit 64
+fi
 cd /home/devmcp/projects
-exec /usr/bin/sudo -n -u devmcp /usr/bin/env -i \
+exec /usr/bin/env -i \
   HOME=/home/devmcp PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
+  XDG_STATE_HOME=/home/devmcp/.local/state \
   OCI_DEV_STATE_DIR=/home/devmcp/.local/state/oci-dev-mcp \
   OCI_DEV_DEFAULT_CWD=/home/devmcp/projects \
   /opt/oci-dev-mcp/bin/oci-dev-mcp stdio

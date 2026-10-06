@@ -19,4 +19,4 @@ if test "${1:-}" = --build; then
   cargo --version
   rustc --version
 fi
-printf 'OAuth AS and public HTTPS are configured separately; no change made.\n'
+printf 'Runtime: Rust stdio + Secure MCP Tunnel. Node and public MCP ports are not required. No changes made.\n'

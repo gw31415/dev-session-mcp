@@ -1,7 +1,7 @@
 [Unit]
 Description=OpenAI Secure MCP Tunnel for development tools
-After=network-online.target oci-dev-worker.service
-Wants=network-online.target oci-dev-worker.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -14,7 +14,8 @@ ExecStart=/usr/local/bin/tunnel-client run --config /etc/oci-dev-tunnel/config.y
 Restart=on-failure
 RestartSec=5
 UMask=0077
-KillMode=control-group
+# tmux must survive Tunnel/Rust child replacement. Stop its jobs explicitly.
+KillMode=process
 StandardOutput=journal
 StandardError=journal
 # Do not enable NoNewPrivileges here: the fixed sudo UID transition needs it off.
