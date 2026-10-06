@@ -105,6 +105,7 @@ impl Tools {
             &["session_id"],
             false,
         );
+        definitions.push(crate::files::tool());
         Ok(Self {
             workspace: Arc::new(Workspace::new().await?),
             tracked: Arc::new(Mutex::new(HashMap::new())),
@@ -163,7 +164,11 @@ impl Tools {
                 "upstream jobs remain; use poll_job/stop_job first"
             );
         }
-        let mut data = self.workspace.call(name, &args).await?;
+        let mut data = if name == "import_file" {
+            crate::files::import(&args).await?
+        } else {
+            self.workspace.call(name, &args).await?
+        };
         if name == "connect_session" || name == "list_sessions" {
             let tracked = self.tracked.lock().unwrap();
             let annotate = |v: &mut Value| {

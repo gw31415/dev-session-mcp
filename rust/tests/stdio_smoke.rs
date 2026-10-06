@@ -97,7 +97,7 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
             .name
             == "dev-session-mcp"
     );
-    ensure!(client.list_tools(None).await?.tools.len() == 19);
+    ensure!(client.list_tools(None).await?.tools.len() == 20);
     let tools = client.list_tools(None).await?.tools;
     for name in [
         "session_info",
@@ -121,8 +121,20 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
             .iter()
             .any(|tool| ["get_memo", "set_memo"].contains(&tool.name.as_ref()))
     );
+    let descriptor = serde_json::to_value(
+        tools
+            .iter()
+            .find(|t| t.name == "import_file")
+            .context("missing import_file")?,
+    )?;
+    ensure!(descriptor["_meta"]["openai/fileParams"] == json!(["file"]));
+    let file_schema = &descriptor["inputSchema"]["properties"]["file"];
+    ensure!(file_schema["required"] == json!(["download_url", "file_id"]));
+    for field in ["download_url", "file_id", "mime_type", "file_name"] {
+        ensure!(file_schema["properties"].get(field).is_some());
+    }
     println!(
-        "PASS actual dev-session-mcp stdio identity and official Rust SDK: 19 tools; no Node/HTTP/OAuth fixture"
+        "PASS actual dev-session-mcp stdio identity and official Rust SDK: 20 tools; no Node/HTTP/OAuth fixture"
     );
 
     let sid = "stdio-check";
@@ -132,6 +144,17 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
         json!({"session_id":sid,"cwd":fixture.cwd}),
     )
     .await?;
+    let blocked = raw(&client, "import_file", json!({"session_id":sid,"file":{"download_url":"https://unapproved.example.test/file?signature=PRIVATE_CAPABILITY","file_id":"file_fixture"},"path":"blocked.bin"})).await?;
+    let blocked_text = result_text(&blocked)?;
+    ensure!(
+        blocked.is_error == Some(true)
+            && blocked_text.contains("origin not configured or permitted")
+            && !blocked_text.contains("PRIVATE_CAPABILITY")
+    );
+    ensure!(!fixture.cwd.join("blocked.bin").exists());
+    println!(
+        "PASS real MCP fileParams metadata/schema and fail-closed unconfigured attachment origin without signed URL disclosure"
+    );
     let shell = created["terminal_job_id"]
         .as_str()
         .context("automatic terminal missing")?
@@ -551,7 +574,7 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
         .env("CONTROL_PLANE_API_KEY", fake_key)
         .env("CREDENTIALS_DIRECTORY", "/fixture-only-credential-dir");
     let (client, pid) = fixture.connect_command(command).await?;
-    ensure!(client.list_tools(None).await?.tools.len() == 19);
+    ensure!(client.list_tools(None).await?.tools.len() == 20);
     client.cancel().await?;
     StdioFixture::wait_exit(pid).await?;
     println!(

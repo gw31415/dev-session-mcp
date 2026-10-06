@@ -1,0 +1,10 @@
+   Compiling dev-session-mcp v0.2.0 (/workspace/dev-session-mcp/rust)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.16s
+     Running unittests src/main.rs (vendor/local-mcp/target/debug/deps/dev_session_mcp-111a3f2d8f96a564)
+
+running 2 tests
+test files::tests::attachment_policy_rejects_private_destinations_and_unapproved_origins ... ok
+PASS actual local HTTP binary stream: 80000 bytes, SHA256, byte cap, failed-transfer cleanup, atomic no-overwrite and explicit replacement; public HTTPS/ChatGPT delivery not exercised
+test files::tests::bounded_binary_transfer_publishes_only_verified_complete_files ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.07s

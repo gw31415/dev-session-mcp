@@ -12,4 +12,5 @@ exec /usr/bin/env -i \
   XDG_STATE_HOME=/home/devmcp/.local/state \
   DEV_SESSION_MCP_STATE_DIR=/home/devmcp/.local/state/dev-session-mcp \
   DEV_SESSION_MCP_DEFAULT_CWD=/home/devmcp/projects \
+  DEV_SESSION_MCP_FILE_ORIGINS= \
   /opt/dev-session-mcp/bin/dev-session-mcp stdio

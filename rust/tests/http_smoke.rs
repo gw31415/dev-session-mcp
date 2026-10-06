@@ -159,7 +159,7 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
             .as_array()
             .unwrap()
             .len()
-            == 19,
+            == 20,
         "wrong current tool count"
     );
     let result = fixture
@@ -175,10 +175,10 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
     );
     let mut client = fixture.connect(&access).await?;
     ensure!(
-        client.list_tools(None).await?.tools.len() == 19,
+        client.list_tools(None).await?.tools.len() == 20,
         "official Rust client tool count"
     );
-    println!("PASS current stateless HTTP and official Rust SDK client: 19 tools");
+    println!("PASS current stateless HTTP and official Rust SDK client: 20 tools");
     let sid = format!("rust.{}", uuid::Uuid::new_v4());
     let session = call(
         &client,
@@ -395,12 +395,12 @@ async fn rust_http_stdio_and_durable_sessions() -> Result<()> {
     ensure!(!server.stderr()?.contains(&access), "bearer logged");
     let stdio = fixture.stdio().await?;
     ensure!(
-        stdio.list_tools(None).await?.tools.len() == 19,
+        stdio.list_tools(None).await?.tools.len() == 20,
         "Rust stdio failed"
     );
     stdio.cancel().await?;
     println!(
-        "PASS clean environment, explicit close, credential rejection, no bearer logs and official Rust stdio: 19 tools"
+        "PASS clean environment, explicit close, credential rejection, no bearer logs and official Rust stdio: 20 tools"
     );
     Ok(())
 }

@@ -4,6 +4,7 @@ mod auth;
 mod broker;
 #[path = "../../vendor/local-mcp/src/config.rs"]
 mod config;
+mod files;
 mod server;
 mod workspace;
 #[allow(dead_code)]

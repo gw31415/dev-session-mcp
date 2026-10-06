@@ -76,6 +76,8 @@ clientの健康状態を確認したうえで、ChatGPTのAdd custom MCP server�
 
 全作業を終了/upgradeする場合、まず全sessionをcloseし、管理者が当該stateのbroker.pidとprocessのUID/argvを照合して、そのbrokerへSIGTERMを送ります。brokerは保持jobを停止してsocket/pid fileを除去します。PID fileだけを盲信してkillしません。Tunnel restartだけで古いbroker/binaryが更新されるとは仮定しません。これらは実機で対象を確認して行う操作です。
 
-大きな成果物の交換は [ファイル転送設計](../docs/FILE-TRANSFER.md) を参照します。現在は既存SSH/SFTPまたは正式なclient側転送連携が必要で、MCPにfile URIを返すだけでdotからdownloadできるとは報告しません。
+添付入力はimport_fileを使います。固定wrapperのDEV_SESSION_MCP_FILE_ORIGINSは既定で空です。正式clientが渡す添付URLの配信originを管理者が検証した後、root所有wrapper内へ完全一致のHTTPS originをカンマ区切りで設定します。ワイルドカード、モデルが指定したorigin、未確認の配信hostを許可しません。値は作業shell/brokerへ渡しません。署名URL全体をログ/chatへ貼らず、originだけを確認します。外部HTTPS取得と実ChatGPT添付入力はまだ未確認です。
+
+成果物の出力交換は [ファイル転送設計](../docs/FILE-TRANSFER.md) を参照します。正式なdot/Library出力連携の公開契約は未確認・未実装で、現在は既存SSH/SFTPまたは正式なclient側転送連携が必要です。file URIを返すだけでdotからdownloadできるとは報告しません。
 
 現在、ARM64実機（OCIを含む）・release build・実Tunnel認証・dot接続・systemd実配置は未確認です。旧Node版はGit履歴で復元でき、ソースは非公開GitHubへ保存します。詳細は [stdio検証](../VALIDATION.md)。

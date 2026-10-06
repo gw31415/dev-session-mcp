@@ -26,11 +26,11 @@ Linux、Rust 1.96+、Cコンパイラ、make/perl/pkg-config、bubblewrap、CA�
 
 ## 道具と使い方
 
-公開ツールは19個です。上流local-mcpの10ツールと契約を保持します。
+公開ツールは20個です。上流local-mcpの10ツールと契約を保持します。
 
-| 上流10ツール | 追加9ツール |
+| 上流10ツール | 追加10ツール |
 | --- | --- |
-| session_info, read_file, get_image, list_directory, write_file | list_sessions, create_session, connect_session, close_session |
+| session_info, read_file, get_image, list_directory, write_file | list_sessions, create_session, connect_session, close_session, import_file |
 | execute, start_command, poll_job, stop_job, without_sandbox | run_command, read_output, send_stdin, resize_command, stop_command |
 
 `create_session({"session_id":"project-a","cwd":"/home/devmcp/projects/a"})` で開始し、同じIDへ `connect_session` で戻ります。sessionごとのinteractive shellを自動作成・再利用します。呼出側にbackend名や端末操作コマンドの指定は不要です。
@@ -39,7 +39,7 @@ Linux、Rust 1.96+、Cコンパイラ、make/perl/pkg-config、bubblewrap、CA�
 
 `run_command` のcommandを省略すると主interactive shellへ戻ります。`connect_session` は選択中commandを勝手に切り替えず、jobs一覧とactive_job_idを返します。終了済みcommandへの再接続でcommandを再実行しません。`stop_command` は1つ、`close_session` はそのsessionの管理対象を停止しmetadataを削除します。他sessionへ影響しません。同時編集ロック・強制worktree・固定workflowはありません。
 
-専用memoツールはありません。目的や引継ぎは普通のファイルにwrite_file/read_fileで保存します。旧版のmemo.mdが存在する場合、close_sessionでもそのファイルを残します。小さなテキスト編集とget_imageは使えますが、大容量ファイルのdotへのアップロード/ダウンロードは未実装です。[ファイル交換の設計とクライアント要件](docs/FILE-TRANSFER.md) を参照してください。
+専用memoツールはありません。目的や引継ぎは普通のファイルにwrite_file/read_fileで保存します。旧版のmemo.mdが存在する場合、close_sessionでもそのファイルを残します。添付入力はimport_fileを追加しました。ChatGPTの正式fileParamsで渡された一時URLからbytesを直接保存し、本文をモデルcontextへ載せません。管理者が検証したHTTPS配信originの設定が必要で、未設定時は取得を拒否します。128 MiB/120秒上限、SHA256、途中失敗の破棄、既存ファイルの保全を設けています。実ChatGPT添付・外部HTTPS取得は未確認で、出力側のdot/Library連携は未実装です。[ファイル交換の設計とクライアント要件](docs/FILE-TRANSFER.md) を参照してください。
 
 ## 権限と継続範囲
 
