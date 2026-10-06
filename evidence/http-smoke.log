@@ -1,5 +1,6 @@
 PASS OAuth discovery, 401 challenge, real fixture authorization-code/PKCE S256 + resource binding
 PASS auth rejection: issuer/audience/signature/exp/nbf/kid/sub/scope/none/HS256/query, Origin and Host
+PASS current 2026-07-28 stateless HTTP discover/list/call with protocol metadata and method/name headers
 PASS official SDK real Streamable HTTP initialize/tools/list: 20 tools
 PASS embedded upstream sandbox execute + file read/write/edit, sessions + memo
 PASS HTTP disconnect/reconnect, job discovery, live stdin, ordinary job continuation
@@ -7,5 +8,6 @@ PASS bounded terminal/upstream output, exit code, stop, active-job close guard
 PASS actual Rust server restart preserves tmux + memo
 PASS clean shell environment, explicit close, credential environment rejection
 PASS no access token in server stderr
-oci-dev-mcp listening on loopback 127.0.0.1:37261 (OAuth required)
-oci-dev-mcp listening on loopback 127.0.0.1:37261 (OAuth required)
+PASS optional Rust stdio real MCP initialize/tools/list
+oci-dev-mcp listening on loopback 127.0.0.1:37397 (OAuth required)
+oci-dev-mcp listening on loopback 127.0.0.1:37397 (OAuth required)

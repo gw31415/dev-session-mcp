@@ -9,6 +9,7 @@ import { generateKeyPairSync, randomBytes, createHash, sign, createHmac } from '
 import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 const root=path.resolve('.'), binary=path.resolve(process.env.OCI_DEV_RUST_BIN??'rust/target/debug/oci-dev-mcp');
 const home=await fs.mkdtemp('/tmp/odm-http-'),cwd=path.join(home,'project'),state=path.join(home,'state');
@@ -60,6 +61,16 @@ async function authorize({wrongVerifier=false,wrongResource=false}={}) {
   return {status:response.status,...await response.json()};
 }
 async function connect(access){const c=new Client({name:'rust-http-fixture',version:'1'});await c.connect(new StreamableHTTPClientTransport(new URL(resource),{requestInit:{headers:{Authorization:`Bearer ${access}`}}}));return c;}
+async function modern(access,method,params={}) {
+  const headers={Authorization:`Bearer ${access}`,Accept:'application/json, text/event-stream','Content-Type':'application/json','MCP-Protocol-Version':'2026-07-28','Mcp-Method':method};
+  if(params.name)headers['Mcp-Name']=params.name;
+  const response=await fetch(resource,{method:'POST',headers,body:JSON.stringify({jsonrpc:'2.0',id:1,method,params:{...params,_meta:{'io.modelcontextprotocol/protocolVersion':'2026-07-28','io.modelcontextprotocol/clientInfo':{name:'modern-fixture',version:'1'},'io.modelcontextprotocol/clientCapabilities':{}}}})});
+  assert.equal(response.status,200);
+  assert.equal(response.headers.get('mcp-session-id'),null);
+  const body=await response.text();
+  const result=response.headers.get('content-type')?.includes('application/json')?JSON.parse(body):JSON.parse(body.split('\n').find(l=>l.startsWith('data:')).slice(5));
+  assert(!result.error,JSON.stringify(result));return result.result;
+}
 async function raw(name,args){return client.callTool({name,arguments:args});}
 async function call(name,args={}){const r=await raw(name,args);assert(!r.isError,JSON.stringify(r));return JSON.parse(r.content[0].text);}
 async function until(args,predicate){for(let i=0;i<100;i++){const r=await call('mux_poll',args);if(predicate(r))return r;await pause(50);}throw new Error('terminal wait expired');}
@@ -86,11 +97,16 @@ try {
   assert.equal((await fetch(resource,{headers:{Authorization:`Bearer ${access}`,Accept:'application/json, text/event-stream',Origin:'https://evil.invalid'}})).status,403);
   assert.equal((await fetch(resource,{headers:{Authorization:`Bearer ${access}`,Accept:'application/json, text/event-stream',Host:'evil.invalid'}})).status,400);
   console.log('PASS auth rejection: issuer/audience/signature/exp/nbf/kid/sub/scope/none/HS256/query, Origin and Host');
+  assert((await modern(access,'server/discover')).supportedVersions.includes('2026-07-28'));
+  assert.equal((await modern(access,'tools/list')).tools.length,20);
+  const modernList=await modern(access,'tools/call',{name:'list_sessions',arguments:{}});assert.equal(modernList.resultType,'complete');
+  console.log('PASS current 2026-07-28 stateless HTTP discover/list/call with protocol metadata and method/name headers');
   client=await connect(access);assert.equal((await client.listTools()).tools.length,20);console.log('PASS official SDK real Streamable HTTP initialize/tools/list: 20 tools');
   const s=await call('create_session',{session_id:'rust.test',cwd});assert.equal(s.cwd,cwd);assert.equal((await call('list_sessions')).sessions.length,1);
   await call('set_memo',{session_id:s.session_id,text:'Purpose: Rust HTTP\nNext: reconnect'});assert.match((await call('get_memo',{session_id:s.session_id})).text,/reconnect/);
   let r=await raw('execute',{session_id:s.session_id,command:['/bin/sh','-c','printf EMBEDDED_EXEC_OK']});assert(!r.isError,JSON.stringify(r));assert.match(r.content[0].text,/EMBEDDED_EXEC_OK/);
   await raw('write_file',{session_id:s.session_id,path:'edit.txt',content:'before\n'});r=await raw('write_file',{session_id:s.session_id,path:'edit.txt',content:'after\n'});assert(!r.isError,JSON.stringify(r));r=await raw('read_file',{session_id:s.session_id,path:'edit.txt'});assert.equal(r.content[0].text,'after\n');console.log('PASS embedded upstream sandbox execute + file read/write/edit, sessions + memo');
+  const modernRead=await modern(access,'tools/call',{name:'read_file',arguments:{session_id:s.session_id,path:'edit.txt'}});assert.equal(modernRead.resultType,'complete');assert.equal(modernRead.content[0].text,'after\n');
   const upstreamJob=JSON.parse((await raw('start_command',{session_id:s.session_id,command:['/bin/sh','-c','sleep 2; printf UPSTREAM_HTTP_RECONNECT']})).content[0].text);
   const job=await call('mux_open',{session_id:s.session_id,command:['/bin/bash','-c','read value; printf "STDIN:%s\\n" "$value"; sleep 30']});
   await client.close();client=await connect(access);const info=await call('connect_session',{session_id:s.session_id});assert(info.mux_jobs.some(j=>j.job_id===job.job_id));assert(info.upstream_jobs.some(j=>j.job_id===upstreamJob.job_id));
@@ -108,6 +124,9 @@ try {
   await call('close_session',{session_id:s.session_id});assert.equal((await call('list_sessions')).sessions.length,0);
   const leaked=spawn(binary,['stdio'],{env:{...env,CONTROL_PLANE_API_KEY:'fixture-not-a-key'},stdio:'ignore'});assert.notEqual((await once(leaked,'exit'))[0],0);console.log('PASS clean shell environment, explicit close, credential environment rejection');
   assert(!errors.includes(access),'bearer token logged');console.log('PASS no access token in server stderr');
+  await client.close();client=undefined;server.kill('SIGTERM');await once(server,'exit');
+  client=new Client({name:'rust-stdio-fixture',version:'1'});await client.connect(new StdioClientTransport({command:binary,args:['stdio'],env}));assert.equal((await client.listTools()).tools.length,20);
+  console.log('PASS optional Rust stdio real MCP initialize/tools/list');
 } finally {
   await client?.close().catch(()=>{});server?.kill('SIGTERM');if(server?.exitCode===null)await once(server,'exit');
   try{execFileSync(env.OCI_DEV_TMUX_BIN,['-S',path.join(state,'tmux.sock'),'kill-server'],{stdio:'ignore'});}catch{}

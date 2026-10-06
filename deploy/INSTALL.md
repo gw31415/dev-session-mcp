@@ -1,48 +1,82 @@
-# OCI Linux install (未実行)
+# OCI: Rust + OAuth HTTP の起動手順
 
-以下はroot権限のインストール例です。今回の作業では実行していません。新しい認証鍵/永続grant、OCI実deploy、Tailscaleやfirewallの変更は含めません。任意コマンドを実行できる接続を有効にする操作はユーザーが行います。
+このファイルは配布手順です。この作業ではOCI実機、実OAuthプロバイダー、public HTTPSへ接続していません。以下のOSユーザー/サービス/認証/client/鍵/DNS/firewall/TLSの実変更はまだ行っていません。本人が既存設定を確認し、実機のパス/既存権限へ合わせてから実行します。既存Tailscale/mycastは変更不要です。
 
-1. source archiveをOCIへ転送・展開し、`sh scripts/preflight.sh` で**そのOCIの**OS/CPUを検出。OCIがUbuntu/Debianならnode/npm/tmux/bubblewrap/build-essential/pkg-config/curl/unzip、Oracle Linuxなら相当するパッケージを導入します。Nodeは22以降、Rustはlocal-mcp要件の1.96以降。実OSを確認してパッケージマネージャを選び、既存Tailscaleは変更しません。
-2. 展開した独立プロジェクトで `npm ci --omit=dev --ignore-scripts` と `cargo build --locked --release --manifest-path vendor/local-mcp/Cargo.toml`。低メモリなら `CARGO_BUILD_JOBS=1`。release buildは初回に時間/ディスクを使います。GHA/Macは不要です。本体をすでに持っているなら同じ確認済み版のlocal-mcpとcodex-linux-sandboxを使えます。
-3. [Platform tunnels](https://platform.openai.com/settings/organization/tunnels) の公式download、または [latest release](https://github.com/openai/tunnel-client/releases/latest) からpreflightが示す `linux-arm64` / `linux-amd64` のfull `tunnel-client` ZIPを選ぶ。公式SHA256SUMSと照合してから `/usr/local/bin/tunnel-client` に配置。arm64版をx86_64へ流用しません。`tunnel-client --version` と `tunnel-client help quickstart` で現行仕様を確認。
-4. workerユーザー `devmcp` と、秘密を持つ専用ユーザー `mcp-tunnel` を作る。どちらも互いのグループに入れず、devmcpにsudo一般権限を与えない。専用homeは0700。既存projectを使う場合はdevmcpへ必要なアクセスだけ付与。
+## 1. 実機で確認してネイティブビルド
 
-配置例（パス・ユーザー名を変える場合はunit/wrapper/YAMLを一緒に合わせる）：
+SSH/Tailscale等の既存経路でOCIへ入り、このprivate repoまたはLibrary source archiveを**独立ディレクトリ**へ配置します。
 
 ```sh
-sudo useradd --create-home --user-group --shell /bin/bash devmcp
-sudo useradd --system --create-home --user-group --home-dir /var/lib/mcp-tunnel --shell /usr/sbin/nologin mcp-tunnel
-sudo chmod 0700 /home/devmcp /var/lib/mcp-tunnel
-sudo install -d -o root -g root -m 0755 /opt/oci-dev-mcp /opt/oci-dev-mcp/bin /usr/local/libexec
-sudo cp -a src package.json package-lock.json node_modules /opt/oci-dev-mcp/
-sudo chown -R root:root /opt/oci-dev-mcp
-sudo install -m 0755 vendor/local-mcp/target/release/local-mcp vendor/local-mcp/target/release/codex-linux-sandbox /opt/oci-dev-mcp/bin/
-sudo install -d -o devmcp -g devmcp -m 0700 /home/devmcp/projects
-sudo install -m 0755 deploy/oci-dev-mcp-stdio /usr/local/libexec/oci-dev-mcp-stdio
-sudo install -m 0440 deploy/sudoers.example /etc/sudoers.d/oci-dev-mcp
-sudo visudo -cf /etc/sudoers.d/oci-dev-mcp
-sudo install -d -o root -g mcp-tunnel -m 0750 /etc/oci-dev-tunnel
-sudo install -o root -g mcp-tunnel -m 0640 deploy/tunnel-client.yaml.example /etc/oci-dev-tunnel/config.yaml
-sudo install -m 0644 deploy/oci-dev-worker.service deploy/oci-dev-tunnel.service /etc/systemd/system/
+uname -sm
+cat /etc/os-release
+sh scripts/preflight.sh --build
+cargo build --release --locked --manifest-path rust/Cargo.toml
+./rust/target/release/oci-dev-mcp --version
 ```
 
-既存ユーザー名がある場合はuseraddを再実行せず設定を合わせます。`/usr/bin/node` が実際のNodeパスと異なる場合はunit/wrapperを修正。設置したコード・wrapperはroot所有を保ちます。
+CPU aarch64/arm64はARM64、x86_64/amd64はAMD64として検出します。Mac/GHAは使いません。必要なbuild依存はRust 1.96+、cc、make、perl、pkg-config。runtime依存はtmux、bubblewrap、CA証明書とネイティブbinaryの動的ライブラリです。古いbubblewrapの場合は上流Codex sandboxの要件に合わせて更新します。Codex依存のため初回buildは大きめです。
 
-既存Tunnel IDをconfig.yamlに設定し、runtime keyを `/etc/oci-dev-tunnel/runtime-key` にroot:root 0600で安全に保存します（秘密をcommand line、履歴、一般shell環境にexportしない）。keyの本文をここへ書かないでください。systemdはLoadCredentialのprivate copyをmcp-tunnelだけへ渡します。永続ファイルはrootだけが読み、devmcpはruntime credential directoryやmcp-tunnelの/procへアクセスできません。
+ローカル実fixture（Node 22+は検証用だけ）:
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now oci-dev-worker.service
-sudo systemctl enable --now oci-dev-tunnel.service
-sudo systemctl status oci-dev-worker.service oci-dev-tunnel.service
-curl -fsS http://127.0.0.1:8080/healthz
-curl -fsS http://127.0.0.1:8080/readyz
+npm ci --ignore-scripts
+OCI_DEV_RUST_BIN="$PWD/rust/target/release/oci-dev-mcp" node test/http-smoke.mjs
 ```
 
-必要な外向き接続はapi.openai.com:443（mTLS構成時はmtls.api.openai.com:443）。stdio MCPにはinboundポート不要、health/UIはloopbackのみ。**同じtunnel IDのactive tunnel-clientは1個だけ**にし、手動runとsystemdを重複させない。設定診断は対応するfull clientのdoctorを使い、runtime keyを一般シェルへ渡さない。
+テストが環境のnamespace/security制約でsandboxに失敗した場合、理由を報告して解決します。通常executeのsandboxを黙って無効化しません。localの制約外fixtureでは組込みsandboxが成功しています。
 
-ChatGPTのAdd custom MCP serverでConnection=Tunnel、既存tunnel IDを選択。組織/ワークスペースassociationとTunnels Read+Useを確認し、作成されたprivate app/pluginをdotに接続。任意shell権限の警告を確認してください。新規grant/鍵が必要な場合は別途ユーザーがその権限を設定します。
+## 2. 既存OAuth認可サーバーの設定
 
-Tunnelの停止/再起動はworkerやtmuxを止めません。worker停止は通常local-mcpジョブを終了しますがtmux端末は残します。全tmux作業の終了は明示的なmux_stop/close_session、またはdevmcpとして `tmux -S /home/devmcp/.local/state/oci-dev-mcp/tmux.sock kill-server`。close_sessionはメモも削除します。任意にdaemon化した子孫はtmux外へ残ることがあるため、そのプロジェクトのプロセス管理で停止します。
+OpenAIが案内する [Auth0 MCP設定ガイド](https://github.com/openai/openai-mcpkit/blob/main/python-authenticated-mcp-server-scaffold/README.md) を例に、既存のAuth0等を使います。本プロジェクトはRust resource serverなので、ガイドのPythonサーバーは必要ありません。以下の設定をASの管理画面で行います。
 
-local-mcpのwithout_sandbox承認を行う場合は、Tailscale/SSHからdevmcpとして対応するapprovals端末へattachする。connect_sessionでkind=approvalsのjob_idを調べ、`tmux -S /home/devmcp/.local/state/oci-dev-mcp/tmux.sock attach -t odm_JOB_ID`。本体の既定askを維持し、ラッパーが自動でyoloへ変更することはありません。
+1. API/resource identifierを **`https://実ドメイン/mcp`** にする。access tokenの`aud`とRustのresourceが完全一致すること。resource indicatorをauthorization/tokenの両リクエストで受け取れること。
+2. token署名はRS256、scopeは `mcp:tools`、access-token有効期間は短め（例5–15分）。正規ユーザーだけがこのscopeを得られるようAS側でも制限する。
+3. authorization-code + PKCE S256を有効にし、discoveryに `code_challenge_methods_supported: ["S256"]`、issuer、authorization/token endpoints、JWKSを公開する。issuerは末尾slashも含め正確にコピーする。
+4. ChatGPTのCIMD対応があればそれを使う。対応しない場合はDCRまたはChatGPT管理画面の事前登録clientを使う。**管理画面に表示される正確なclient metadata/redirect URIをコピー**し、推測しない。CIMDでは `none` または `private_key_jwt` とAS policyを合わせる。秘密はAS/ChatGPTの適切な管理画面へ直接入力し、chat/README/shell envへ貼らない。
+5. 許可する本人のユーザーID（JWTの`sub`）をAS管理画面で確認する。表示名や未検証emailで代用しない。
+
+Rust設定に必要なのはresource/issuer/subで、AS側のprivate keyやclient secretは置きません。新しいtenant/client/grant/実鍵作成はこの実装で自動実行していません。すでに適合するASがなければ、上記の管理画面設定が利用開始前の作業です。OAuth code/token endpointはASが提供し、Rustにログインサーバーを重複実装しません。
+
+[OpenAIの現行OAuth説明](https://developers.openai.com/plugins/build/auth) と [MCP Authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization) に沿います。
+
+## 3. 専用の作業ユーザー・HTTP設定
+
+既存の低権限開発ユーザーがあればそれを使います。例の`devmcp`を実ユーザーへ合わせ、sudo一般許可やroot実行を与えません。binary/sourceはroot所有等で固定し、作業プロジェクト/stateは作業ユーザー所有にします。全プロジェクトを同じUIDから扱える強い権限であることに同意してから使います。
+
+`deploy/http-config.json.example`を `/etc/oci-dev-mcp/http.json` に配置し、domain/issuer/subを実値へ置換します。設定ファイルはroot所有・serviceユーザー読取可（例0640）、stateは0700、生成metadata/memoは0600です。
+
+```json
+{
+  "listen": "127.0.0.1:8765",
+  "resource": "https://dev.example.com/mcp",
+  "issuer": "https://YOUR-TENANT.auth0.com/",
+  "allowed_subjects": ["auth0|ACTUAL-USER-ID"],
+  "scope": "mcp:tools",
+  "allowed_origins": ["https://chatgpt.com:443"],
+  "local_fixture": false
+}
+```
+
+dot等がOriginを送る場合は、その正確なoriginを追加します。Originなしの非ブラウザMCP clientも使えます。すべてのHTTP methodをOAuth middlewareが保護し、無認証で取得できるのはprotected-resource metadataだけです。
+
+Node workerとRust serverは同じstateで併用しません。旧Node版へ戻す場合も、使うbackendを1つにします。stateは既定HOME/.local/state/oci-dev-mcp、上流session metadataはXDG_STATE_HOME/local-mcp/sessionsです。変更する際は両方の保存先を引き継いでください。
+
+## 4. HTTPSと常駐
+
+DNS/TLS/公開ネットワークの実変更は本人の確認後に行います。`deploy/Caddyfile.example`を実ドメインに合わせ、Caddy自身のユーザーでTLS秘密鍵を保管してください。serviceユーザーからTLS鍵を読める構成にしません。OAuth AS秘密も作業UIDへ置きません。backendをpublic HTTPへforwardする設定は禁止です。
+
+`deploy/oci-dev-http.service`を実ユーザーと実パスへ合わせます。binary配置例 `/opt/oci-dev-mcp/bin/oci-dev-mcp`、作業例 `/home/devmcp/projects`。承認後にunitを配置し、`systemctl daemon-reload`、`systemctl enable --now oci-dev-http` を行います。unitのKillMode=processはtmuxをserver再起動から独立させるためです。停止後もtmuxが残るので、全作業終了にはMCPのmux_stop/close_sessionまたは専用socketへのtmux kill-serverを明示的に使います。
+
+Caddy例は `/mcp` とprotected-resource metadataだけをproxyし、SSEをflushします。raw HTTP headers/bodyのログは有効にしません。TLS公開前もMCP backendはloopback + OAuth必須で、認証を外す起動フラグはありません。
+
+## 5. 利用者側で接続して確認
+
+ChatGPT/dotのMCP接続URLへ `https://実ドメイン/mcp` を指定し、OAuth linkingで本人としてログインします。AS側で登録方式/client redirectが正しいことを確認します。
+
+最小確認はmetadata取得 → 無認証MCPが401 → OAuth linking → list_sessions → create_session → execute/read/write → mux_open/send/poll → 切断/再接続 → mux_stop/close_session。実機・provider・clientでここまで通って初めて接続済みと報告します。
+
+## 任意のSecure MCP Tunnel
+
+HTTPにはTunnelは不要です。Tunnelを選ぶ場合は `oci-dev-mcp stdio` が使えます。`deploy/oci-dev-rust-stdio`は別UIDへの固定clean-env launcher例です。root所有で変更不可にし、sudoersはこの固定wrapperだけを許可します。runtime keyは別Tunnelユーザーのsystemd LoadCredential等へ置き、作業shellへ渡しません。
+
+旧Nodeの常駐daemon方式、公式Tunnelのlinux-arm64/amd64取得・設定例は [../docs/LEGACY-TUNNEL-INSTALL.md](../docs/LEGACY-TUNNEL-INSTALL.md)。Rust stdio adapter自体は常駐daemonを介さないため、そのstdioプロセス終了では通常upstream jobが終了し、tmuxだけが残ります。

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Optional Tunnel launcher: install root-owned, not writable by either user.
+set -eu
+cd /home/devmcp/projects
+exec /usr/bin/sudo -n -u devmcp /usr/bin/env -i \
+  HOME=/home/devmcp PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
+  OCI_DEV_STATE_DIR=/home/devmcp/.local/state/oci-dev-mcp \
+  OCI_DEV_DEFAULT_CWD=/home/devmcp/projects \
+  /opt/oci-dev-mcp/bin/oci-dev-mcp stdio

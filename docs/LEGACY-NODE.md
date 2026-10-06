@@ -1,3 +1,5 @@
+> Node 0.1.0 rollback reference. Run these commands from the repository root. The standard deployment is now Rust HTTP; see [current README](../README.md).
+
 # OCI development MCP
 
 `nakasyou/local-mcp` をそのまま使い、セッション管理・明示的なメモ・tmux端末だけを追加する独立プロジェクトです。Node.js 22以降、Linux、tmux、bubblewrap、ビルド済みlocal-mcpが必要です。既存mycast・Tailscaleの設定を変更しません。
@@ -45,11 +47,11 @@ Linuxではlocal-mcpと同じディレクトリにcodex-linux-sandboxも必要�
 
 ## OCI起動
 
-詳細は [deploy/INSTALL.md](deploy/INSTALL.md) と同梱systemd/unit・sudoers・clean-env wrapperです。`scripts/preflight.sh` が実OS/CPUを検出し、公式Tunnelのlinux-arm64/amd64配布を選べます。今回、新しい鍵・grant・OSネットワーク変更・OCI deployは実施していません。OCI ARM64で動作確認済みではありません。
+詳細は [deploy/INSTALL.md](LEGACY-TUNNEL-INSTALL.md) と同梱systemd/unit・sudoers・clean-env wrapperです。`scripts/preflight.sh` が実OS/CPUを検出し、公式Tunnelのlinux-arm64/amd64配布を選べます。今回、新しい鍵・grant・OSネットワーク変更・OCI deployは実施していません。OCI ARM64で動作確認済みではありません。
 
 ## 検証
 
-`npm test` は実ビルドのlocal-mcpと実tmuxを使う小さいstdio MCP疎通テストです。結果・環境制約は [VALIDATION.md](VALIDATION.md) に記録します。tmuxがtask-localの場合は `OCI_DEV_TMUX_BIN=/absolute/path/tmux npm test`。
+`npm test` は実ビルドのlocal-mcpと実tmuxを使う小さいstdio MCP疎通テストです。結果・環境制約は [VALIDATION.md](../VALIDATION.md) に記録します。tmuxがtask-localの場合は `OCI_DEV_TMUX_BIN=/absolute/path/tmux npm test`。
 
 本体のread_file/execは上流実装を維持しており、巨大ファイル/出力の内部メモリ消費は上流仕様に従います。ラッパーの返却テキストは全体64 KiBへ制限します。作業コマンドは全体をfileへ保存し、必要な範囲を抽出して読んでください。画像も本体のget_imageのままです。メモはsession directory内のmemo.md（0600）、追加metadataは0700 state directory、停止済みterminalの出力はtmuxが生きている間だけ取得できます。
 

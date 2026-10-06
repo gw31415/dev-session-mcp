@@ -5,6 +5,6 @@
   "type": "module",
   "description": "Persistent tmux development tools over stdio MCP and Secure MCP Tunnel",
   "engines": { "node": ">=22" },
-  "scripts": { "start": "node src/server.mjs", "test": "node test/smoke.mjs" },
+  "scripts": { "start": "node src/server.mjs", "test": "node test/smoke.mjs", "test:http": "node test/http-smoke.mjs" },
   "dependencies": { "@modelcontextprotocol/server": "2.3.1", "@modelcontextprotocol/client": "2.3.1", "zod": "4.6.5" }
 }

@@ -1,3 +1,5 @@
+> Node 0.1.0 + Tunnel rollback reference. Current Rust HTTP instructions are [deploy/INSTALL.md](../deploy/INSTALL.md). Paths below are repository-root-relative.
+
 # OCI Linux install (未実行)
 
 以下はroot権限のインストール例です。今回の作業では実行していません。新しい認証鍵/永続grant、OCI実deploy、Tailscaleやfirewallの変更は含めません。任意コマンドを実行できる接続を有効にする操作はユーザーが行います。

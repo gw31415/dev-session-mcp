@@ -1,0 +1,14 @@
+# Configure DNS, certificate issuance and networking only after user approval.
+# Run Caddy with its own OS user; devmcp must not read Caddy TLS private keys.
+dev.example.com {
+    @mcp path /mcp /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/mcp
+    handle @mcp {
+        reverse_proxy 127.0.0.1:8765 {
+            flush_interval -1
+        }
+    }
+    handle {
+        respond "Not found" 404
+    }
+    # No request/body/header logging, and no insecure public HTTP backend.
+}
