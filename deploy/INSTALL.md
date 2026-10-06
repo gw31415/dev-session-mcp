@@ -1,6 +1,6 @@
 # Linux: dev-session-mcp + Secure MCP Tunnel
 
-これは実機導入の手順書です。実ホストでのTunnel認証・dot接続・OSサービス変更はまだ実施していません。既存SSH/TailscaleでLinuxホストへ入り、独立ディレクトリで進めます。OCI VPS、他のVPS、自宅Linuxなど、クラウド固有のAPIは使いません。公開MCP port/HTTPSや外部OAuthの設定は不要です。既存配置の読み替えは [READMEの移行手順](../README.md#旧名からの移行) を参照します。
+これは実機導入の手順書です。実ホストでのTunnel認証・dot接続・OSサービス変更はまだ実施していません。既存SSH/TailscaleでLinuxホストへ入り、独立ディレクトリで進めます。OCI VPS、他のVPS、自宅Linuxなど、クラウド固有のAPIは使いません。公開MCP port/HTTPSや外部OAuthの設定は不要です。
 
 ## 1. 実OS/CPUを検出してbuild
 
@@ -70,9 +70,9 @@ curl -fsS http://127.0.0.1:8080/readyz
 
 clientの健康状態を確認したうえで、ChatGPTのAdd custom MCP serverのConnection=Tunnelから既存Tunnel IDを選び、作成したprivate app/pluginをdotへ接続します。組織/ワークスペースassociationと本人の利用権限を確認します。stdio側はこの認可を信頼し、任意コマンドを作業UID権限で実行できるため本人専用にします。[公式接続案内](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 
-最小確認: `list_sessions` → `create_session` → execute/read/write → `run_command/send_stdin/read_output` → 接続を切って同じsessionへ再接続 → `stop_command/close_session`。実ホスト・認証・dotでここまで通って初めて「接続済み」と報告します。legacy MCP clientはchildが置き換わったときinitialize/initializedを再送します。現行2026-07-28の自己完結requestもRust SDK/Tunnelで扱います。
+最小確認: `list_sessions` → `create_session` → execute/read/write → `run_command/send_stdin/read_output` → 接続を切って同じsessionへ再接続 → `stop_command/close_session`。実ホスト・認証・dotでここまで通って初めて「接続済み」と報告します。セッション型MCP clientはchildが置き換わったときinitialize/initializedを再送します。現行2026-07-28の自己完結requestもRust SDK/Tunnelで扱います。
 
-終了は `stop_command` / `close_session`。旧memo.mdがある場合はcloseでも保持し、daemon化した子孫はプロジェクト側で管理します。without_sandboxの承認は既存SSH経路で作業UIDになり、同じHOME/XDG_STATE_HOME/DEV_SESSION_MCP_STATE_DIRで `/opt/dev-session-mcp/bin/dev-session-mcp approval-console SESSION_ID` を実行します。Ctrl-C/stdin EOFはconsoleのdetachだけです。人が内容を読んでy/nを入力します。この手順はyoloや永続許可を新設しません。
+終了は `stop_command` / `close_session`。作業ファイルは保持し、daemon化した子孫はプロジェクト側で管理します。without_sandboxの承認は既存SSH経路で作業UIDになり、同じHOME/XDG_STATE_HOME/DEV_SESSION_MCP_STATE_DIRで `/opt/dev-session-mcp/bin/dev-session-mcp approval-console SESSION_ID` を実行します。Ctrl-C/stdin EOFはconsoleのdetachだけです。人が内容を読んでy/nを入力します。この手順はyoloや永続許可を新設しません。
 
 全作業を終了/upgradeする場合、まず全sessionをcloseし、管理者が当該stateのbroker.pidとprocessのUID/argvを照合して、そのbrokerへSIGTERMを送ります。brokerは保持jobを停止してsocket/pid fileを除去します。PID fileだけを盲信してkillしません。Tunnel restartだけで古いbroker/binaryが更新されるとは仮定しません。これらは実機で対象を確認して行う操作です。
 
@@ -80,4 +80,4 @@ clientの健康状態を確認したうえで、ChatGPTのAdd custom MCP server�
 
 成果物の出力交換は [ファイル転送設計](../docs/FILE-TRANSFER.md) を参照します。正式なdot/Library出力連携の公開契約は未確認・未実装で、現在は既存SSH/SFTPまたは正式なclient側転送連携が必要です。file URIを返すだけでdotからdownloadできるとは報告しません。
 
-現在、ARM64実機（OCIを含む）・release build・実Tunnel認証・dot接続・systemd実配置は未確認です。旧Node版はGit履歴で復元でき、ソースは非公開GitHubへ保存します。詳細は [stdio検証](../VALIDATION.md)。
+現在、ARM64実機（OCIを含む）・release build・実Tunnel認証・dot接続・systemd実配置は未確認です。ソースは非公開GitHubへ保存します。詳細は [stdio検証](../VALIDATION.md)。

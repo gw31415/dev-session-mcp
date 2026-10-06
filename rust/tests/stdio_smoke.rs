@@ -116,11 +116,6 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
             "missing upstream tool {name}"
         );
     }
-    ensure!(
-        !tools
-            .iter()
-            .any(|tool| ["get_memo", "set_memo"].contains(&tool.name.as_ref()))
-    );
     let descriptor = serde_json::to_value(
         tools
             .iter()
@@ -485,15 +480,17 @@ async fn rust_stdio_tools_and_reconnect_without_node_or_oauth() -> Result<()> {
             .iter()
             .any(|marker| output.contains(marker))
     );
-    let legacy_note = fixture
+    let user_note = fixture
         .home
         .path()
         .join("state/sessions")
         .join(sid)
-        .join("memo.md");
-    tokio::fs::write(&legacy_note, "existing user note\n").await?;
+        .join("jobs")
+        .join(&shell)
+        .join("notes.txt");
+    tokio::fs::write(&user_note, "user note\n").await?;
     call(&client, "close_session", json!({"session_id":sid})).await?;
-    ensure!(tokio::fs::read_to_string(&legacy_note).await? == "existing user note\n");
+    ensure!(tokio::fs::read_to_string(&user_note).await? == "user note\n");
     ensure!(
         raw(&client, "read_output", json!({"session_id":sid}))
             .await?

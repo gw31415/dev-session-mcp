@@ -15,9 +15,9 @@ mod sandbox {
     include!(concat!(env!("OUT_DIR"), "/sandbox.rs"));
 }
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::{os::unix::process::CommandExt, path::PathBuf};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -39,8 +39,6 @@ enum Command {
     /// Attach a local human console to an existing session's approval terminal.
     ApprovalConsole { session_id: String },
     #[command(hide = true)]
-    Worker { spec: PathBuf },
-    #[command(hide = true)]
     Broker { state: PathBuf },
 }
 
@@ -56,34 +54,19 @@ fn main() -> Result<()> {
     unsafe {
         libc::umask(0o077);
     }
-    match Cli::parse().command {
-        Command::Worker { spec } => {
-            let spec: workspace::WorkerSpec = serde_json::from_slice(&std::fs::read(spec)?)?;
-            let (program, args) = spec.command.split_first().context("empty command")?;
-            let error = std::process::Command::new(program)
-                .args(args)
-                .current_dir(spec.cwd)
-                .env_clear()
-                .envs(spec.env)
-                .exec();
-            // Do not print argv, environment, or user command contents.
-            eprintln!("Could not start command: {}", error.kind());
-            std::process::exit(127);
-        }
-        command => tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(async {
-                match command {
-                    Command::Serve { config } => server::http(config).await,
-                    Command::Stdio => server::stdio().await,
-                    Command::Start { session_id } => approvals::start(Some(&session_id)).await,
-                    Command::ApprovalConsole { session_id } => {
-                        broker::approval_console(&session_id).await
-                    }
-                    Command::Broker { state } => broker::run(state).await,
-                    Command::Worker { .. } => unreachable!(),
+    let command = Cli::parse().command;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            match command {
+                Command::Serve { config } => server::http(config).await,
+                Command::Stdio => server::stdio().await,
+                Command::Start { session_id } => approvals::start(Some(&session_id)).await,
+                Command::ApprovalConsole { session_id } => {
+                    broker::approval_console(&session_id).await
                 }
-            }),
-    }
+                Command::Broker { state } => broker::run(state).await,
+            }
+        })
 }

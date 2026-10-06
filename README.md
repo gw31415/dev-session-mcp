@@ -39,7 +39,7 @@ Linux、Rust 1.96+、Cコンパイラ、make/perl/pkg-config、bubblewrap、CA�
 
 `run_command` のcommandを省略すると主interactive shellへ戻ります。`connect_session` は選択中commandを勝手に切り替えず、jobs一覧とactive_job_idを返します。終了済みcommandへの再接続でcommandを再実行しません。`stop_command` は1つ、`close_session` はそのsessionの管理対象を停止しmetadataを削除します。他sessionへ影響しません。同時編集ロック・強制worktree・固定workflowはありません。
 
-専用memoツールはありません。目的や引継ぎは普通のファイルにwrite_file/read_fileで保存します。旧版のmemo.mdが存在する場合、close_sessionでもそのファイルを残します。添付入力はimport_fileを追加しました。ChatGPTの正式fileParamsで渡された一時URLからbytesを直接保存し、本文をモデルcontextへ載せません。管理者が検証したHTTPS配信originの設定が必要で、未設定時は取得を拒否します。128 MiB/120秒上限、SHA256、途中失敗の破棄、既存ファイルの保全を設けています。実ChatGPT添付・外部HTTPS取得は未確認で、出力側のdot/Library連携は未実装です。[ファイル交換の設計とクライアント要件](docs/FILE-TRANSFER.md) を参照してください。
+目的や引継ぎは普通のファイルにwrite_file/read_fileで保存します。close_sessionは作業ファイルやsession state内の管理対象外ファイルを削除しません。添付入力はimport_fileを追加しました。ChatGPTの正式fileParamsで渡された一時URLからbytesを直接保存し、本文をモデルcontextへ載せません。管理者が検証したHTTPS配信originの設定が必要で、未設定時は取得を拒否します。128 MiB/120秒上限、SHA256、途中失敗の破棄、既存ファイルの保全を設けています。実ChatGPT添付・外部HTTPS取得は未確認で、出力側のdot/Library連携は未実装です。[ファイル交換の設計とクライアント要件](docs/FILE-TRANSFER.md) を参照してください。
 
 ## 権限と継続範囲
 
@@ -53,24 +53,9 @@ Tunnel/Rust stdioの終了・再起動を越えて、独立PTY brokerが端末�
 
 Tunnel UIDと作業UIDを分け、runtime keyはLoadCredentialでTunnel側だけに渡します。root所有の固定wrapperは引数を拒否し、env -iで作業processを起動します。作業UIDにtransport鍵や一般sudo権限を与えません。同じstateのstdio owner/brokerは各1個、broker.sockは0600/同一UID検証です。公開shell/HTTP portを増設しません。同じTunnel IDのactive clientは1個です。[公式stdio制限](https://github.com/openai/tunnel-client/blob/master/docs/configuration.md#stdio-deployment-limits)
 
-## 旧名からの移行
-
-| 旧名 | 現在 |
-| --- | --- |
-| binary/crate oci-dev-mcp | dev-session-mcp |
-| wrapper oci-dev-rust-stdio | dev-session-mcp-stdio |
-| service oci-dev-tunnel.service | dev-session-mcp-tunnel.service |
-| /opt/oci-dev-mcp、/etc/oci-dev-tunnel | /opt/dev-session-mcp、/etc/dev-session-mcp-tunnel |
-| OCI_DEV_STATE_DIR、OCI_DEV_DEFAULT_CWD | DEV_SESSION_MCP_STATE_DIR、DEV_SESSION_MCP_DEFAULT_CWD |
-| OCI_DEV_TMUX_BIN、DEV_SESSION_MCP_TMUX_BIN | 廃止、tmux不要 |
-| mux_open/poll/send/stop、mux_jobs | run_command/read_output/send_stdin/stop_command、jobs |
-| get_memo/set_memo | 普通のファイルで引継ぎ、既存memo.mdは保存 |
-
-従来stateのmetadataを参照するなら固定wrapperのDEV_SESSION_MCP_STATE_DIRを旧パスへ合わせます。稼働中state/socketを移動せずbackendを重複起動しません。旧tmux上の生存jobは新PTY brokerへ移せないため、旧binary/管理端末で作業を終えるか明示停止してから切り替えます。旧jobの結果を必要ならファイルへ保存してください。Tunnelの既存keyや利用許可を作り直す必要はありません。
-
 ## 確認状況と保存
 
-pty-process 0.5.3 + 薄い独立brokerを実装しています。[選定理由とlibshpool実probe](docs/BACKEND-OPTIONS.md)、[実検証結果](VALIDATION.md) を参照してください。旧Node版と以前のcheckpointは [Git履歴](docs/HISTORY.md) から復元できます。保留中のRust HTTP/OAuthコードは残していますが、Tunnel導入では使いません。
+pty-process 0.5.3 + 薄い独立brokerを実装しています。[選定理由とlibshpool実probe](docs/BACKEND-OPTIONS.md)、[実検証結果](VALIDATION.md) を参照してください。保留中のRust HTTP/OAuthコードは残していますが、Tunnel導入では使いません。
 
 **ARM64実機（OCIを含む）、release build、実Tunnel認証、実ChatGPT/dot接続、systemd実配置は未確認です。** 永続保存先は本人の非公開 [gw31415/dev-session-mcp](https://github.com/gw31415/dev-session-mcp) です。既存mycastは変更しません。
 

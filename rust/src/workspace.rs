@@ -1,6 +1,5 @@
 use crate::config;
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -18,12 +17,6 @@ pub fn state_dir() -> Result<PathBuf> {
                 .context("HOME is required")?
                 .join(".local/state/dev-session-mcp"),
         ))
-}
-#[derive(Serialize, Deserialize)]
-pub struct WorkerSpec {
-    pub command: Vec<String>,
-    pub cwd: PathBuf,
-    pub env: HashMap<String, String>,
 }
 pub struct Workspace {
     state: PathBuf,
@@ -115,6 +108,22 @@ pub fn bounded(text: &str, limit: usize, from_end: bool) -> (String, bool) {
             ),
             true,
         )
+    }
+}
+
+// Recursive removal would delete files beyond the server's owned metadata.
+async fn remove_empty_directory(path: PathBuf) -> Result<()> {
+    match tokio::fs::remove_dir(path).await {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -282,6 +291,9 @@ impl Workspace {
         let mut jobs = Vec::new();
         if let Ok(mut entries) = tokio::fs::read_dir(self.session_dir(id)?.join("jobs")).await {
             while let Some(entry) = entries.next_entry().await? {
+                if !entry.path().join("job.json").is_file() {
+                    continue;
+                }
                 let job = entry.file_name().to_string_lossy().into_owned();
                 let mut record = self.job(id, &job).await?;
                 record
@@ -414,23 +426,20 @@ impl Workspace {
                     self.broker
                         .call(json!({"op":"forget","session_id":id,"job_id":job}))
                         .await?;
+                    let dir = self.job_dir(id, job)?;
+                    tokio::fs::remove_file(dir.join("job.json")).await?;
+                    remove_empty_directory(dir).await?;
                 }
                 tokio::fs::remove_file(config::session_path(id)?).await?;
                 let dir = self.session_dir(id)?;
-                if dir.join("memo.md").exists() {
-                    // Removing the memo API must not delete existing users' notes.
-                    if dir.join("jobs").exists() {
-                        tokio::fs::remove_dir_all(dir.join("jobs")).await?;
+                remove_empty_directory(dir.join("jobs")).await?;
+                for name in ["terminal.json", "current.json"] {
+                    let path = dir.join(name);
+                    if path.exists() {
+                        tokio::fs::remove_file(path).await?;
                     }
-                    for name in ["terminal.json", "current.json"] {
-                        let path = dir.join(name);
-                        if path.exists() {
-                            tokio::fs::remove_file(path).await?;
-                        }
-                    }
-                } else if dir.exists() {
-                    tokio::fs::remove_dir_all(dir).await?;
                 }
+                remove_empty_directory(dir).await?;
                 Ok(json!({"session_id":id,"status":"closed"}))
             }
             _ => anyhow::bail!("unknown extension tool"),
