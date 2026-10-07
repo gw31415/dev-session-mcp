@@ -1,5 +1,9 @@
 # Validation — private PTY broker + Rust MCP
 
+2026-10-07 UTC: local-mcpの丸ごとのvendorとbuild時の文字列書換えを廃止し、使用する4モジュールだけを `rust/src/base` へ整理しました。公式 `rmcp` SDKが通信を担当し、Linux sandbox helperは同じ実行ファイルへ直接呼出します。由来と追加機能は [UPSTREAM](docs/UPSTREAM.md)、原著作権とライセンスは [NOTICE](NOTICE.md) に記録しています。
+
+この整理後に `cargo fmt --manifest-path rust/Cargo.toml -- --check` と、下記の実stdio integration testを実行しました。**1 passed / 0 failed（1.74秒）**。[実ログ](evidence/rust-upstream-refactor-stdio.log)。20ツール、fileParams拒否、実sandboxでのファイル編集、承認拒否、複数PTY、frontend交換後の再接続・終了結果保持、stdin/resize/個別停止、出力上限、秘密env拒否、clean-env wrapperを確認しました。既存VPSへは接続せず、実機の稼働や配置を変更していません。
+
 2026-10-06 UTC。独立した `/workspace/dev-session-mcp`、Debian 13 x86_64、Rust/Cargo 1.98.1、bubblewrap 0.12.0で確認しました。推奨導入は公式Secure MCP Tunnel + Rust stdioです。runtimeにNode/tmux/shpoolは不要です。
 
 ```sh
@@ -35,4 +39,4 @@ libshpoolの小さな実probeは [evidence/shpool-spike.log](evidence/shpool-spi
 
 未確認: ARM64実機（OCIを含む）、release build、実Tunnel認証、実ChatGPT/dot接続、systemd/sudoers/UIDの実配置、実ChatGPT添付input/外部HTTPS fetch・大容量file output。PTY broker終了/ホスト再起動を越える作業復旧は提供しません。新しい実key/grant、実deploy、OS/network/Tailscale変更は実施していません。
 
-vendor source/ライセンスと既存mycastは変更していません。実機準備は [INSTALL](deploy/INSTALL.md)、[BOOTSTRAP](deploy/BOOTSTRAP.md)。
+この検証は独立プロジェクトのローカルfixtureで行いました。[local-mcp](https://github.com/nakasyou/local-mcp) 由来のコードと保守範囲は [UPSTREAM](docs/UPSTREAM.md)、著作権とライセンスは [NOTICE](NOTICE.md) に記録します。実機準備は [INSTALL](deploy/INSTALL.md)、[BOOTSTRAP](deploy/BOOTSTRAP.md)。

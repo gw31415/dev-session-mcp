@@ -1,3 +1,7 @@
+// Derived from nakasyou/local-mcp. Copyright (c) 2026 Shotaro Nakamura.
+// Adapted and maintained by dev-session-mcp; see NOTICE.md and docs/UPSTREAM.md.
+// Upstream MIT notice: licenses/local-mcp-MIT.txt.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -56,16 +60,14 @@ pub async fn run(
                 false,
                 false,
             );
-        let executable = std::env::current_exe()?
-            .parent()
-            .context("local-mcp executable has no parent directory")?
-            .join("codex-linux-sandbox");
+        let executable = std::env::current_exe()?;
         anyhow::ensure!(
             executable.is_file(),
             "sandbox helper is missing: {}",
             executable.display()
         );
         let mut process = Command::new(executable);
+        process.arg0(codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0);
         process.args(args);
         process
     };

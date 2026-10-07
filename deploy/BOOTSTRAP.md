@@ -2,6 +2,8 @@
 
 本人が既存SSH/Tailscaleで対象Linuxホストへ入り、**Rust版の最新source archive**を独立ディレクトリへ配置してから、以下をホスト側のAIへ渡します。OCI VPSも利用例の一つです。source保存やローカルbuildだけで実ホストの接続は始まりません。
 
+[nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) 由来の基礎ツールに、このプロジェクトの保持PTY・Tunnel配置を追加した独立拡張です。[由来と責任分担](../docs/UPSTREAM.md) と [NOTICE](../NOTICE.md) を確認してください。この依頼は初期準備用で、稼働中環境の変更許可にはなりません。
+
 ---
 
 このLinuxホストの独立プロジェクトで、Rust stdio + 公式Secure MCP Tunnelの初期準備を進めてください。AGENTS.mdとREADME.md、deploy/INSTALL.mdを読んでください。既存プロジェクト/SSH/Tailscaleは変更しません。公開HTTP/外部OAuthは今回使いません。

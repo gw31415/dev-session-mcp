@@ -1,3 +1,7 @@
+// Derived from nakasyou/local-mcp. Copyright (c) 2026 Shotaro Nakamura.
+// Adapted and maintained by dev-session-mcp; see NOTICE.md and docs/UPSTREAM.md.
+// Upstream MIT notice: licenses/local-mcp-MIT.txt.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

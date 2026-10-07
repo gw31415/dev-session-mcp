@@ -1,5 +1,7 @@
 # File exchange: attachment import and output boundary
 
+[nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) 由来のread_file/write_file等に対し、ここに記載するimport_fileとURL取得制限はdev-session-mcpの追加実装です。upstreamへの実装済み機能として扱いません。[由来と保守範囲](UPSTREAM.md)、[NOTICE](../NOTICE.md)。
+
 正式な入力仕様は [Plugins File APIs](https://developers.openai.com/plugins/reference#file-apis) です。ChatGPTがtool descriptorのopenai/fileParams指定に応じて一時download URL/file IDを渡します。使用中のrmcp 3.5.1はtool metadataを保持できます。import_fileを追加し、ファイルbytesを会話本文へ載せずHTTP bodyから作業ファイルへ直接保存します。
 
 ## import_file

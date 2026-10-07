@@ -1,19 +1,10 @@
-#[path = "../../vendor/local-mcp/src/approvals.rs"]
-mod approvals;
+mod base;
+use base::{approvals, config, sandbox, tools as mcp};
 mod auth;
 mod broker;
-#[path = "../../vendor/local-mcp/src/config.rs"]
-mod config;
 mod files;
 mod server;
 mod workspace;
-#[allow(dead_code)]
-mod mcp {
-    include!(concat!(env!("OUT_DIR"), "/mcp.rs"));
-}
-mod sandbox {
-    include!(concat!(env!("OUT_DIR"), "/sandbox.rs"));
-}
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

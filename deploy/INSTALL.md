@@ -1,6 +1,8 @@
 # Linux: dev-session-mcp + Secure MCP Tunnel
 
-これは実機導入の手順書です。実ホストでのTunnel認証・dot接続・OSサービス変更はまだ実施していません。既存SSH/TailscaleでLinuxホストへ入り、独立ディレクトリで進めます。OCI VPS、他のVPS、自宅Linuxなど、クラウド固有のAPIは使いません。公開MCP port/HTTPSや外部OAuthの設定は不要です。
+これは実機導入の手順書です。[nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) 由来のツール・承認・sandboxに、このプロジェクトの保持PTYとTunnel用の秘密分離を組み合わせます。upstreamの公式手順ではありません。[由来と保守範囲](../docs/UPSTREAM.md)、[NOTICE](../NOTICE.md) を参照してください。
+
+既存SSH/TailscaleでLinuxホストへ入り、独立ディレクトリで進めます。OCI VPS、他のVPS、自宅Linuxなど、クラウド固有のAPIは使いません。公開MCP port/HTTPSや外部OAuthの設定は不要です。以下は新規導入の例であり、稼働中の既存環境を変更・停止する指示ではありません。
 
 ## 1. 実OS/CPUを検出してbuild
 
@@ -80,4 +82,4 @@ clientの健康状態を確認したうえで、ChatGPTのAdd custom MCP server�
 
 成果物の出力交換は [ファイル転送設計](../docs/FILE-TRANSFER.md) を参照します。正式なdot/Library出力連携の公開契約は未確認・未実装で、現在は既存SSH/SFTPまたは正式なclient側転送連携が必要です。file URIを返すだけでdotからdownloadできるとは報告しません。
 
-現在、ARM64実機（OCIを含む）・release build・実Tunnel認証・dot接続・systemd実配置は未確認です。ソースは非公開GitHubへ保存します。詳細は [stdio検証](../VALIDATION.md)。
+このソース変更について、ARM64実機（OCIを含む）・release build・実Tunnel認証・dot接続・systemd実配置は未確認です。ソースは [GitHub](https://github.com/gw31415/dev-session-mcp) へ保存します。詳細は [stdio検証](../VALIDATION.md)。

@@ -3,4 +3,3 @@
 *.env
 library-identity.json
 target/
-vendor/local-mcp/.github/

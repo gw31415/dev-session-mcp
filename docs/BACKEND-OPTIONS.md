@@ -1,5 +1,7 @@
 # Persistent terminal backend selection
 
+[nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) 由来のツール・承認・sandboxを基礎として、ここに記載する保持PTY/brokerはdev-session-mcp側の追加実装です。upstream自体の機能や選定として扱いません。[由来と保守範囲](UPSTREAM.md)、[NOTICE](../NOTICE.md)。
+
 2026-10-06 UTC。採用済みbackendは **pty-process 0.5.3 + 同一binaryの独立PTY broker** です。tmux/shpoolはruntime依存にしません。通常APIはsession_idによるrun_command/read_output/send_stdin/resize_command/stop_commandです。
 
 ## libshpoolの実probe
@@ -18,4 +20,4 @@ brokerは作業UIDの別processとして自動起動し、frontend再起動か�
 
 broker自体の終了/ホスト再起動では保持PTYと出力を失います。この条件はユーザーが許容した範囲です。session別keeperによるbroker再起動越しの復旧は実装していません。[tmuxのkill-server](https://raw.githubusercontent.com/tmux/tmux/master/tmux.1) も全sessionを破棄しますが、それを独自brokerの試験証拠には使いません。
 
-実stdio frontendの終了/別PIDでの再起動、切断中に終了したjobの最終出力/exit 9、counter=1で再実行しないこと、live stdin/resize/stopを確認済みです。詳細は [VALIDATION](../VALIDATION.md)。OCI/ARM64/Tunnel実接続は未確認です。
+実stdio frontendの終了/別PIDでの再起動、切断中に終了したjobの最終出力/exit 9、counter=1で再実行しないこと、live stdin/resize/stopを確認済みです。詳細は [VALIDATION](../VALIDATION.md)。このソース変更をOCI/ARM64/Tunnel実接続で検証してはいません。

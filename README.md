@@ -1,6 +1,8 @@
 # dev-session-mcp
 
-Linuxホストを複数プロジェクトの開発環境として使うための独立したRust MCPサーバーです。OCI VPSも利用例の一つです。導入経路は **公式Secure MCP Tunnel → Rust stdio → 開発ツール + 独立PTY保持プロセス**。既存プロジェクトやSSH/Tailscaleの設定を変更せず、独立して導入できます。
+Linuxホストを複数プロジェクトの開発環境として使うための独立したRust MCPサーバーです。[Shotaro Nakamura氏の nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) のツール・承認・sandbox実装を基礎に、接続が切れても保持するPTYセッションと公式Secure MCP Tunnelの秘密分離を追加しています。本プロジェクトが独立して保守する拡張であり、upstreamの公式配布や作者による推奨ではありません。[由来と責任分担](docs/UPSTREAM.md)、[著作権・ライセンス表示](NOTICE.md) を参照してください。
+
+OCI VPSも利用例の一つです。導入経路は **公式Secure MCP Tunnel → Rust stdio → 開発ツール + 独立PTY保持プロセス**。既存プロジェクトやSSH/Tailscaleの設定を変更せず、独立して導入できます。
 
 ```text
 ChatGPT / dot
@@ -16,6 +18,8 @@ Rust stdio（作業UID、認証鍵なし）
 
 [INSTALL](deploy/INSTALL.md) が実OS/CPU検出、native build、公式client配布、秘密分離、systemd常駐、dotへの接続を説明します。[BOOTSTRAP](deploy/BOOTSTRAP.md) は既存SSH/Tailscaleでホストへ入った後にAIへ渡せる準備依頼です。
 
+基本のローカルツールと承認フローだけが目的なら、[local-mcp自身の導入・使い方](https://github.com/nakasyou/local-mcp#readme) も参照してください。本プロジェクトは保持PTY・再接続とTunnel常駐の導入を提供します。
+
 ```sh
 sh scripts/preflight.sh --build
 cargo build --release --locked --manifest-path rust/Cargo.toml
@@ -26,7 +30,7 @@ Linux、Rust 1.96+、Cコンパイラ、make/perl/pkg-config、bubblewrap、CA�
 
 ## 道具と使い方
 
-公開ツールは20個です。上流local-mcpの10ツールと契約を保持します。
+公開ツールは20個です。[local-mcp](https://github.com/nakasyou/local-mcp) 由来の10ツールと承認・sandboxの契約を保持し、下表の10ツールを追加しています。派生コードは `rust/src/base`、追加実装は `broker.rs`・`workspace.rs`・`files.rs` で保守します。MCP通信は公式 `rmcp` SDKを使います。
 
 | 上流10ツール | 追加10ツール |
 | --- | --- |
@@ -57,8 +61,8 @@ Tunnel UIDと作業UIDを分け、runtime keyはLoadCredentialでTunnel側だけ
 
 pty-process 0.5.3 + 薄い独立brokerを実装しています。[選定理由とlibshpool実probe](docs/BACKEND-OPTIONS.md)、[実検証結果](VALIDATION.md) を参照してください。保留中のRust HTTP/OAuthコードは残していますが、Tunnel導入では使いません。
 
-**ARM64実機（OCIを含む）、release build、実Tunnel認証、実ChatGPT/dot接続、systemd実配置は未確認です。** 永続保存先は本人の非公開 [gw31415/dev-session-mcp](https://github.com/gw31415/dev-session-mcp) です。既存mycastは変更しません。
+本リポジトリで記録している検証はローカルLinux x86_64でのものです。**このソース変更についてARM64実機（OCIを含む）、release build、実Tunnel認証、実ChatGPT/dot接続、systemd実配置は未確認です。** 稼働中ホストの設定や状態をこの文書から推定しません。保存先は [gw31415/dev-session-mcp](https://github.com/gw31415/dev-session-mcp) です。
 
-再利用元は [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp)、revision `21025d048f54cc9f948c26ac42fa36183dc453c2`。vendor原本を変更せずbuild.rsでdispatcherの可視性と同一binaryのsandbox helper呼出を調整します。上流LICENSEはMIT、Cargo欄はApache-2.0で不一致があるため双方を保持します。追加コードはMIT、推移的依存は各ライセンスに従います。
+上流全体のsnapshotを同梱・build時に書換える構造は使いません。公開ライブラリAPIがないため必要部分を出典付きの派生モジュールとして保守し、通常のCargo依存とCargo.lockを使います。[更新方針](docs/UPSTREAM.md#dependency-and-update-policy) を参照してください。上流LICENSEのMIT本文と著作権表示を保持し、元のCargo欄のApache-2.0表記との不一致は [NOTICE](NOTICE.md) に記録しています。追加コードはMIT、推移的依存は各ライセンスに従います。
 
 出典: [公式Rust SDK](https://github.com/modelcontextprotocol/rust-sdk)、[Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)、[tunnel-client](https://github.com/openai/tunnel-client)、[client設定仕様](https://github.com/openai/tunnel-client/blob/master/docs/configuration.md)。

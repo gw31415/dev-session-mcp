@@ -1,3 +1,7 @@
+// Derived from nakasyou/local-mcp. Copyright (c) 2026 Shotaro Nakamura.
+// Adapted and maintained by dev-session-mcp; see NOTICE.md and docs/UPSTREAM.md.
+// Upstream MIT notice: licenses/local-mcp-MIT.txt.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -7,7 +11,6 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -26,64 +29,7 @@ fn jobs() -> &'static Mutex<HashMap<Uuid, Job>> {
     JOBS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub async fn serve() -> Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                write_message(&mut stdout, &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error.to_string()}})).await?;
-                continue;
-            }
-        };
-        if request.get("id").is_none() {
-            continue;
-        }
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let response = match dispatch(&request).await {
-            Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-            Err(error) => {
-                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("{error:#}")}})
-            }
-        };
-        write_message(&mut stdout, &response).await?;
-    }
-    Ok(())
-}
-
-async fn write_message(stdout: &mut tokio::io::Stdout, message: &Value) -> Result<()> {
-    stdout
-        .write_all(serde_json::to_string(message)?.as_bytes())
-        .await?;
-    stdout.write_all(b"\n").await?;
-    stdout.flush().await?;
-    Ok(())
-}
-
-async fn dispatch(request: &Value) -> Result<Value> {
-    match request
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-    {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": "local-mcp", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory and sandbox roots."
-        })),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools()})),
-        "tools/call" => call_tool(request.get("params").unwrap_or(&Value::Null)).await,
-        method => anyhow::bail!("method not found: {method}"),
-    }
-}
-
-fn tools() -> Value {
+pub(crate) fn tools() -> Value {
     #[cfg(not(windows))]
     let write_file_description = "Write a UTF-8 file in the Codex sandbox. Relative paths use the session working directory.";
     #[cfg(windows)]
@@ -120,7 +66,7 @@ fn tools() -> Value {
     tools
 }
 
-async fn call_tool(params: &Value) -> Result<Value> {
+pub(crate) async fn call_tool(params: &Value) -> Result<Value> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
