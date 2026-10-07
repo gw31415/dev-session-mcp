@@ -95,6 +95,7 @@ with tempfile.TemporaryDirectory(prefix='dev-session-mcp-check-') as directory:
         m.tool('signal_execution', execution_id=pty['execution_id'], signal='TERM')
         wait_exit(m, pty['execution_id'], restored['cursor'])
         wait_exit(m, other['execution_id'], other['cursor'])
+        m.bad_tool('start_execution', session_id=session, command=['/bin/true'], profile='sandbox', io='pipes', cwd=str(root))
         sandbox = m.tool('start_execution', session_id=session, command=['/bin/sh','-c','printf sandbox'], profile='sandbox', io='pipes')
         r, events = wait_exit(m,sandbox['execution_id'],sandbox['cursor']); assert r['execution']['exit_code']==0 and any(e['data'].get('text')=='sandbox' for e in events)
         flood = m.tool('start_execution', session_id=session, command=['/usr/bin/python3','-c','import sys;sys.stdout.write("\\x00あ"*600000)'], profile='host', io='pipes')
@@ -135,7 +136,19 @@ with tempfile.TemporaryDirectory(prefix='dev-session-mcp-check-') as directory:
         assert m.tool('read_execution',execution_id=fresh['execution_id'],cursor=alive['cursor'])['catch_up_required']
         wait_exit(m,fresh['execution_id'],fresh['cursor'])
         m.tool('close_session',session_id=session)
-        print('PASS: stdio discovery/13 tools, sandbox files, separate pipes, PTY stdin/resize/signal, concurrency, frontend reconnect, PID/broker-epoch rejection, uncertain input receipt, bounded gap, private callback rejection, session close')
+        # Stop a test-only broker with a live process group and confirm child reaping.
+        session = m.tool('open_session',cwd=str(project))['id']
+        stopped = m.tool('start_execution',session_id=session,command=['/bin/sh','-c','sleep 30 & wait'],profile='host',io='pipes')
+        m.close(); broker(state,'shutdown')
+        for _ in range(100):
+            if not (state/'broker.sock').exists(): break
+            time.sleep(.03)
+        try: os.kill(stopped['pid'],0)
+        except ProcessLookupError: pass
+        else: raise AssertionError('broker must reap its managed child before removing the socket')
+        m = MCP(state)
+        m.tool('close_session',session_id=session)
+        print('PASS: stdio discovery/13 tools, sandbox files, separate pipes, PTY stdin/resize/signal, concurrency, frontend reconnect, PID/broker-epoch rejection, uncertain input receipt, bounded gap, private callback rejection, session close, live broker shutdown')
     finally:
         if m.p.poll() is None: m.close()
         if (state/'broker.sock').exists(): broker(state,'shutdown')

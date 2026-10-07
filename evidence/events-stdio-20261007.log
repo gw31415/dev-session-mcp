@@ -1,1 +1,1 @@
-PASS: stdio discovery/13 tools, sandbox files, separate pipes, PTY stdin/resize/signal, concurrency, frontend reconnect, PID/broker-epoch rejection, uncertain input receipt, bounded gap, private callback rejection, session close
+PASS: stdio discovery/13 tools, sandbox files, separate pipes, PTY stdin/resize/signal, concurrency, frontend reconnect, PID/broker-epoch rejection, uncertain input receipt, bounded gap, private callback rejection, session close, live broker shutdown

@@ -319,6 +319,14 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
     } else {
         session.cwd.clone()
     };
+    ensure!(
+        profile == "host"
+            || session
+                .permitted_directories
+                .iter()
+                .any(|root| cwd.starts_with(root)),
+        "sandbox cwd must lie within session permitted roots"
+    );
     let mut state = ledger.lock().unwrap();
     if state.executions.len() >= EXECUTIONS {
         let candidate = state
@@ -396,6 +404,7 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
         .to_owned();
     let (tx, mut rx) = mpsc::channel(8);
     let id;
+    let initial;
     {
         let mut state = ledger.lock().unwrap();
         id = format!("{}:{pid}:{ticks}", state.epoch);
@@ -408,6 +417,9 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
             },
         );
         state.append(&id, "started", json!({"profile":profile,"io":io,"pid":pid}));
+        // The start cursor must precede output even if a short child finishes
+        // before the RPC response is delivered.
+        initial = state.executions[&id].record.clone();
     }
     let mut pumps = Vec::new();
     for (reader, stream) in readers {
@@ -447,6 +459,20 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
                 }
             }
         };
+        while let Ok(action) = rx.try_recv() {
+            if let Action::Input(_, receipt) = action {
+                let mut state = held.lock().unwrap();
+                let record = &mut state.executions.get_mut(&owned_id).unwrap().record;
+                if record["input"]["sequence"] == receipt {
+                    record["input"]["delivery"] = json!("delivery_unknown");
+                }
+                state.append(
+                    &owned_id,
+                    "input",
+                    json!({"input_sequence":receipt,"delivery":"delivery_unknown"}),
+                );
+            }
+        }
         drop(input);
         for mut reader in pumps {
             if tokio::time::timeout(Duration::from_millis(500), &mut reader)
@@ -464,7 +490,7 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
         }
         state.append(&owned_id, "exit", json!({"exit_code":code}));
     });
-    Ok(ledger.lock().unwrap().executions[&id].record.clone())
+    Ok(initial)
 }
 async fn handle(
     args: Value,
@@ -688,6 +714,26 @@ pub async fn run() -> Result<()> {
         .collect();
     for action in actions {
         let _ = action.send(Action::Signal(libc::SIGKILL)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let notify = ledger.lock().unwrap().changed.clone();
+        let changed = notify.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if ledger
+            .lock()
+            .unwrap()
+            .executions
+            .values()
+            .all(|e| e.record["status"] != "running")
+        {
+            break;
+        }
+        if tokio::time::timeout_at(deadline, changed).await.is_err() {
+            eprintln!("Broker shutdown: some child exits remain unconfirmed.");
+            break;
+        }
     }
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(state.join("broker.pid"));
