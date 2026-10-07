@@ -60,7 +60,7 @@ fn authorized_url(value: &str, origins: &str) -> Result<Url> {
     );
     Ok(url)
 }
-fn public_address(ip: IpAddr) -> bool {
+pub(crate) fn public_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, c, _] = ip.octets();

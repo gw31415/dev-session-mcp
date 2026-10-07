@@ -5,20 +5,19 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=mcp-tunnel
-Group=mcp-tunnel
-Environment=HOME=/var/lib/mcp-tunnel
+User=ubuntu
+Group=ubuntu
+Environment=HOME=/home/ubuntu
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 LoadCredential=runtime-key:/etc/dev-session-mcp-tunnel/runtime-key
 ExecStart=/usr/local/bin/tunnel-client run --config /etc/dev-session-mcp-tunnel/config.yaml --control-plane.api-key=file:%d/runtime-key
 Restart=on-failure
 RestartSec=5
 UMask=0077
-# The private PTY holder must survive Tunnel/Rust child replacement. Stop jobs explicitly.
+# Keep the independent broker alive when the Tunnel frontend is replaced.
 KillMode=process
 StandardOutput=journal
 StandardError=journal
-# Do not enable NoNewPrivileges here: the fixed sudo UID transition needs it off.
 
 [Install]
 WantedBy=multi-user.target

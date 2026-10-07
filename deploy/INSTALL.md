@@ -1,60 +1,45 @@
-# Linux: dev-session-mcp + Secure MCP Tunnel
+# Linux installation and safe update
 
-これは実機導入の手順書です。[nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) 由来のツール・承認・sandboxに、このプロジェクトの保持PTYとTunnel用の秘密分離を組み合わせます。upstreamの公式手順ではありません。[由来と保守範囲](../docs/UPSTREAM.md)、[NOTICE](../NOTICE.md) を参照してください。
+This is an unexecuted example for the existing Ubuntu account, with no new UID or sudoers grant. Adapt all `ubuntu` paths to the actual existing user. The endpoint is personal and trusted: host commands have that user's full rights and can read that user's credential files and Events store. Clean environment inheritance and private file modes do not isolate mutually trusted same-UID processes.
 
-既存SSH/TailscaleでLinuxホストへ入り、独立ディレクトリで進めます。OCI VPS、他のVPS、自宅Linuxなど、クラウド固有のAPIは使いません。公開MCP port/HTTPSや外部OAuthの設定は不要です。以下は新規導入の例であり、稼働中の既存環境を変更・停止する指示ではありません。
+## Build on the actual OS/CPU
 
-## 1. 実OS/CPUを検出してbuild
+Keep this repository independent of other projects. Detect rather than assume architecture:
 
 ```sh
 uname -sm
 cat /etc/os-release
 sh scripts/preflight.sh --build
+cargo build --locked --manifest-path rust/Cargo.toml
+cargo test --locked --manifest-path rust/Cargo.toml
+python3 tests/stdio.py rust/target/debug/dev-session-mcp
 cargo build --release --locked --manifest-path rust/Cargo.toml
-./rust/target/release/dev-session-mcp --version
 ```
 
-preflightはaarch64/arm64をARM64、x86_64/amd64をAMD64として検出します。Rust 1.96+、cc/make/perl/pkg-config、bubblewrap、CA証明書と動的ライブラリが必要です。不足は実OSのパッケージマネージャで導入します。Nodeは不要。低メモリならbuildに `CARGO_BUILD_JOBS=1` を付けます。
+Linux ARM64/aarch64 and AMD64/x86_64 use native Rust builds. Rust 1.96+, C compiler, make/perl/pkg-config, bubblewrap and CA certificates are required. Use `CARGO_BUILD_JOBS=1` on a small host. Namespace/sandbox denial is a test failure to diagnose; never fall back to host automatically. The Rust binary contains the Codex Linux sandbox helper and independent broker. No Node, tmux, Mac or GHA is required.
 
-任意のローカルstdio確認は、Node不要の `cargo test --locked --manifest-path rust/Cargo.toml --test stdio_smoke -- --nocapture`。このtestは一時HOME/state/projectで実サーバーを起動し、作業プロジェクトを変更しません。namespace制約でsandboxが失敗したら原因を報告し、通常executeのsandboxを無効化しません。
+## Existing Tunnel and single-user placement
 
-## 2. 公式tunnel-clientを用意
+Use the [official Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels). Get the full client for the detected CPU from [official releases](https://github.com/openai/tunnel-client/releases/latest), verify its published SHA256SUMS, and record the installed version. Linux arm64 and amd64 distributions are provided. Use the existing Tunnel ID/runtime key and existing workspace association; this implementation does not create keys or grants. Outbound API port 443 is required; no inbound shell/MCP port or Tailscale/firewall change is needed. The health listener remains loopback.
 
-[Platform Tunnels](https://platform.openai.com/settings/organization/tunnels) のdownload、または [公式latest release](https://github.com/openai/tunnel-client/releases/latest) から、検出したCPUに合うfull clientの `linux-arm64` / `linux-amd64` ZIPを選びます。配布のSHA256SUMSと照合し、実行ファイルを `/usr/local/bin/tunnel-client` へ配置します。再現用に導入したversionを記録し、更新時にもchecksumを確認します。
+The example wrapper is a fixed, argument-free `env -i` launcher. It excludes Tunnel credential environment variables from stdio and all execution children. The Events store contains signing secrets but command environments do not. Review the same-UID trust boundary above before connecting other people or agents.
 
-```sh
-tunnel-client --version
-tunnel-client help quickstart
-```
-
-既存Tunnel IDとruntime API keyを使います。runtimeの本人にはTunnels Read + Use、対象ChatGPT workspaceにはprivate MCPを利用できるassociation/権限が必要です。未作成・未許可なら本人または管理者の操作が残ります。ここでは新規key/grantを自動作成しません。runtime keyをchat/argv/履歴/exportへ貼らず、常駐clientにはadmin keyを使いません。[公式権限案内](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels#permissions-and-access)
-
-## 3. 作業UIDとTunnel UIDを分けて配置
-
-以下はroot権限を使う**未実行の配置例**です。`devmcp`と`mcp-tunnel`が既に存在するならuseraddを省略し、home/パスを全ファイルで合わせます。互いのグループに入れず、devmcpに一般sudo権限を与えません。
+Unexecuted new-install placement example:
 
 ```sh
-sudo useradd --create-home --user-group --shell /bin/bash devmcp
-sudo useradd --system --create-home --user-group --home-dir /var/lib/mcp-tunnel --shell /usr/sbin/nologin mcp-tunnel
-sudo chmod 0700 /home/devmcp /var/lib/mcp-tunnel
 sudo install -d -o root -g root -m 0755 /opt/dev-session-mcp/bin /usr/local/libexec
 sudo install -o root -g root -m 0755 rust/target/release/dev-session-mcp /opt/dev-session-mcp/bin/dev-session-mcp
-sudo install -d -o devmcp -g devmcp -m 0700 /home/devmcp/projects /home/devmcp/.local /home/devmcp/.local/state /home/devmcp/.local/state/local-mcp /home/devmcp/.local/state/dev-session-mcp
+mkdir -p /home/ubuntu/projects /home/ubuntu/.local/state/dev-session-mcp-v3
+chmod 0700 /home/ubuntu/.local/state/dev-session-mcp-v3
 sudo install -o root -g root -m 0755 deploy/dev-session-mcp-stdio /usr/local/libexec/dev-session-mcp-stdio
-sudo install -o root -g root -m 0440 deploy/sudoers.example /etc/sudoers.d/dev-session-mcp
-sudo visudo -cf /etc/sudoers.d/dev-session-mcp
-sudo install -d -o root -g mcp-tunnel -m 0750 /etc/dev-session-mcp-tunnel
-sudo install -o root -g mcp-tunnel -m 0640 deploy/tunnel-client.yaml.example /etc/dev-session-mcp-tunnel/config.yaml
+sudo install -d -o root -g root -m 0700 /etc/dev-session-mcp-tunnel
+sudo install -o root -g root -m 0600 deploy/tunnel-client.yaml.example /etc/dev-session-mcp-tunnel/config.yaml
 sudo install -o root -g root -m 0644 deploy/dev-session-mcp-tunnel.service /etc/systemd/system/dev-session-mcp-tunnel.service
 ```
 
-config.yamlのTunnel IDを実値へ置換します。MCP commandは `sudo -n -u devmcp -- /usr/local/libexec/dev-session-mcp-stdio`。sudoersはこの固定wrapperの**引数なし**だけを許可します。wrapperはsudoを再実行せず `env -i` でRust stdioを起動します。binary/wrapperと親ディレクトリはroot所有・作業UIDから変更不可にします。
+Set the real existing Tunnel ID in config.yaml, and place its existing runtime key through a secure local terminal into `/etc/dev-session-mcp-tunnel/runtime-key`, root-owned 0600. Do not paste it into chat, argv, export, shell history or logs. systemd LoadCredential supplies it to the Tunnel process, and the fixed launcher removes inherited credential environment. Same UID means host commands may still read that process's runtime credential copy; no UID isolation is claimed. No sudoers rule is required.
 
-Rust stdioはTunnelのchildとして常駐し、同一binaryのprivate PTY brokerを作業UIDで別processとして自動起動します。broker専用unitは不要です。上流session metadataは `/home/devmcp/.local/state/local-mcp/sessions`、拡張session/job metadataとbroker.sock/broker.pidは `/home/devmcp/.local/state/dev-session-mcp`。broker.sockは0600、stateは0700で同一UIDを確認します。パス変更時はwrapperのHOME/XDG_STATE_HOME/DEV_SESSION_MCP_STATE_DIRを揃えます。
-
-## 4. 既存runtime keyを安全に配置して起動
-
-本人が安全な端末経路で既存runtime keyを `/etc/dev-session-mcp-tunnel/runtime-key` に保存し、root:root 0600にします。鍵本文をコマンドに埋め込む例は提供しません。systemd `LoadCredential` がTunnel UID専用のprivate copyを作り、clientは `--control-plane.api-key=file:%d/runtime-key` で読みます。作業UIDに鍵・credential directoryを読める権限を与えません。
+For a new installation only, after confirming no other client owns that Tunnel ID:
 
 ```sh
 sudo systemctl daemon-reload
@@ -64,22 +49,23 @@ curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
-同じTunnel IDのclientは1個だけにします。既存client/別Rust backendが動いていれば、重複起動せず現状を確認して停止対象を決めます。必要な外向き接続は `api.openai.com:443`、既存control-plane mTLSを使う場合は `mtls.api.openai.com:443`。inbound portは開けません。health/UIはloopbackのみ。既存Tailscale/firewallを変更しません。
+One active client per Tunnel ID. `KillMode=process` preserves the broker through frontend replacement. It does not terminate work or update an already running broker binary. broker.sock is 0600 and peer UID checked; state is 0700. Session metadata and Events subscriptions share this single state directory; output/state journal is broker RAM. Broker termination/host restart loses executions and journal.
 
-このunitは `KillMode=process` でPTY brokerをTunnelの停止/restartから残します。broker自体の終了/ホスト再起動ではPTYと保持出力を失います。Rust stdioが終了すれば通常の上流jobの追跡handleは失われます。生存が必要な作業は通常の `run_command` / `send_stdin` で開始します。Tunnel停止を全作業の終了と取り違えないでください。
+## Updating a host currently used for access
 
-## 5. ChatGPT/dotで既存Tunnelを接続
+Version 0.3 is a breaking API/state change. There is no old-schema migration or legacy shim. Do not stop the live Tunnel/broker while it is the only active control path.
 
-clientの健康状態を確認したうえで、ChatGPTのAdd custom MCP serverのConnection=Tunnelから既存Tunnel IDを選び、作成したprivate app/pluginをdotへ接続します。組織/ワークスペースassociationと本人の利用権限を確認します。stdio側はこの認可を信頼し、任意コマンドを作業UID権限で実行できるため本人専用にします。[公式接続案内](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+1. Inspect the actual running binary, unit, wrapper, UID, state path and active sessions through the existing connection. Report what was observed; do not assume this example describes the live host.
+2. Build the new binary at a separate versioned path. Run the above checks with temporary state, which does not contact the live broker or alter project files.
+3. Keep the old binary, configuration and state for rollback. Prepare the new fixed wrapper with a **new state path** such as `dev-session-mcp-v3`; do not point the new binary at the old socket. This lets old executions remain under their old broker while testing the new broker.
+4. Coordinate any necessary old session termination and the precise cutover with the user/parent. Maintain the existing SSH/Tailscale recovery path. Do not infer approval to kill active work from approval to implement or push source.
+5. At the agreed cutover, replace only the chosen Tunnel MCP command, restart that frontend, and rescan the plugin's catalog. Ensure only one client uses the existing Tunnel ID. The old broker persists until explicitly managed; it is not killed by this source update.
+6. Verify `server/discover`, the 13-tool catalog, `open_session`, actual sandbox/host operations and `execution.events` subscription/verification/delivery in ChatGPT/dot. Check stdin receipt and frontend reconnect. Only then report the runtime version as connected and verified.
 
-最小確認: `list_sessions` → `create_session` → execute/read/write → `run_command/send_stdin/read_output` → 接続を切って同じsessionへ再接続 → `stop_command/close_session`。実ホスト・認証・dotでここまで通って初めて「接続済み」と報告します。セッション型MCP clientはchildが置き換わったときinitialize/initializedを再送します。現行2026-07-28の自己完結requestもRust SDK/Tunnelで扱います。
+The current source is saved to main; this implementation session did not modify or stop the production VPS. ARM64/OCI build, actual platform Events callback and Tunnel deployment remain runtime checks.
 
-終了は `stop_command` / `close_session`。作業ファイルは保持し、daemon化した子孫はプロジェクト側で管理します。without_sandboxの承認は既存SSH経路で作業UIDになり、同じHOME/XDG_STATE_HOME/DEV_SESSION_MCP_STATE_DIRで `/opt/dev-session-mcp/bin/dev-session-mcp approval-console SESSION_ID` を実行します。Ctrl-C/stdin EOFはconsoleのdetachだけです。人が内容を読んでy/nを入力します。この手順はyoloや永続許可を新設しません。
+## Events and attachments
 
-全作業を終了/upgradeする場合、まず全sessionをcloseし、管理者が当該stateのbroker.pidとprocessのUID/argvを照合して、そのbrokerへSIGTERMを送ります。brokerは保持jobを停止してsocket/pid fileを除去します。PID fileだけを盲信してkillしません。Tunnel restartだけで古いbroker/binaryが更新されるとは仮定しません。これらは実機で対象を確認して行う操作です。
+Events need no additional service or manually created key. The client provides the whsec signing secret during authenticated `events/subscribe`. Callback delivery is public HTTPS/443 with verification, DNS/IP checks, signatures, finite leases and bounded retry. Private state storage contains secrets: protect backups and do not print the store. See [EVENTS](../docs/EVENTS.md).
 
-添付入力はimport_fileを使います。固定wrapperのDEV_SESSION_MCP_FILE_ORIGINSは既定で空です。正式clientが渡す添付URLの配信originを管理者が検証した後、root所有wrapper内へ完全一致のHTTPS originをカンマ区切りで設定します。ワイルドカード、モデルが指定したorigin、未確認の配信hostを許可しません。値は作業shell/brokerへ渡しません。署名URL全体をログ/chatへ貼らず、originだけを確認します。外部HTTPS取得と実ChatGPT添付入力はまだ未確認です。
-
-成果物の出力交換は [ファイル転送設計](../docs/FILE-TRANSFER.md) を参照します。正式なdot/Library出力連携の公開契約は未確認・未実装で、現在は既存SSH/SFTPまたは正式なclient側転送連携が必要です。file URIを返すだけでdotからdownloadできるとは報告しません。
-
-このソース変更について、ARM64実機（OCIを含む）・release build・実Tunnel認証・dot接続・systemd実配置は未確認です。ソースは [GitHub](https://github.com/gw31415/dev-session-mcp) へ保存します。詳細は [stdio検証](../VALIDATION.md)。
+`import_file` remains denied until the fixed wrapper's `DEV_SESSION_MCP_FILE_ORIGINS` is configured with a verified exact HTTPS origin used by the actual client. Do not log signed URLs or allow a model-supplied/wildcard origin. This setting is not passed into command environments. [File transfer details and unimplemented output-side integration](../docs/FILE-TRANSFER.md).

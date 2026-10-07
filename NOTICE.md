@@ -1,6 +1,6 @@
 # Third-party notices
 
-Parts of `rust/src/base/{approvals,config,sandbox,tools}.rs` are derived from
+Parts of `rust/src/base/{config,sandbox,tools}.rs` are derived from
 [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp), by Shotaro Nakamura.
 The original source was taken from commit
 `21025d048f54cc9f948c26ac42fa36183dc453c2`. This identifies the origin of the

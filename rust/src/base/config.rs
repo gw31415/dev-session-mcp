@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -17,10 +17,7 @@ pub struct Session {
 }
 
 pub fn state_dir() -> Result<PathBuf> {
-    dirs::state_dir()
-        .or_else(dirs::data_local_dir)
-        .map(|path| path.join("local-mcp"))
-        .context("could not determine a local state directory")
+    crate::workspace::state_dir()
 }
 
 pub fn session_path(id: &str) -> Result<PathBuf> {
@@ -28,40 +25,26 @@ pub fn session_path(id: &str) -> Result<PathBuf> {
     Ok(state_dir()?.join("sessions").join(format!("{id}.json")))
 }
 
-pub fn socket_path(id: &str) -> Result<PathBuf> {
-    validate_session_id(id)?;
-    Ok(socket_path_for_id(id))
-}
-
-/// Returns a short, per-user directory for Unix-domain session sockets.
-///
-/// Socket paths have a platform-specific length limit (104 bytes on macOS),
-/// so they cannot live below the regular state directory, which may include
-/// a long home-directory path. Session metadata remains in `state_dir()`.
-#[cfg(unix)]
-fn socket_dir() -> PathBuf {
-    // `TMPDIR` on macOS can itself be long, so use the conventional short
-    // system temporary directory rather than `std::env::temp_dir()`.
-    let uid = unsafe { libc::geteuid() };
-    PathBuf::from("/tmp").join(format!("local-mcp-{uid}"))
-}
-
-#[cfg(unix)]
-fn socket_path_for_id(id: &str) -> PathBuf {
-    socket_dir().join(format!("{id}.sock"))
-}
-
-#[cfg(windows)]
-fn socket_path_for_id(id: &str) -> PathBuf {
-    PathBuf::from(format!(r"\\.\pipe\local-mcp-{id}"))
-}
-
 pub async fn create_session(cwd: &Path, id: Option<&str>) -> Result<Session> {
     let cwd = canonical_directory(cwd)?;
-    let id = id
-        .map(str::to_owned)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let id = id.map(str::to_owned).unwrap_or_else(|| {
+        format!("{:x}", Sha256::digest(cwd.as_os_str().as_encoded_bytes()))[..24].to_owned()
+    });
     validate_session_id(&id)?;
+    if let Ok(existing) = load_session(&id).await {
+        return Ok(existing);
+    }
+    let mut entries = tokio::fs::read_dir(state_dir()?.join("sessions")).await?;
+    let mut count = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.path().extension().is_some_and(|s| s == "json") {
+            count += 1;
+        }
+    }
+    anyhow::ensure!(
+        count < 64,
+        "64 project sessions reached; close one before opening another"
+    );
     let session = Session {
         id,
         cwd: cwd.clone(),
@@ -75,8 +58,8 @@ pub async fn load_session(id: &str) -> Result<Session> {
     let path = session_path(id)?;
     let bytes = tokio::fs::read(&path)
         .await
-        .with_context(|| format!("session {id} was not found; run `local-mcp start` first"))?;
-    serde_json::from_slice(&bytes).context("invalid local-mcp session")
+        .with_context(|| format!("session {id} was not found; use open_session first"))?;
+    serde_json::from_slice(&bytes).context("invalid session")
 }
 
 pub async fn save_session(session: &Session) -> Result<()> {
@@ -105,36 +88,4 @@ pub fn canonical_directory(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot resolve {}", path.display()))?;
     anyhow::ensure!(path.is_dir(), "{} is not a directory", path.display());
     Ok(path)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_custom_session_ids() {
-        assert!(validate_session_id("my-project_1.dev").is_ok());
-        assert!(validate_session_id("").is_err());
-        assert!(validate_session_id("../escape").is_err());
-        assert!(validate_session_id("contains spaces").is_err());
-        assert!(validate_session_id(&"x".repeat(65)).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn puts_sockets_in_a_short_per_user_directory() {
-        let path = socket_path("7418eda5-fd07-4e00-ace5-c1ece2f68a02").unwrap();
-        assert_eq!(path.parent(), Some(socket_dir().as_path()));
-        assert!(path.as_os_str().len() < 104);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn uses_a_named_pipe_for_session_ipc() {
-        let path = socket_path("7418eda5-fd07-4e00-ace5-c1ece2f68a02").unwrap();
-        assert_eq!(
-            path,
-            PathBuf::from(r"\\.\pipe\local-mcp-7418eda5-fd07-4e00-ace5-c1ece2f68a02")
-        );
-    }
 }

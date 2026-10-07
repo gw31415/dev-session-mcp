@@ -1,16 +1,14 @@
 #!/bin/sh
-# Tunnel runs this fixed wrapper as devmcp via the one sudoers UID transition.
-# Install root-owned and non-writable by either service user. No arguments.
+# Fixed same-UID launcher; edit the existing user's paths at installation.
 set -eu
 if test "$#" -ne 0; then
   printf 'This launcher takes no arguments.\n' >&2
   exit 64
 fi
-cd /home/devmcp/projects
+cd /home/ubuntu/projects
 exec /usr/bin/env -i \
-  HOME=/home/devmcp PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
-  XDG_STATE_HOME=/home/devmcp/.local/state \
-  DEV_SESSION_MCP_STATE_DIR=/home/devmcp/.local/state/dev-session-mcp \
-  DEV_SESSION_MCP_DEFAULT_CWD=/home/devmcp/projects \
+  HOME=/home/ubuntu USER=ubuntu LOGNAME=ubuntu \
+  PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
+  DEV_SESSION_MCP_STATE_DIR=/home/ubuntu/.local/state/dev-session-mcp-v3 \
   DEV_SESSION_MCP_FILE_ORIGINS= \
   /opt/dev-session-mcp/bin/dev-session-mcp stdio

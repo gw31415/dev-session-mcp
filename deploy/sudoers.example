@@ -1,4 +1,0 @@
-# root:root 0440 at /etc/sudoers.d/dev-session-mcp; validate using visudo -cf.
-# Empty argument string permits this exact wrapper with NO arguments only.
-Defaults:mcp-tunnel !requiretty
-mcp-tunnel ALL=(devmcp) NOPASSWD: /usr/local/libexec/dev-session-mcp-stdio ""

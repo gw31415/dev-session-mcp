@@ -1,7 +1,7 @@
-//! Private, same-UID PTY holder. Independent of MCP frontend lifetime.
+//! Single owner of processes, execution records and the bounded event journal.
 use crate::{
-    config,
-    workspace::{MAX_OUTPUT, bounded, clean_environment, safe_environment},
+    config, sandbox,
+    workspace::{self, MAX_OUTPUT, text},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -9,113 +9,163 @@ use std::{
     collections::{HashMap, VecDeque},
     os::{
         fd::AsRawFd,
-        unix::{
-            fs::{FileTypeExt, MetadataExt, PermissionsExt},
-            process::CommandExt,
-        },
+        unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::{Notify, mpsc},
 };
 
-const FRAME_LIMIT: u64 = 1024 * 1024;
-type Jobs = Arc<tokio::sync::Mutex<HashMap<(String, String), Arc<Job>>>>;
-struct Buffer {
-    bytes: VecDeque<u8>,
-    total: u64,
-    status: &'static str,
-    exit_code: Option<i32>,
-}
-struct Job {
-    pid: u32,
-    output: Mutex<Buffer>,
-    input: tokio::sync::Mutex<Option<pty_process::OwnedWritePty>>,
-    stop: mpsc::Sender<()>,
-}
+const FRAME: u64 = 2 * 1024 * 1024;
+const HISTORY_BYTES: usize = 1024 * 1024;
+const HISTORY_EVENTS: usize = 1024;
+const EXECUTIONS: usize = 64;
+const BATCH_BYTES: usize = 32 * 1024;
 
+type Shared = Arc<Mutex<Ledger>>;
+struct Execution {
+    record: Value,
+    actions: mpsc::Sender<Action>,
+}
+enum Action {
+    Input(Vec<u8>, u64),
+    Resize(u16, u16),
+    Signal(i32),
+}
+struct Ledger {
+    epoch: String,
+    sequence: u64,
+    events: VecDeque<Value>,
+    bytes: usize,
+    executions: HashMap<String, Execution>,
+    changed: Arc<Notify>,
+}
+impl Ledger {
+    fn new() -> Self {
+        Self {
+            epoch: uuid::Uuid::new_v4().simple().to_string(),
+            sequence: 0,
+            events: VecDeque::new(),
+            bytes: 0,
+            executions: HashMap::new(),
+            changed: Arc::new(Notify::new()),
+        }
+    }
+    fn append(&mut self, execution: &str, kind: &str, data: Value) -> u64 {
+        self.sequence += 1;
+        let seq = self.sequence;
+        let record = self.executions.get_mut(execution).expect("owned execution");
+        record.record["cursor"] = json!(format!("{}:{seq}", self.epoch));
+        let event = json!({"sequence":seq,"execution_id":execution,"session_id":record.record["session_id"],"kind":kind,"timestamp":crate::events::timestamp(),"data":data});
+        self.bytes += serde_json::to_vec(&event).unwrap().len();
+        self.events.push_back(event);
+        while self.bytes > HISTORY_BYTES || self.events.len() > HISTORY_EVENTS {
+            self.bytes -= serde_json::to_vec(&self.events.pop_front().unwrap())
+                .unwrap()
+                .len();
+        }
+        self.changed.notify_waiters();
+        seq
+    }
+    fn read(&self, args: &Value) -> Result<Value> {
+        let execution = args.get("execution_id").and_then(Value::as_str);
+        let session = args.get("session_id").and_then(Value::as_str);
+        let record = execution
+            .map(|id| {
+                self.executions
+                    .get(id)
+                    .context("execution unavailable; never use a bare PID")
+            })
+            .transpose()?;
+        let earliest = self
+            .events
+            .front()
+            .and_then(|v| v["sequence"].as_u64())
+            .unwrap_or(self.sequence + 1);
+        let supplied = args.get("cursor").and_then(Value::as_str);
+        let mut position = self.sequence;
+        let mut gap = false;
+        if let Some(cursor) = supplied {
+            let (epoch, seq) = cursor.rsplit_once(':').context("invalid cursor")?;
+            let seq: u64 = seq.parse()?;
+            gap = epoch != self.epoch || seq.saturating_add(1) < earliest || seq > self.sequence;
+            position = if gap { earliest.saturating_sub(1) } else { seq };
+        }
+        let mut events = Vec::new();
+        let mut bytes = 0;
+        let mut end = position;
+        let mut more = false;
+        for event in &self.events {
+            let seq = event["sequence"].as_u64().unwrap();
+            if seq <= position {
+                continue;
+            }
+            let matches = execution.is_none_or(|id| event["execution_id"] == id)
+                && session.is_none_or(|id| event["session_id"] == id);
+            if matches {
+                let size = serde_json::to_vec(event)?.len();
+                if bytes + size > BATCH_BYTES {
+                    more = true;
+                    break;
+                }
+                bytes += size;
+                events.push(event.clone());
+            }
+            end = seq;
+        }
+        Ok(
+            json!({"execution":record.map(|r|r.record.clone()),"events":events,"cursor":format!("{}:{end}",self.epoch),"earliest_cursor":format!("{}:{}",self.epoch,earliest.saturating_sub(1)),"catch_up_required":gap,"more":more}),
+        )
+    }
+}
+#[derive(Clone)]
 pub struct Client {
     socket: PathBuf,
-}
-
-/// Local human interface only: never exposed as an MCP approval tool.
-pub async fn approval_console(session_id: &str) -> Result<()> {
-    clean_environment()?;
-    config::load_session(session_id).await?;
-    let state = crate::workspace::state_dir()?;
-    let client = Client {
-        socket: state.join("broker.sock"),
-    };
-    let mut entries =
-        tokio::fs::read_dir(state.join("sessions").join(session_id).join("jobs")).await?;
-    let mut selected = None;
-    while let Some(entry) = entries.next_entry().await? {
-        let record: Value =
-            serde_json::from_slice(&tokio::fs::read(entry.path().join("job.json")).await?)?;
-        if record["kind"] == "approvals" {
-            let job = record["job_id"].as_str().context("invalid approval job")?;
-            if client
-                .call(json!({"op":"status","session_id":session_id,"job_id":job}))
-                .await?["status"]
-                == "running"
-            {
-                selected = Some(job.to_owned());
-                break;
-            }
-        }
-    }
-    let job = selected.context("no running approval terminal for this session")?;
-    eprintln!(
-        "Local approval console for {session_id}. Ctrl-C or stdin EOF detaches; the session keeps running."
-    );
-    let mut input = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
-    let mut printed = String::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-    loop {
-        tokio::select! {
-            _ = tick.tick() => {
-                let response = client.call(json!({"op":"poll","session_id":session_id,"job_id":job,"max_output_bytes":MAX_OUTPUT})).await?;
-                let output = response["output"].as_str().context("invalid approval output")?;
-                // Ring truncation may require redisplaying the retained tail.
-                let new = output.strip_prefix(&printed).unwrap_or(output);
-                stdout.write_all(new.as_bytes()).await?;
-                stdout.flush().await?;
-                printed = output.to_owned();
-                ensure!(response["status"] == "running", "approval terminal stopped");
-            }
-            line = input.next_line() => {
-                let Some(line) = line? else { return Ok(()) };
-                ensure!(line.len() < MAX_OUTPUT, "approval input too large");
-                client.call(json!({"op":"send","session_id":session_id,"job_id":job,"text":format!("{line}\n")})).await?;
-            }
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-        }
-    }
+    uid: u32,
 }
 impl Client {
-    pub async fn new(state: &Path) -> Result<Self> {
-        let client = Self {
-            socket: state.join("broker.sock"),
-        };
+    #[cfg(test)]
+    pub fn test_socket(socket: PathBuf) -> Self {
+        Self {
+            socket,
+            uid: unsafe { libc::geteuid() },
+        }
+    }
+
+    pub async fn new() -> Result<Self> {
+        workspace::clean_environment()?;
+        let state = workspace::state_dir()?;
+        let socket = std::env::var_os("DEV_SESSION_MCP_BROKER_SOCKET")
+            .map(PathBuf::from)
+            .unwrap_or(state.join("broker.sock"));
+        let uid = unsafe { libc::geteuid() };
+        let client = Self { socket, uid };
         if client.call(json!({"op":"ping"})).await.is_ok() {
             return Ok(client);
         }
+        ensure!(
+            std::env::var_os("DEV_SESSION_MCP_BROKER_SOCKET").is_none(),
+            "configured broker unavailable; no alternate broker started"
+        );
         let mut command = std::process::Command::new(std::env::current_exe()?);
         command
-            .args(["broker"])
-            .arg(state)
+            .arg("broker")
             .env_clear()
-            .envs(safe_environment())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // Detach only our private holder, never the user's existing services.
+            .envs(workspace::safe_environment())
+            .env("DEV_SESSION_MCP_STATE_DIR", &state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(origins) = std::env::var_os("DEV_SESSION_MCP_FILE_ORIGINS") {
+            command.env("DEV_SESSION_MCP_FILE_ORIGINS", origins);
+        }
+        use std::os::unix::process::CommandExt;
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() < 0 {
@@ -124,274 +174,444 @@ impl Client {
                 Ok(())
             });
         }
-        let mut child = command
-            .spawn()
-            .context("could not start private PTY broker")?;
+        let mut child = command.spawn()?;
         for _ in 0..100 {
             if client.call(json!({"op":"ping"})).await.is_ok() {
                 return Ok(client);
             }
-            if child.try_wait()?.is_some() {
-                anyhow::bail!("private PTY broker exited during startup");
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            ensure!(child.try_wait()?.is_none(), "broker exited during startup");
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        anyhow::bail!("private PTY broker startup timed out")
+        anyhow::bail!("broker startup timed out")
     }
     pub async fn call(&self, request: Value) -> Result<Value> {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let metadata = std::fs::symlink_metadata(&self.socket)?;
-            ensure!(
-                metadata.file_type().is_socket()
-                    && metadata.uid() == unsafe { libc::geteuid() }
-                    && metadata.mode() & 0o077 == 0,
-                "broker socket must be private and owned by this OS user"
-            );
-            let mut socket = UnixStream::connect(&self.socket).await?;
-            ensure!(
-                socket.peer_cred()?.uid() == unsafe { libc::geteuid() },
-                "broker UID mismatch"
-            );
-            let mut bytes = serde_json::to_vec(&request)?;
-            ensure!(
-                bytes.len() < FRAME_LIMIT as usize,
-                "broker request too large"
-            );
-            bytes.push(b'\n');
-            socket.write_all(&bytes).await?;
-            let mut response = Vec::new();
-            BufReader::new(socket.take(FRAME_LIMIT + 1))
-                .read_until(b'\n', &mut response)
-                .await?;
-            ensure!(
-                response.len() <= FRAME_LIMIT as usize && response.last() == Some(&b'\n'),
-                "invalid broker response frame"
-            );
-            let response: Value = serde_json::from_slice(&response)?;
-            ensure!(
-                response["ok"] == true,
-                "{}",
-                response["error"]
-                    .as_str()
-                    .unwrap_or("broker operation failed")
-            );
-            Ok(response["result"].clone())
-        })
-        .await
-        .context("broker request timed out")?
-    }
-}
-
-fn key(request: &Value) -> Result<(String, String)> {
-    let id = request["session_id"]
-        .as_str()
-        .context("missing session_id")?;
-    let job = request["job_id"].as_str().context("missing job_id")?;
-    config::validate_session_id(id)?;
-    config::validate_session_id(job)?;
-    Ok((id.into(), job.into()))
-}
-fn snapshot(job: Option<&Arc<Job>>, limit: usize) -> Value {
-    let Some(job) = job else {
-        return json!({"status":"unavailable","exit_code":null,"output":"","output_bytes":0,"truncated":false});
-    };
-    let buffer = job.output.lock().unwrap();
-    let raw: Vec<u8> = buffer.bytes.iter().copied().collect();
-    let stripped = strip_ansi_escapes::strip(&raw);
-    let text = String::from_utf8_lossy(&stripped).replace("\r\n", "\n");
-    let (output, truncated) = bounded(&text, limit, true);
-    json!({"status":buffer.status,"exit_code":buffer.exit_code,"pid":job.pid,"output_bytes":output.len(),"output":output,"truncated":truncated || buffer.total > raw.len() as u64})
-}
-async fn stop(job: &Arc<Job>) -> Result<()> {
-    if job.output.lock().unwrap().status != "running" {
-        return Ok(());
-    }
-    let _ = job.stop.try_send(());
-    for _ in 0..100 {
-        if job.output.lock().unwrap().status != "running" {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    anyhow::bail!("command did not stop")
-}
-async fn handle(request: Value, jobs: &Jobs, shutdown: &Notify) -> Result<Value> {
-    let op = request["op"].as_str().context("missing broker operation")?;
-    if op == "ping" {
-        return Ok(json!({"pid":std::process::id(),"protocol":1}));
-    }
-    if op == "shutdown" {
-        shutdown.notify_one();
-        return Ok(json!({"status":"stopping"}));
-    }
-    let key = key(&request)?;
-    if op == "start" {
-        let mut jobs = jobs.lock().await;
-        ensure!(!jobs.contains_key(&key), "command already exists");
-        let command: Vec<String> = serde_json::from_value(request["command"].clone())?;
+        let metadata = std::fs::symlink_metadata(&self.socket)?;
         ensure!(
-            !command.is_empty()
-                && !command[0].is_empty()
-                && command.len() <= 256
-                && serde_json::to_vec(&command)?.len() <= MAX_OUTPUT
-                && command.iter().all(|s| !s.contains('\0')),
-            "invalid command argv"
+            metadata.file_type().is_socket()
+                && metadata.uid() == self.uid
+                && metadata.mode() & 0o077 == 0,
+            "broker socket must be private and owned by this UID"
         );
-        let cwd = config::canonical_directory(Path::new(
-            request["cwd"].as_str().context("missing cwd")?,
-        ))?;
-        let (pty, pts) = pty_process::open()?;
-        pty.resize(pty_process::Size::new(40, 160))?;
-        let mut child = pty_process::Command::new(&command[0])
-            .args(&command[1..])
-            .current_dir(cwd)
-            .env_clear()
-            .envs(safe_environment())
-            .kill_on_drop(true)
-            .spawn(pts)?;
-        let pid = child.id().context("missing command PID")?;
-        let (mut reader, writer) = pty.into_split();
-        let (stop_tx, mut stop_rx) = mpsc::channel(1);
-        let job = Arc::new(Job {
-            pid,
-            output: Mutex::new(Buffer {
-                bytes: VecDeque::new(),
-                total: 0,
-                status: "running",
-                exit_code: None,
-            }),
-            input: tokio::sync::Mutex::new(Some(writer)),
-            stop: stop_tx,
-        });
-        jobs.insert(key, job.clone());
-        let output_job = job.clone();
-        let mut reader_task = tokio::spawn(async move {
-            let mut bytes = [0; 8192];
-            loop {
-                match reader.read(&mut bytes).await {
-                    Ok(0) => break,
-                    Ok(count) => {
-                        let mut output = output_job.output.lock().unwrap();
-                        output.total = output.total.saturating_add(count as u64);
-                        output.bytes.extend(&bytes[..count]);
-                        let excess = output.bytes.len().saturating_sub(MAX_OUTPUT);
-                        output.bytes.drain(..excess);
+        let mut stream = UnixStream::connect(&self.socket).await?;
+        ensure!(stream.peer_cred()?.uid() == self.uid, "broker UID mismatch");
+        let mut body = serde_json::to_vec(&request)?;
+        ensure!(body.len() < FRAME as usize, "request too large");
+        body.push(b'\n');
+        stream.write_all(&body).await?;
+        let mut response = Vec::new();
+        let mut reader = BufReader::new(stream.take(FRAME + 1));
+        let read = reader.read_until(b'\n', &mut response);
+        if request["op"] == "wait_events" {
+            read.await?;
+        } else {
+            tokio::time::timeout(Duration::from_secs(20), read).await??;
+        }
+        ensure!(
+            response.len() <= FRAME as usize && response.last() == Some(&b'\n'),
+            "invalid broker frame"
+        );
+        let value: Value = serde_json::from_slice(&response)?;
+        ensure!(
+            value["ok"] == true,
+            "{}",
+            value["error"].as_str().unwrap_or("broker operation failed")
+        );
+        Ok(value["result"].clone())
+    }
+}
+async fn pump<R: AsyncRead + Unpin>(
+    mut reader: R,
+    ledger: Shared,
+    id: String,
+    stream: &'static str,
+) {
+    let mut buffer = [0; 4096];
+    let mut pending = Vec::new();
+    loop {
+        let count = match reader.read(&mut buffer).await {
+            Ok(n) => n,
+            Err(_) => 0,
+        };
+        if count == 0 {
+            if !pending.is_empty() {
+                ledger.lock().unwrap().append(
+                    &id,
+                    "output",
+                    json!({"stream":stream,"text":String::from_utf8_lossy(&pending)}),
+                );
+            }
+            break;
+        }
+        pending.extend_from_slice(&buffer[..count]);
+        let mut output = String::new();
+        loop {
+            match std::str::from_utf8(&pending) {
+                Ok(text) => {
+                    output.push_str(text);
+                    pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    output.push_str(std::str::from_utf8(&pending[..valid]).unwrap());
+                    if let Some(invalid) = error.error_len() {
+                        output.push('\u{fffd}');
+                        pending.drain(..valid + invalid);
+                    } else {
+                        pending.drain(..valid);
+                        break;
                     }
-                    // Linux signals PTY slave closure with EIO.
-                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                    Err(_) => break,
                 }
             }
-        });
-        tokio::spawn(async move {
-            let (status, stopped) = tokio::select! {
-                result = child.wait() => (result, false),
-                _ = stop_rx.recv() => {
-                    unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
-                    (child.wait().await, true)
+        }
+        if !output.is_empty() {
+            ledger
+                .lock()
+                .unwrap()
+                .append(&id, "output", json!({"stream":stream,"text":output}));
+        }
+    }
+}
+enum Input {
+    Pty(pty_process::OwnedWritePty),
+    Pipe(tokio::process::ChildStdin),
+}
+impl Input {
+    async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Pty(w) => w.write_all(data).await,
+            Self::Pipe(w) => w.write_all(data).await,
+        }
+    }
+    fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        match self {
+            Self::Pty(w) => {
+                w.resize(pty_process::Size::new(rows, cols))?;
+                Ok(())
+            }
+            Self::Pipe(_) => anyhow::bail!("resize requires a PTY"),
+        }
+    }
+}
+async fn start(args: &Value, ledger: Shared) -> Result<Value> {
+    let session = config::load_session(text(args, "session_id")?).await?;
+    let command: Vec<String> = serde_json::from_value(args["command"].clone())?;
+    ensure!(
+        !command.is_empty()
+            && command.len() <= 256
+            && command.iter().all(|s| !s.contains('\0'))
+            && serde_json::to_vec(&command)?.len() <= MAX_OUTPUT,
+        "invalid argv"
+    );
+    let profile = text(args, "profile")?;
+    ensure!(
+        ["host", "sandbox"].contains(&profile),
+        "profile must be host or sandbox"
+    );
+    let io = args.get("io").and_then(Value::as_str).unwrap_or("pty");
+    ensure!(["pty", "pipes"].contains(&io), "io must be pty or pipes");
+    ensure!(
+        profile != "sandbox" || io == "pipes",
+        "sandbox profile uses pipes; host PTY retains full OS-user rights"
+    );
+    let cwd = if let Some(path) = args.get("cwd").and_then(Value::as_str) {
+        config::canonical_directory(Path::new(path))?
+    } else {
+        session.cwd.clone()
+    };
+    let mut state = ledger.lock().unwrap();
+    if state.executions.len() >= EXECUTIONS {
+        let candidate = state
+            .executions
+            .iter()
+            .filter(|(_, e)| e.record["status"] != "running")
+            .min_by_key(|(_, e)| e.record["started_sequence"].as_u64().unwrap_or(0))
+            .map(|(id, _)| id.clone());
+        if let Some(id) = candidate {
+            state.executions.remove(&id);
+        } else {
+            anyhow::bail!("64 live executions reached; stop one before starting another");
+        }
+    }
+    // Reserve capacity before spawning; the start operation is serialized by the broker.
+    drop(state);
+    let (mut child, mut input, readers) = if io == "pty" {
+        let (pty, pts) = pty_process::open()?;
+        pty.resize(pty_process::Size::new(24, 80))?;
+        let child = pty_process::Command::new(&command[0])
+            .args(&command[1..])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(workspace::safe_environment())
+            .kill_on_drop(true)
+            .spawn(pts)?;
+        let (reader, writer) = pty.into_split();
+        (
+            child,
+            Input::Pty(writer),
+            vec![(
+                Box::new(reader) as Box<dyn AsyncRead + Unpin + Send>,
+                "terminal",
+            )],
+        )
+    } else {
+        let mut process = if profile == "sandbox" {
+            sandbox::command(&command, &cwd, &session.permitted_directories)?
+        } else {
+            let mut p = tokio::process::Command::new(&command[0]);
+            p.args(&command[1..])
+                .current_dir(&cwd)
+                .env_clear()
+                .envs(workspace::safe_environment());
+            p
+        };
+        process
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = process.spawn()?;
+        let input = Input::Pipe(child.stdin.take().unwrap());
+        let readers = vec![
+            (
+                Box::new(child.stdout.take().unwrap()) as Box<dyn AsyncRead + Unpin + Send>,
+                "stdout",
+            ),
+            (
+                Box::new(child.stderr.take().unwrap()) as Box<dyn AsyncRead + Unpin + Send>,
+                "stderr",
+            ),
+        ];
+        (child, input, readers)
+    };
+    let pid = child.id().context("missing child PID")?;
+    let ticks = std::fs::read_to_string(format!("/proc/{pid}/stat"))?
+        .rsplit_once(')')
+        .context("invalid proc stat")?
+        .1
+        .split_whitespace()
+        .nth(19)
+        .context("missing start ticks")?
+        .to_owned();
+    let (tx, mut rx) = mpsc::channel(8);
+    let id;
+    {
+        let mut state = ledger.lock().unwrap();
+        id = format!("{}:{pid}:{ticks}", state.epoch);
+        let record = json!({"execution_id":id,"session_id":session.id,"pid":pid,"profile":profile,"io":io,"status":"running","exit_code":null,"started_sequence":state.sequence+1});
+        state.executions.insert(
+            id.clone(),
+            Execution {
+                record,
+                actions: tx,
+            },
+        );
+        state.append(&id, "started", json!({"profile":profile,"io":io,"pid":pid}));
+    }
+    let mut pumps = Vec::new();
+    for (reader, stream) in readers {
+        pumps.push(tokio::spawn(pump(
+            reader,
+            ledger.clone(),
+            id.clone(),
+            stream,
+        )));
+    }
+    let owned_id = id.clone();
+    let held = ledger.clone();
+    tokio::spawn(async move {
+        let status = loop {
+            tokio::select! {
+                result=child.wait()=>break result,
+                action=rx.recv()=>match action {
+                    Some(Action::Input(bytes,receipt))=> {
+                        let written=tokio::time::timeout(Duration::from_secs(2),input.write(&bytes)).await.is_ok_and(|r|r.is_ok());
+                        let delivery=if written{"written"}else{"delivery_unknown"};
+                        let mut state=held.lock().unwrap();
+                        let record=&mut state.executions.get_mut(&owned_id).unwrap().record;
+                        if record["input"]["sequence"]==receipt {record["input"]["delivery"]=json!(delivery);}
+                        state.append(&owned_id,"input",json!({"input_sequence":receipt,"delivery":delivery}));
+                    }
+                    Some(Action::Resize(rows,cols))=> {
+                        let ok=input.resize(rows,cols).is_ok();
+                        held.lock().unwrap().append(&owned_id,"resize",json!({"rows":rows,"cols":cols,"applied":ok}));
+                    }
+                    Some(Action::Signal(signal))=> {
+                        // The child handle is not reaped outside this actor. Its PID cannot
+                        // be reused while this branch signals the owned process group.
+                        let ok=unsafe{libc::kill(-(pid as i32),signal)}==0;
+                        held.lock().unwrap().append(&owned_id,"signal",json!({"signal":signal,"sent":ok}));
+                    }
+                    None=> { let _=child.start_kill(); break child.wait().await; }
                 }
-            };
-            // Drain final output before publishing completion; a detached child
-            // retaining the slave cannot keep completion waiting forever.
-            if tokio::time::timeout(Duration::from_millis(500), &mut reader_task)
+            }
+        };
+        drop(input);
+        for mut reader in pumps {
+            if tokio::time::timeout(Duration::from_millis(500), &mut reader)
                 .await
                 .is_err()
             {
-                reader_task.abort();
+                reader.abort();
             }
-            job.input.lock().await.take();
-            let mut output = job.output.lock().unwrap();
-            output.status = if stopped {
-                "stopped"
-            } else if status.is_ok() {
-                "completed"
-            } else {
-                "unavailable"
+        }
+        let code = status.ok().and_then(|s| s.code());
+        let mut state = held.lock().unwrap();
+        if let Some(execution) = state.executions.get_mut(&owned_id) {
+            execution.record["status"] = json!("exited");
+            execution.record["exit_code"] = json!(code);
+        }
+        state.append(&owned_id, "exit", json!({"exit_code":code}));
+    });
+    Ok(ledger.lock().unwrap().executions[&id].record.clone())
+}
+async fn handle(
+    args: Value,
+    ledger: Shared,
+    starts: Arc<tokio::sync::Mutex<()>>,
+    shutdown: Arc<Notify>,
+) -> Result<Value> {
+    match text(&args, "op")? {
+        "ping" => {
+            Ok(json!({"pid":std::process::id(),"epoch":ledger.lock().unwrap().epoch,"protocol":2}))
+        }
+        "shutdown" => {
+            shutdown.notify_one();
+            Ok(json!({"status":"stopping"}))
+        }
+        "open_session" => {
+            let _guard = starts.lock().await;
+            let cwd = config::canonical_directory(Path::new(text(&args, "cwd")?))?;
+            let session = config::create_session(&cwd, None).await?;
+            Ok(json!(session))
+        }
+        "list_sessions" => {
+            let mut entries = tokio::fs::read_dir(workspace::state_dir()?.join("sessions")).await?;
+            let mut sessions = Vec::new();
+            while let Some(entry) = entries.next_entry().await? {
+                if sessions.len() >= 64 {
+                    break;
+                }
+                if entry.path().extension().is_some_and(|s| s == "json") {
+                    let data: Value =
+                        serde_json::from_slice(&tokio::fs::read(entry.path()).await?)?;
+                    sessions.push(data);
+                }
+            }
+            let executions: Vec<_> = ledger
+                .lock()
+                .unwrap()
+                .executions
+                .values()
+                .map(|e| e.record.clone())
+                .collect();
+            Ok(json!({"sessions":sessions,"executions":executions}))
+        }
+        "inspect_session" => Ok(json!(
+            config::load_session(text(&args, "session_id")?).await?
+        )),
+        "close_session" => {
+            let _guard = starts.lock().await;
+            let id = text(&args, "session_id")?;
+            config::load_session(id).await?;
+            let actions: Vec<_> = ledger
+                .lock()
+                .unwrap()
+                .executions
+                .values()
+                .filter(|e| e.record["session_id"] == id && e.record["status"] == "running")
+                .map(|e| e.actions.clone())
+                .collect();
+            for action in actions {
+                action.send(Action::Signal(libc::SIGKILL)).await?;
+            }
+            tokio::fs::remove_file(config::session_path(id)?).await?;
+            ledger.lock().unwrap().changed.notify_waiters();
+            Ok(json!({"session_id":id,"closed":true}))
+        }
+        "start_execution" => {
+            let _guard = starts.lock().await;
+            start(&args, ledger).await
+        }
+        "event_position" => ledger.lock().unwrap().read(&args),
+        "read_execution" => {
+            text(&args, "execution_id")?;
+            ledger.lock().unwrap().read(&args)
+        }
+        "wait_events" => loop {
+            let notify = ledger.lock().unwrap().changed.clone();
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            config::load_session(text(&args, "session_id")?).await?;
+            let data = ledger.lock().unwrap().read(&args)?;
+            if data["catch_up_required"] == true
+                || data["events"].as_array().is_some_and(|s| !s.is_empty())
+            {
+                break Ok(data);
+            }
+            notified.await;
+        },
+        "input_execution" | "resize_execution" | "signal_execution" => {
+            let id = text(&args, "execution_id")?;
+            let mut state = ledger.lock().unwrap();
+            let execution = state
+                .executions
+                .get(id)
+                .context("execution unavailable; bare/stale PIDs are rejected")?;
+            ensure!(
+                execution.record["status"] == "running",
+                "execution is not running"
+            );
+            let sender = execution.actions.clone();
+            let permit = sender
+                .try_reserve()
+                .context("execution input queue full or closed; action not accepted")?;
+            let action = match text(&args, "op")? {
+                "input_execution" => {
+                    let bytes = text(&args, "text")?.as_bytes().to_vec();
+                    let seq = state.append(
+                        id,
+                        "input",
+                        json!({"delivery":"accepted","bytes":bytes.len()}),
+                    );
+                    state.executions.get_mut(id).unwrap().record["input"] =
+                        json!({"sequence":seq,"delivery":"accepted"});
+                    Action::Input(bytes, seq)
+                }
+                "resize_execution" => {
+                    ensure!(execution.record["io"] == "pty", "resize requires a PTY");
+                    let rows = args["rows"].as_u64().context("missing rows")?;
+                    let cols = args["cols"].as_u64().context("missing cols")?;
+                    ensure!(
+                        (1..=1000).contains(&rows) && (1..=1000).contains(&cols),
+                        "invalid dimensions"
+                    );
+                    Action::Resize(rows as u16, cols as u16)
+                }
+                _ => Action::Signal(match text(&args, "signal")? {
+                    "INT" => libc::SIGINT,
+                    "TERM" => libc::SIGTERM,
+                    "KILL" => libc::SIGKILL,
+                    _ => anyhow::bail!("signal must be INT, TERM or KILL"),
+                }),
             };
-            output.exit_code = status.ok().and_then(|s| s.code());
-        });
-        return Ok(json!({"pid":pid}));
-    }
-    let job = jobs.lock().await.get(&key).cloned();
-    let limit = request
-        .get("max_output_bytes")
-        .map(|v| v.as_u64().context("invalid output limit"))
-        .transpose()?
-        .unwrap_or(16384) as usize;
-    ensure!(
-        (256..=MAX_OUTPUT).contains(&limit),
-        "output limit must be 256..65536"
-    );
-    if op == "poll" || op == "status" {
-        return Ok(snapshot(job.as_ref(), limit));
-    }
-    if op == "forget" {
-        if let Some(job) = &job {
-            stop(job).await?;
+            permit.send(action);
+            Ok(state.executions[id].record.clone())
         }
-        jobs.lock().await.remove(&key);
-        return Ok(json!({"status":"unavailable"}));
-    }
-    let job = job.context("command unavailable")?;
-    if op == "stop" {
-        stop(&job).await?;
-        return Ok(snapshot(Some(&job), limit));
-    }
-    ensure!(
-        job.output.lock().unwrap().status == "running",
-        "command is not running"
-    );
-    let mut input = job.input.lock().await;
-    let writer = input.as_mut().context("command input closed")?;
-    match op {
-        "send" => {
-            let text = request
-                .get("text")
-                .map(|v| v.as_str().context("invalid stdin text"))
-                .transpose()?
-                .unwrap_or("");
-            ensure!(
-                text.len() <= MAX_OUTPUT && !text.contains('\0'),
-                "stdin too large or invalid"
-            );
-            let keys: Vec<String> =
-                serde_json::from_value(request.get("keys").cloned().unwrap_or(json!([])))?;
-            ensure!(keys.len() <= 16, "too many terminal keys");
-            let mut bytes = text.as_bytes().to_vec();
-            for key in keys {
-                bytes.extend_from_slice(match key.as_str() {
-                    "Enter" => b"\r",
-                    "C-c" => b"\x03",
-                    "C-d" => b"\x04",
-                    "Escape" => b"\x1b",
-                    "Tab" => b"\t",
-                    "Up" => b"\x1b[A",
-                    "Down" => b"\x1b[B",
-                    "Left" => b"\x1b[D",
-                    "Right" => b"\x1b[C",
-                    _ => anyhow::bail!("invalid terminal key"),
-                });
-            }
-            writer.write_all(&bytes).await?;
+        "read_file" | "write_file" | "list_directory" | "get_image" => {
+            crate::base::tools::call(text(&args, "op")?, &args).await
         }
-        "resize" => {
-            let rows = request["rows"].as_u64().context("missing rows")?;
-            let cols = request["cols"].as_u64().context("missing cols")?;
-            ensure!(
-                (1..=1000).contains(&rows) && (1..=1000).contains(&cols),
-                "terminal dimensions must be 1..1000"
-            );
-            writer.resize(pty_process::Size::new(rows as u16, cols as u16))?;
-        }
+        "import_file" => crate::files::import(&args).await,
         _ => anyhow::bail!("unknown broker operation"),
     }
-    drop(input);
-    Ok(snapshot(Some(&job), limit))
 }
-pub async fn run(state: PathBuf) -> Result<()> {
-    clean_environment()?;
-    ensure!(state.is_absolute(), "broker state path must be absolute");
-    std::fs::create_dir_all(&state)?;
+pub async fn run() -> Result<()> {
+    workspace::clean_environment()?;
+    let state = workspace::state_dir()?;
+    ensure!(state.is_absolute(), "state must be absolute");
+    std::fs::create_dir_all(state.join("sessions"))?;
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -400,55 +620,74 @@ pub async fn run(state: PathBuf) -> Result<()> {
         .open(state.join("broker.lock"))?;
     ensure!(
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "PTY broker already running"
+        "broker already running"
     );
     let socket = state.join("broker.sock");
-    match std::fs::remove_file(&socket) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+    if socket.exists() {
+        std::fs::remove_file(&socket)?;
     }
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(state.join("broker.pid"), std::process::id().to_string())?;
-    let jobs: Jobs = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let ledger = Arc::new(Mutex::new(Ledger::new()));
+    let starts = Arc::new(tokio::sync::Mutex::new(()));
     let shutdown = Arc::new(Notify::new());
+    let slots = Arc::new(tokio::sync::Semaphore::new(32));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
-        let stream = tokio::select! { pair = listener.accept() => pair?.0, _ = shutdown.notified()=>break, _=terminate.recv()=>break };
+        let stream = tokio::select! {pair=listener.accept()=>pair?.0,_=shutdown.notified()=>break,_=terminate.recv()=>break};
         if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
             continue;
         }
-        let jobs = jobs.clone();
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            continue;
+        };
+        let ledger = ledger.clone();
+        let starts = starts.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             let (reader, mut writer) = stream.into_split();
-            let response = tokio::time::timeout(Duration::from_secs(5), async {
+            let response: Result<Value> = async {
+                let mut reader = BufReader::new(reader.take(FRAME + 1));
                 let mut bytes = Vec::new();
-                BufReader::new(reader.take(FRAME_LIMIT + 1))
-                    .read_until(b'\n', &mut bytes)
-                    .await?;
+                tokio::time::timeout(Duration::from_secs(2), reader.read_until(b'\n', &mut bytes))
+                    .await??;
                 ensure!(
-                    bytes.len() <= FRAME_LIMIT as usize && bytes.last() == Some(&b'\n'),
-                    "invalid request frame"
+                    bytes.len() <= FRAME as usize && bytes.last() == Some(&b'\n'),
+                    "invalid frame"
                 );
-                handle(serde_json::from_slice(&bytes)?, &jobs, &shutdown).await
-            })
+                let request = serde_json::from_slice(&bytes)?;
+                let mut disconnected = [0u8; 1];
+                tokio::select! {
+                    response=handle(request,ledger,starts,shutdown)=>response,
+                    _=reader.read(&mut disconnected)=>anyhow::bail!("client disconnected"),
+                }
+            }
             .await;
             let value = match response {
-                Ok(Ok(v)) => json!({"ok":true,"result":v}),
-                Ok(Err(e)) => json!({"ok":false,"error":e.to_string()}),
-                Err(_) => json!({"ok":false,"error":"broker operation timed out"}),
+                Ok(value) => json!({"ok":true,"result":value}),
+                Err(error) => {
+                    json!({"ok":false,"error":workspace::bounded(&error.to_string(),1024,false).0})
+                }
             };
             if let Ok(mut bytes) = serde_json::to_vec(&value) {
                 bytes.push(b'\n');
-                let _ = writer.write_all(&bytes).await;
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), writer.write_all(&bytes)).await;
             }
         });
     }
-    let held: Vec<_> = jobs.lock().await.values().cloned().collect();
-    for job in held {
-        let _ = stop(&job).await;
+    let actions: Vec<_> = ledger
+        .lock()
+        .unwrap()
+        .executions
+        .values()
+        .filter(|e| e.record["status"] == "running")
+        .map(|e| e.actions.clone())
+        .collect();
+    for action in actions {
+        let _ = action.send(Action::Signal(libc::SIGKILL)).await;
     }
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(state.join("broker.pid"));

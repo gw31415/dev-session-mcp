@@ -1,63 +1,28 @@
 # local-mcp relationship and maintenance
 
-dev-session-mcp extends ideas and tool implementations from
-[nakasyou/local-mcp](https://github.com/nakasyou/local-mcp), by Shotaro Nakamura.
-It is an independently maintained development-session MCP server, not an
-official upstream release or an endorsed integration.
+dev-session-mcp adapts file-access, session configuration and Codex sandbox invocation from [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp), by Shotaro Nakamura. It is independently maintained, not an official upstream release or endorsed integration. [Upstream installation and usage](https://github.com/nakasyou/local-mcp#readme) describes that project's own tools and approval workflow.
 
-## Why the base tools are adapted source
+## Why the base is adapted source
 
-The upstream repository currently defines a `local-mcp` executable and a
-separate Linux sandbox helper. Its source tree has no `lib.rs` or public
-library interface. The official crates.io API for `local-mcp` returned 404
-when checked on 2026-10-07. There is no confirmed upstream library crate to
-declare as a Cargo dependency.
+At the recorded source revision, upstream defines an executable and separate Linux sandbox helper, with no lib.rs/public library API. The official crates.io API returned 404 for local-mcp when checked on 2026-10-07. No confirmed upstream library crate exists to declare as a normal dependency.
 
-We therefore retain only the four adapted modules actually used by this
-application, under `rust/src/base`, instead of shipping the entire upstream
-repository, manifests, lockfile, CLI, and handwritten MCP transport. These
-modules are maintained directly as source. Builds do not fetch local-mcp,
-apply string replacements, or import a hash-pinned source snapshot. The
-origin commit in NOTICE is a provenance record, not a build mechanism.
+This repository maintains three necessary derived modules, `rust/src/base/{config,sandbox,tools}.rs`, directly. It does not ship/fetch/rewrite the complete upstream repository or use its handwritten MCP transport. NOTICE's origin commit is provenance, not a build-time snapshot pin. Source headers and the original MIT notice remain.
 
 | Responsibility | Ownership |
 | --- | --- |
-| Base ten tools, file access, approval requests and session configuration | Derived from local-mcp; adapted in `rust/src/base` |
-| Codex sandbox invocation | Derived from local-mcp; Linux helper routed into this executable |
-| MCP protocol and transports | Official `rmcp` dependency, composed in `server.rs` |
-| Persistent PTYs, private broker, reconnect, output limits, stdin and resize | dev-session-mcp additions in `broker.rs` and `workspace.rs`; `pty-process` dependency |
-| Attachment import and URL policy | dev-session-mcp addition in `files.rs` |
-| Tunnel credential separation, wrapper and systemd deployment | dev-session-mcp deployment files; official external tunnel-client |
-| Optional HTTP/OAuth authorization | dev-session-mcp additions; unused by the recommended Tunnel deployment |
+| Bounded file tools, project metadata, Codex sandbox invocation | Adapted local-mcp source in rust/src/base |
+| MCP 2026 stdio lifecycle and transport | Official rmcp dependency; small Events discovery adapter |
+| Single process owner, explicit execution API, bounded journal/cursors, PTY/pipes, input and signal routing | dev-session-mcp broker; pty-process dependency |
+| Events verification/signatures, durable bounded outbox, leases/retry | dev-session-mcp events module |
+| Attachment import/URL policy | dev-session-mcp files module |
+| Same-user clean environment launcher and systemd instructions | dev-session-mcp deploy files; official external tunnel-client |
 
-The base tools are `session_info`, `read_file`, `get_image`, `list_directory`,
-`write_file`, `execute`, `start_command`, `poll_job`, `stop_job`, and
-`without_sandbox`. This project adds ten session/PTY/file-import tools.
-See [README usage](../README.md#道具と使い方).
+Version 0.3 intentionally replaces the old tool contracts. Upstream approval console, execute/start/poll/stop/without_sandbox and the previous dual job/session maps are removed; no legacy compatibility is claimed. Sandbox restrictions remain explicit in the mandatory execution profile and file write path. Host profile openly grants the owner's normal OS rights. See [README](../README.md).
 
 ## Dependency and update policy
 
-Cargo dependencies use ordinary package versions and Cargo.lock. Codex's
-workspace crates use an explicit git revision because those APIs are used
-directly; this is a normal dependency pin, not a copied repository snapshot.
-`cargo build --locked` keeps these dependencies reproducible.
+Cargo uses normal package versions and Cargo.lock. Codex workspace crates use an explicit Git dependency revision because their APIs are called directly. This is a normal dependency pin, not a copied repository snapshot; cargo build --locked is reproducible.
 
-When updating the base tools, compare upstream changes against the origin
-record and the four maintained modules. Port relevant fixes explicitly,
-record the source and reason, preserve notices, and run the real stdio
-integration test covering tools, sandboxing and approval behavior. Do not
-automatically replace these modules with a whole upstream checkout. If
-upstream publishes a supported library interface, reassess using it as a
-normal dependency before adding another adapter.
+Compare relevant upstream fixes against the recorded origin and the three maintained modules. Port relevant changes explicitly, record the source/reason, preserve notices and run the real stdio/sandbox checks. Do not auto-replace these files with a complete checkout. If upstream publishes a supported library API, reassess a normal dependency before adding another adapter.
 
-## Attribution and choosing a server
-
-Use [local-mcp's own installation and usage](https://github.com/nakasyou/local-mcp#readme)
-for its base local tools and approval workflow. Use this project when the
-additional retained PTY sessions and credential-separated Secure MCP Tunnel
-deployment fit the requirement. The upstream author remains credited for
-the derived code; the additional behavior and its maintenance are this
-project's responsibility.
-
-[NOTICE](../NOTICE.md) and [the preserved upstream license](../licenses/local-mcp-MIT.txt)
-document the original copyright and the upstream license/manifest discrepancy.
+The upstream author remains credited for derived code. Added behavior and maintenance are this project's responsibility. [NOTICE](../NOTICE.md) and [preserved MIT license](../licenses/local-mcp-MIT.txt) record the supplied license and original Cargo metadata discrepancy.

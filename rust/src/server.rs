@@ -1,205 +1,149 @@
-use crate::{
-    auth::{Auth, Settings, authenticate},
-    mcp,
-    workspace::{MAX_OUTPUT, Workspace, bounded},
-};
+use crate::{broker::Client, events::Events, workspace};
 use anyhow::Result;
-use axum::{Router, middleware, routing::get};
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+    ErrorData as McpError, RoleServer, ServerHandler, Service, ServiceExt,
     model::*,
-    service::RequestContext,
-    transport::{
-        StreamableHttpServerConfig, StreamableHttpService,
-        streamable_http_server::session::local::LocalSessionManager,
-    },
+    service::{NotificationContext, RequestContext},
 };
 use serde_json::{Value, json};
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
 
 #[derive(Clone)]
-struct Tools {
-    workspace: Arc<Workspace>,
-    tracked: Arc<Mutex<HashMap<String, HashSet<String>>>>,
-    tools: Arc<Vec<Tool>>,
+struct Server {
+    broker: Client,
+    events: Events,
+    tools: Vec<Tool>,
 }
-
-impl Tools {
+impl Server {
     async fn new() -> Result<Self> {
-        let mut definitions = mcp::tools().as_array().unwrap().clone();
-        let sid =
-            json!({"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_.-]+$"});
-        let string = json!({"type":"string","maxLength":65536});
-        let output = json!({"type":"integer","minimum":256,"maximum":65536});
-        let mut add = |name: &str,
-                       description: &str,
-                       properties: Value,
-                       required: &[&str],
-                       read_only: bool| {
-            definitions.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read_only,"destructiveHint":!read_only,"openWorldHint":true}}));
-        };
-        add(
-            "list_sessions",
-            "List development sessions, working directories and persistent terminals.",
-            json!({}),
-            &[],
-            true,
-        );
-        add(
-            "create_session",
-            "Create a development session with an automatically managed persistent terminal. Existing IDs are not overwritten.",
-            json!({"session_id":sid,"cwd":string}),
-            &[],
-            false,
-        );
-        add(
-            "connect_session",
-            "Reconnect a session and automatically reuse or restore its persistent terminal. Discover command job IDs; no editing lock.",
-            json!({"session_id":sid}),
-            &["session_id"],
-            false,
-        );
-        add(
-            "run_command",
-            "Run persistent argv in this session; omitted command reuses its interactive shell. Selects the returned job for session-only stdin/output/stop. Other commands keep running. FULL service-user filesystem/network access without sandbox or approval. Use execute for sandboxed commands.",
-            json!({"session_id":sid,"command":{"type":"array","items":string,"minItems":1,"maxItems":256},"cwd":string,"max_output_bytes":output}),
-            &["session_id"],
-            false,
-        );
-        add(
-            "read_output",
-            "Read bounded merged terminal output and exit status for this session's selected command. Optional job_id selects another command belonging to this session. Repeated terminal snapshot, not a stream.",
-            json!({"session_id":sid,"job_id":sid,"max_output_bytes":output}),
-            &["session_id"],
-            true,
-        );
-        add(
-            "send_stdin",
-            "Send literal stdin to this session's selected command, with optional job_id for another command in this session. FULL service-user rights without sandbox or approval. Enter submits; C-c interrupts; C-d sends EOF.",
-            json!({"session_id":sid,"job_id":sid,"text":string,"keys":{"type":"array","maxItems":16,"items":{"type":"string","enum":["Enter","C-c","C-d","Escape","Tab","Up","Down","Left","Right"]}},"max_output_bytes":output}),
-            &["session_id"],
-            false,
-        );
-        add(
-            "stop_command",
-            "Stop only the selected command (optional job_id) in this session. Other commands and the session remain. Detached/daemonized descendants need explicit process management.",
-            json!({"session_id":sid,"job_id":sid}),
-            &["session_id"],
-            false,
-        );
-        add(
-            "resize_command",
-            "Resize the selected command terminal in this session (optional job_id). Does not restart the command.",
-            json!({"session_id":sid,"job_id":sid,"rows":{"type":"integer","minimum":1,"maximum":1000},"cols":{"type":"integer","minimum":1,"maximum":1000}}),
-            &["session_id", "rows", "cols"],
-            false,
-        );
-        add(
-            "close_session",
-            "Stop all managed terminals/commands in this session and remove session metadata. Other sessions remain. Refuses while ordinary sandboxed jobs remain tracked.",
-            json!({"session_id":sid}),
-            &["session_id"],
-            false,
-        );
-        definitions.push(crate::files::tool());
+        let broker = Client::new().await?;
+        let events = Events::new(broker.clone()).await?;
+        let tools = definitions();
         Ok(Self {
-            workspace: Arc::new(Workspace::new().await?),
-            tracked: Arc::new(Mutex::new(HashMap::new())),
-            tools: Arc::new(serde_json::from_value(json!(definitions))?),
+            broker,
+            events,
+            tools: serde_json::from_value(json!(tools))?,
         })
     }
-    async fn dispatch(&self, name: &str, args: Value) -> Result<CallToolResult> {
-        let upstream = mcp::tools()
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v["name"] == name);
-        if upstream {
-            let mut result = mcp::call_tool(&json!({"name":name,"arguments":args})).await?;
-            let id = args["session_id"].as_str().unwrap_or("").to_owned();
-            let data = result["content"][0]["text"]
-                .as_str()
-                .and_then(|s| serde_json::from_str::<Value>(s).ok());
-            {
-                let mut tracked = self.tracked.lock().unwrap();
-                if ["execute", "start_command"].contains(&name) {
-                    if let Some(job) = data.as_ref().and_then(|v| v["job_id"].as_str()) {
-                        tracked.entry(id.clone()).or_default().insert(job.into());
-                    }
-                }
-                if ["poll_job", "stop_job"].contains(&name)
-                    && !data.as_ref().is_some_and(|v| v["status"] == "running")
-                {
-                    if let Some(job) = args["job_id"].as_str() {
-                        if let Some(jobs) = tracked.get_mut(&id) {
-                            jobs.remove(job);
-                        }
-                    }
-                }
-            }
-            let mut left = MAX_OUTPUT;
-            if let Some(content) = result["content"].as_array_mut() {
-                for block in content {
-                    if let Some(text) = block["text"].as_str() {
-                        let (text, _) = bounded(text, left, false);
-                        left -= text.len();
-                        block["text"] = json!(text);
-                    }
-                }
-            }
-            let mut result: CallToolResult = serde_json::from_value(result)?;
-            result.result_type = Some(ResultType::COMPLETE);
-            return Ok(result);
-        }
-        if name == "close_session" {
-            let tracked = self.tracked.lock().unwrap();
-            anyhow::ensure!(
-                !tracked
-                    .get(args["session_id"].as_str().unwrap_or(""))
-                    .is_some_and(|jobs| !jobs.is_empty()),
-                "upstream jobs remain; use poll_job/stop_job first"
-            );
-        }
-        let mut data = if name == "import_file" {
-            crate::files::import(&args).await?
-        } else {
-            self.workspace.call(name, &args).await?
-        };
-        if name == "connect_session" || name == "list_sessions" {
-            let tracked = self.tracked.lock().unwrap();
-            let annotate = |v: &mut Value| {
-                let id = v["session_id"].as_str().unwrap_or("");
-                let jobs: Vec<_> = tracked
-                    .get(id)
-                    .map(|s| s.iter().map(|j| json!({"job_id":j})).collect())
-                    .unwrap_or_default();
-                v["upstream_jobs"] = json!(jobs);
-            };
-            if name == "connect_session" {
-                annotate(&mut data);
-            } else {
-                for v in data["sessions"].as_array_mut().unwrap() {
-                    annotate(v);
-                }
-            }
-        }
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            serde_json::to_string(&data)?,
-        )]))
-    }
 }
-impl ServerHandler for Tools {
+fn definitions() -> Vec<Value> {
+    let id = json!({"type":"string","maxLength":128});
+    let text = json!({"type":"string","maxLength":65536});
+    let path = json!({"type":"string","maxLength":4096});
+    let mut tools = Vec::new();
+    let mut add = |name: &str,
+                   description: &str,
+                   properties: Value,
+                   required: &[&str],
+                   read_only: bool| {
+        tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read_only,"destructiveHint":!read_only,"openWorldHint":true}}));
+    };
+    add(
+        "open_session",
+        "Open a project directory. Reopening the same canonical directory returns the same session. No implicit shell, locks, or worktrees.",
+        json!({"cwd":path}),
+        &["cwd"],
+        false,
+    );
+    add(
+        "list_sessions",
+        "List project sessions and bounded execution records; reconnect by their explicit IDs.",
+        json!({}),
+        &[],
+        true,
+    );
+    add(
+        "close_session",
+        "Stop only this session's managed executions and remove its session metadata. Preserve project files.",
+        json!({"session_id":id}),
+        &["session_id"],
+        false,
+    );
+    add(
+        "start_execution",
+        "Start argv once. host uses FULL OS-user filesystem/network rights without approval; sandbox restricts writes to session roots and disables network, and requires io=pipes. PTY merges stdout/stderr. Subscribe to execution.events for batched push; read_execution is for reconnection/gaps. Returns the execution record. No automatic shell or implicit selected job.",
+        json!({"session_id":id,"command":{"type":"array","items":text,"minItems":1,"maxItems":256},"profile":{"type":"string","enum":["sandbox","host"]},"io":{"type":"string","enum":["pty","pipes"],"default":"pty"},"cwd":path}),
+        &["session_id", "command", "profile"],
+        false,
+    );
+    add(
+        "input_execution",
+        "Queue literal UTF-8 stdin. Include newline to submit a line. Acceptance is distinct from OS write; Events report written or delivery_unknown. Never automatically resend input after a lost response or broker crash.",
+        json!({"execution_id":id,"text":text}),
+        &["execution_id", "text"],
+        false,
+    );
+    add(
+        "resize_execution",
+        "Resize a running host PTY without restarting it. Returns the same execution record; Events report application.",
+        json!({"execution_id":id,"rows":{"type":"integer","minimum":1,"maximum":1000},"cols":{"type":"integer","minimum":1,"maximum":1000}}),
+        &["execution_id", "rows", "cols"],
+        false,
+    );
+    add(
+        "signal_execution",
+        "Send INT, TERM or KILL to this owned execution's process group. Bare/stale PIDs are rejected. Completion is delivered by Events; detached descendants require explicit project management.",
+        json!({"execution_id":id,"signal":{"type":"string","enum":["INT","TERM","KILL"]}}),
+        &["execution_id", "signal"],
+        false,
+    );
+    add(
+        "read_execution",
+        "Recover execution state and sequenced output after reconnect or an event gap. Pass the last cursor; deduplicate by sequence. History is bounded, catch_up_required marks loss, more means another bounded page remains. This is a recovery API; ordinary updates arrive through Events.",
+        json!({"execution_id":id,"cursor":id}),
+        &["execution_id"],
+        true,
+    );
+    add(
+        "read_file",
+        "Read up to 64 KiB UTF-8 text with a structured truncation flag. Host OS-user file access; relative path uses session cwd.",
+        json!({"session_id":id,"path":path}),
+        &["session_id", "path"],
+        true,
+    );
+    add(
+        "write_file",
+        "Write up to 64 KiB UTF-8 in the Codex sandbox, with network disabled. Destination parent must lie within session permitted roots. No self-declared approval or permission expansion.",
+        json!({"session_id":id,"path":path,"content":text}),
+        &["session_id", "path", "content"],
+        false,
+    );
+    add(
+        "list_directory",
+        "List bounded host directory entries. Host OS-user file access; relative path uses session cwd.",
+        json!({"session_id":id,"path":path}),
+        &["session_id", "path"],
+        true,
+    );
+    add(
+        "get_image",
+        "Read a PNG/JPEG/GIF/WebP up to 1 MiB as image content. Host OS-user file access.",
+        json!({"session_id":id,"path":path}),
+        &["session_id", "path"],
+        true,
+    );
+    tools.push(crate::files::tool());
+    tools
+}
+impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-            .with_instructions("Create or connect a session; its persistent terminal is managed automatically. Use session_id with run_command, read_output, send_stdin and stop_command. Omit command in run_command to reuse the interactive shell. The most recent run selects the default job; use job_id for concurrent commands. These terminal tools have full OS-user/filesystem/network rights without a sandbox or approval. execute/start_command keep their sandbox contract and process-local job handles. Use ordinary files for handover; close_session ends all terminals in that session.")
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(Implementation::new(env!("CARGO_PKG_NAME"),env!("CARGO_PKG_VERSION"))).with_instructions("Explicit project sessions and executions. Use execution.events subscriptions for batched output/state/exit; read_execution only for catch-up. Host execution has full OS-user rights; sandbox execution disables network. Input acceptance is not an application acknowledgement. No implicit shell, default execution, or legacy API.")
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tools.iter().find(|t| t.name == name).cloned()
+    }
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Owned(vec![ProtocolVersion::V_2026_07_28])
+    }
+    async fn initialize(
+        &self,
+        _: InitializeRequestParams,
+        _: RequestContext<RoleServer>,
+    ) -> std::result::Result<InitializeResult, McpError> {
+        Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            "use server/discover with per-request metadata",
+            None,
+        ))
     }
     async fn list_tools(
         &self,
@@ -207,7 +151,7 @@ impl ServerHandler for Tools {
         _: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
         let mut result = ListToolsResult::default();
-        result.tools = self.tools.as_ref().clone();
+        result.tools = self.tools.clone();
         Ok(result)
     }
     async fn call_tool(
@@ -215,97 +159,121 @@ impl ServerHandler for Tools {
         request: CallToolRequestParams,
         _: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, McpError> {
-        let result = self
-            .dispatch(&request.name, json!(request.arguments.unwrap_or_default()))
-            .await;
-        let result = match result {
-            Ok(r) => r,
-            Err(e) => CallToolResult::error(vec![ContentBlock::text(
-                bounded(&format!("{e:#}"), 1024, false).0,
+        if self.get_tool(&request.name).is_none() {
+            return Err(McpError::invalid_params("unknown tool", None));
+        }
+        let mut args = json!(request.arguments.unwrap_or_default());
+        args["op"] = json!(request.name);
+        let result = match self.broker.call(args).await {
+            Ok(data) if request.name == "get_image" => serde_json::from_value(data)
+                .map_err(|_| McpError::internal_error("invalid image response", None))?,
+            Ok(data) => {
+                let mut result = CallToolResult::success(vec![ContentBlock::text(
+                    serde_json::to_string(&data).unwrap(),
+                )]);
+                result.structured_content = Some(data);
+                result
+            }
+            Err(error) => CallToolResult::error(vec![ContentBlock::text(
+                workspace::bounded(&error.to_string(), 1024, false).0,
             )]),
         };
         Ok(result.into())
     }
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _: RequestContext<RoleServer>,
+    ) -> std::result::Result<CustomResult, McpError> {
+        let params = request.params.unwrap_or(json!({}));
+        let result = match request.method.as_str() {
+            "events/list" => Ok(Events::list()),
+            "events/subscribe" => self.events.subscribe(params).await,
+            "events/unsubscribe" => self.events.unsubscribe(params).await,
+            _ => {
+                return Err(McpError::new(
+                    ErrorCode::METHOD_NOT_FOUND,
+                    "unknown method",
+                    None,
+                ));
+            }
+        };
+        result.map(CustomResult).map_err(|error| {
+            let reason = error.to_string();
+            if [
+                "invalid_callback",
+                "private_callback",
+                "dns_failed",
+                "timeout_or_transport",
+                "challenge_failed",
+                "response_failed",
+                "response_too_large",
+            ]
+            .contains(&reason.as_str())
+            {
+                McpError::new(
+                    ErrorCode(-32015),
+                    "callback verification failed",
+                    Some(json!({"reason":reason})),
+                )
+            } else {
+                McpError::invalid_params(workspace::bounded(&reason, 1024, false).0, None)
+            }
+        })
+    }
 }
-
+struct EventService(Server);
+impl Service<RoleServer> for EventService {
+    async fn handle_request(
+        &self,
+        request: ClientRequest,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ServerResult, McpError> {
+        let discovery = matches!(request, ClientRequest::DiscoverRequest(_));
+        let result = Service::handle_request(&self.0, request, context).await?;
+        if discovery {
+            // The SDK validates the inline lifecycle, but its typed capabilities
+            // omit draft Events. Preserve validation and extend only wire discovery.
+            let mut value = serde_json::to_value(result)
+                .map_err(|_| McpError::internal_error("discovery serialization failed", None))?;
+            value["capabilities"]["events"] = json!({});
+            Ok(ServerResult::CustomResult(CustomResult(value)))
+        } else {
+            Ok(result)
+        }
+    }
+    async fn handle_notification(
+        &self,
+        notification: ClientNotification,
+        context: NotificationContext<RoleServer>,
+    ) -> std::result::Result<(), McpError> {
+        Service::handle_notification(&self.0, notification, context).await
+    }
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        ServerHandler::supported_protocol_versions(&self.0)
+    }
+    fn get_info(&self) -> ServerConfig {
+        ServerHandler::get_info(&self.0)
+    }
+}
 pub async fn stdio() -> Result<()> {
-    Tools::new()
-        .await?
+    workspace::clean_environment()?;
+    let state = workspace::state_dir()?;
+    std::fs::create_dir_all(&state)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.join("frontend.lock"))?;
+    use std::os::fd::AsRawFd;
+    anyhow::ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "another stdio frontend owns this state"
+    );
+    EventService(Server::new().await?)
         .serve(rmcp::transport::stdio())
         .await?
         .waiting()
-        .await?;
-    Ok(())
-}
-pub async fn http(path: PathBuf) -> Result<()> {
-    crate::workspace::clean_environment()?;
-    let settings: Settings = serde_json::from_slice(&tokio::fs::read(path).await?)?;
-    let auth = Auth::load(settings).await?;
-    let tools = Tools::new().await?;
-    let resource = url::Url::parse(&auth.settings.resource)?;
-    let mut hosts = vec![
-        resource.host_str().unwrap().into(),
-        auth.settings.listen.to_string(),
-    ];
-    if let Some(port) = resource.port() {
-        hosts.push(format!("{}:{port}", resource.host_str().unwrap()));
-    }
-    let mut origins = auth.settings.allowed_origins.clone();
-    // Explicit port avoids rmcp's deprecated portless matching behavior.
-    origins.push(format!(
-        "{}://{}:{}",
-        resource.scheme(),
-        resource.host().unwrap(),
-        resource.port_or_known_default().unwrap()
-    ));
-    let mut config = StreamableHttpServerConfig::default();
-    config.legacy_session_mode = true;
-    config.json_response = true;
-    config.max_request_body_bytes = 1024 * 1024;
-    let config = config
-        .with_allowed_hosts(hosts)
-        .with_allowed_origins(origins)
-        .enforce_origin_validation();
-    let cancellation = config.cancellation_token.clone();
-    let service = StreamableHttpService::new(
-        move || Ok(tools.clone()),
-        Arc::new(LocalSessionManager::default()),
-        config,
-    );
-    let protected = Router::new()
-        .route_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(auth.clone(), authenticate));
-    let metadata = auth.metadata.clone();
-    let root = metadata.clone();
-    let app = Router::new()
-        .route(
-            "/.well-known/oauth-protected-resource/mcp",
-            get(move || {
-                let doc = metadata.clone();
-                async move { axum::Json(doc) }
-            }),
-        )
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(move || {
-                let doc = root.clone();
-                async move { axum::Json(doc) }
-            }),
-        )
-        .merge(protected);
-    let listener = tokio::net::TcpListener::bind(auth.settings.listen).await?;
-    eprintln!(
-        "dev-session-mcp listening on loopback {} (OAuth required)",
-        auth.settings.listen
-    );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("signal handler");
-            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
-            cancellation.cancel();
-        })
         .await?;
     Ok(())
 }
