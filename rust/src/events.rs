@@ -254,7 +254,10 @@ impl Events {
     pub fn list() -> Value {
         json!({"events":[{"name":NAME,"description":"Batched terminal/pipe output, input receipts, execution state and exit. Data only; recover sequence gaps with read_execution.","delivery":["webhook"],"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"execution_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false},"payloadSchema":{"type":"object","properties":{"events":{"type":"array","items":{"type":"object"}},"catch_up_required":{"type":"boolean"},"earliest_cursor":{"type":"string"}},"required":["events","catch_up_required","earliest_cursor"],"additionalProperties":false}}]})
     }
-    async fn identity(&self, params: &Value) -> Result<(String, String, String, Option<String>)> {
+    async fn identity(
+        &self,
+        params: &Value,
+    ) -> Result<(String, String, String, Option<String>, bool)> {
         ensure!(params["name"] == NAME, "unknown event");
         ensure!(
             params["delivery"]["mode"] == "webhook",
@@ -270,9 +273,11 @@ impl Events {
             "unknown event filter"
         );
         let session = workspace::text(&params["arguments"], "session_id")?.to_owned();
-        self.broker
-            .call(json!({"op":"inspect_session","session_id":session}))
+        let session_info = self
+            .broker
+            .call(json!({"op":"inspect_event_session","session_id":session}))
             .await?;
+        let closed = session_info["state"] == "closed";
         let execution = params["arguments"]
             .get("execution_id")
             .map(|v| v.as_str().context("invalid execution_id"))
@@ -298,11 +303,21 @@ impl Events {
             execution
         ]))?;
         let id = format!("sub_{:x}", Sha256::digest(identity));
-        Ok((id, url, session, execution))
+        if closed {
+            ensure!(
+                self.subscriptions
+                    .lock()
+                    .await
+                    .get(&id)
+                    .is_some_and(|s| s.owner == unsafe { libc::geteuid() } && s.expires > now()),
+                "closed session only retains its existing unexpired subscription"
+            );
+        }
+        Ok((id, url, session, execution, closed))
     }
     pub async fn subscribe(&self, params: Value) -> Result<Value> {
         let _guard = self.control.lock().await;
-        let (id, url, session_id, execution_id) = self.identity(&params).await?;
+        let (id, url, session_id, execution_id, closed) = self.identity(&params).await?;
         let secret = workspace::text(&params["delivery"], "secret")?.to_owned();
         key(&secret)?;
         let ttl = match params.get("ttlMs") {
@@ -334,7 +349,11 @@ impl Events {
             secret,
             session_id,
             execution_id,
-            expires: now() + ttl,
+            expires: if closed {
+                existing.as_ref().unwrap().expires.min(now() + ttl)
+            } else {
+                now() + ttl
+            },
             cursor: existing.as_ref().and_then(|s| s.cursor.clone()),
             old_secret: prior.or_else(|| existing.as_ref().and_then(|s| s.old_secret.clone())),
             pending: existing.as_ref().and_then(|s| s.pending.clone()),
@@ -374,6 +393,10 @@ impl Events {
             }
             cache.insert(cache_key, now() + 300);
         }
+        ensure!(
+            subscription.expires > now(),
+            "subscription expired during verification"
+        );
         if let Some(worker) = self.workers.lock().unwrap().remove(&id) {
             worker.abort();
         }
@@ -479,7 +502,7 @@ impl Events {
                 return Ok(());
             }
             self.broker
-                .call(json!({"op":"inspect_session","session_id":subscription.session_id}))
+                .call(json!({"op":"inspect_event_session","session_id":subscription.session_id}))
                 .await?;
             if subscription.pending.is_none() {
                 let request = json!({"op":"wait_events","session_id":subscription.session_id,"execution_id":subscription.execution_id,"cursor":subscription.cursor});
@@ -819,14 +842,40 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let mut renewed = subscription.clone();
-        renewed["ttlMs"] = json!(1000);
+        renewed["ttlMs"] = json!(3000);
         ensure!(restored.subscribe(renewed).await?["id"] == id);
         // Verification cache is deliberately in-memory; a frontend restart verifies again.
         let (_, fresh) = tokio::time::timeout(Duration::from_secs(5), requests.recv())
             .await?
             .unwrap();
         ensure!(serde_json::from_slice::<Value>(&fresh)?["type"] == "verification");
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let child=broker.call(json!({"op":"start_execution","session_id":session,"profile":"host","io":"pipes","command":["/bin/sleep","30"]})).await?;
+        let closed = broker
+            .call(json!({"op":"close_session","session_id":session}))
+            .await?;
+        ensure!(closed["closed"] == true && closed["pending"] == false);
+        let (_, terminal) = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await?
+            .unwrap();
+        let terminal: Value = serde_json::from_slice(&terminal)?;
+        let kinds: Vec<_> = terminal["data"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        ensure!(
+            kinds.contains(&"closing") && kinds.contains(&"exit") && kinds.contains(&"closed"),
+            "terminal Events must remain deliverable after metadata removal"
+        );
+        ensure!(broker.call(json!({"op":"read_execution","execution_id":child["execution_id"],"cursor":child["cursor"]})).await?["execution"]["status"]=="exited");
+        let expiry = restored.subscriptions.lock().await[&id].expires;
+        ensure!(restored.subscribe(subscription.clone()).await?["id"] == id);
+        ensure!(
+            restored.subscriptions.lock().await[&id].expires == expiry,
+            "closed leases cannot be extended indefinitely"
+        );
+        tokio::time::sleep(Duration::from_millis(3200)).await;
         ensure!(
             !restored.subscriptions.lock().await.contains_key(&id),
             "expired lease must stop its waiting worker"

@@ -1,0 +1,1 @@
+{"result": "PASS", "cases": ["stdio Events discovery", "sandbox file edit", "pipe text+EOF", "pipe EOF-only", "PTY pipe-close rejection", "stdin/resize/frontend reconnect", "signal bypasses blocked stdin", "confirmed close/ordered terminal history", "idempotent close"], "temporary_state": "/tmp/dev-session-mcp-io-06kwozcf/state"}

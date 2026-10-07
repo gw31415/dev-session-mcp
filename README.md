@@ -23,7 +23,7 @@ Linux を複数プロジェクトの開発環境として使う独立した Rust
 
 `server/discover` は `capabilities.events` を宣言し、`events/list` に `execution.events` を返します。`events/subscribe` / `events/unsubscribe` は公式 webhook 形式です。session_id、任意の execution_id で絞り、出力・開始・終了・入力受領を最大 100 ms 待ってまとめて配信します。[配信仕様と限界](docs/EVENTS.md)。
 
-イベントは sequence と cursor を持ちます。重複・順序逆転を受け入れ、sequence で重複を除きます。Webhook の 2xx は受領確認であり、アプリ処理完了を証明しません。`input_execution` の返答は **accepted**、OS 書込みは後続の **written / delivery_unknown**。write が途中で失敗した可能性や返答喪失がある場合、入力を自動再送しません。無出力だけで入力待ちと断定しません。
+イベントは sequence と cursor を持ちます。重複・順序逆転を受け入れ、sequence で重複を除きます。Webhook の 2xx は受領確認であり、アプリ処理完了を証明しません。`input_execution` の返答は **accepted**、OS 書込みは後続の **written / delivery_unknown**。`close_stdin:true` は pipes の送信済み text の後で write descriptor を閉じて EOF を送ります。PTY の Ctrl-D は text の `\u0004` で渡す別操作です。write が途中で失敗した可能性や返答喪失がある場合、入力を自動再送しません。無出力だけで入力待ちと断定しません。
 
 journal は全実行で直近 **1 MiB / 1,024 events**、回収 page は **32 KiB**、実行記録と session は各 **64 件**です。満杯なら完了記録を古い順に捨て、live 実行は勝手に停止しません。`catch_up_required` が履歴欠落を示し、`more` なら次の page を回収します。Events は最大 8 subscriptions、outbox は各 1 batch、完全 body は最大 64 KiB。遅い callback が子プロセスの出力 reader を止めません。完全なログは project のファイルへ保存してください。
 
@@ -31,11 +31,11 @@ PTY は stdout/stderr を terminal stream に合流し、ANSI を保持します
 
 ## 権限と秘密
 
-**host の command/stdin は、その OS ユーザーの全ファイル・ネットワーク権限を承認なしで使います。** sandbox は session roots への書込みだけを許可し、ネットワークを無効にします。sandbox は pipes のみ。`approved=true` などで拡張できません。read_file/get_image/list_directory は OS ユーザーのファイルアクセスです。
+**host の command/stdin は、旧 run_command と同じ本人 OS ユーザーの全ファイル・ネットワーク権限を承認なしで使います。** sandbox は session roots への書込みだけを許可し、ネットワークを無効にします。sandbox は pipes のみ。`approved=true` などで拡張できません。read_file/get_image/list_directory は OS ユーザーのファイルアクセスです。
 
 同じ Ubuntu ユーザーを使う本人専用の trusted endpoint です。Tunnel runtime key と Events signing secrets を作業 command の環境へ継承せず、state directory は 0700、socket・秘密 store は 0600、Unix peer UID を検査します。ただし **同一 UID の host command は、読める credential file や Events store、同一 UID process の情報を読めます**。これは新 UID による秘密隔離を保証する設計ではありません。他人や信頼できない agent に公開しないでください。
 
-Tunnel / frontend の再起動を越えて broker と実行・journal を保持します。broker 自体の終了やホスト再起動では実行と journal を失います。Events subscription と未確認 batch は disk に保存し、frontend 再起動で再開します。broker lifetime が変わったら cursor gap を返します。daemon 化して別 process group に離脱した子孫は project 側で管理します。close_session は管理対象を終了し、project ファイルを残します。
+Tunnel / frontend の再起動を越えて broker と実行・journal を保持します。broker 自体の終了やホスト再起動では実行と journal を失います。Events subscription と未確認 batch は disk に保存し、frontend 再起動で再開します。broker lifetime が変わったら cursor gap を返します。daemon 化して別 process group に離脱した子孫は project 側で管理します。close_session は closing にして独立 signal 経路で終了を要求し、全管理 process の終了確認後に closed を返して metadata を削除します。5秒で確認できなければ closed:false/pending:true と metadata を残し、終了後に同じ close を再試行します。closing 中の新実行・編集は拒否します。終端の closing/exit/closed は既存 journal と実行記録、既存 Events lease で回収・配信できます。closed lease の期限は延長せず、追加の永続 tombstone は作りません。project ファイルは残します。
 
 ## Build と確認
 

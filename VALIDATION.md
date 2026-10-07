@@ -15,3 +15,11 @@ The initial nested sandbox attempts failed because the outer managed execution s
 The compiled runtime allows private loopback HTTP callbacks **only under cfg(test)** for actual local delivery fixtures; no production env/config flag enables them. These tests do not prove OpenAI callback authorization, real ChatGPT/dot Events/catalog integration, actual Tunnel authentication, ARM64 build, release build or systemd placement. Those remain coordinated runtime checks.
 
 Historical evidence files and PUBLICATION-AUDIT describe earlier revisions and are not current API or runtime proof. Current source uses a single broker and journal, explicit profile/ID APIs, stdio MCP 2026 lifecycle, webhook Events and cursor recovery. The production runtime currently exposes its prior catalog until an explicit safe cutover/rescan.
+
+## Review follow-up: pipe EOF and confirmed close
+
+The follow-up was verified with a locked offline build, the focused real broker/Events test (**1 passed, 0 failed, 3 filtered**, 3.59 seconds) and `python3 tests/io_control.py <built-binary>`. [Focused stdio evidence](evidence/io-control-20261007.log). The earlier full-suite evidence above remains its recorded revision; unchanged cases were not rebuilt into a new test framework.
+
+The small real-process checks cover sha256sum receiving text then explicit pipe EOF, cat receiving EOF only, PTY rejecting descriptor close, stdin/resize/frontend reconnect, signals interrupting a deliberately blocked pipe write, and close confirming child reaping before reporting closed. Closing/exit/closed remain ordered and recoverable after metadata removal. The real webhook test confirms those terminal events are delivered after close, and that refreshing an existing closed subscription cannot extend its original expiry. No permanent tombstone or separate job registry is introduced. Pending close keeps metadata and truthfully requests retry; start/edit are blocked while closing.
+
+ARM64 native build/isolated smoke is being prepared on the existing authorized VPS in a separate source/target path. This paragraph is not a successful ARM64/deployment claim; completed runtime evidence will be reported separately. The live Tunnel/wrapper and old sessions remain untouched until coordinated cutover.

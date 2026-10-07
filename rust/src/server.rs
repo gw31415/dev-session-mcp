@@ -53,7 +53,7 @@ fn definitions() -> Vec<Value> {
     );
     add(
         "close_session",
-        "Stop only this session's managed executions and remove its session metadata. Preserve project files.",
+        "Mark closing, signal managed executions independently of stdin, and confirm their exit before metadata removal. If pending=true, retry close after exit. Bounded terminal history and existing Events leases remain readable; project files are preserved.",
         json!({"session_id":id}),
         &["session_id"],
         false,
@@ -67,9 +67,9 @@ fn definitions() -> Vec<Value> {
     );
     add(
         "input_execution",
-        "Queue literal UTF-8 stdin. Include newline to submit a line. Acceptance is distinct from OS write; Events report written or delivery_unknown. Never automatically resend input after a lost response or broker crash.",
-        json!({"execution_id":id,"text":text}),
-        &["execution_id", "text"],
+        "Queue literal UTF-8 stdin. close_stdin=true closes only a pipe after the queued text, producing EOF; PTY Ctrl-D is literal text, not pipe close. Acceptance differs from OS write; Events report written/delivery_unknown and stdin_closed. Never automatically resend uncertain input.",
+        json!({"execution_id":id,"text":text,"close_stdin":{"type":"boolean","default":false}}),
+        &["execution_id"],
         false,
     );
     add(

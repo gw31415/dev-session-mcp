@@ -32,11 +32,11 @@ type Shared = Arc<Mutex<Ledger>>;
 struct Execution {
     record: Value,
     actions: mpsc::Sender<Action>,
+    signals: mpsc::Sender<i32>,
 }
 enum Action {
-    Input(Vec<u8>, u64),
+    Input(Vec<u8>, u64, bool),
     Resize(u16, u16),
-    Signal(i32),
 }
 struct Ledger {
     epoch: String,
@@ -274,13 +274,27 @@ async fn pump<R: AsyncRead + Unpin>(
 }
 enum Input {
     Pty(pty_process::OwnedWritePty),
-    Pipe(tokio::process::ChildStdin),
+    Pipe(Option<tokio::process::ChildStdin>),
 }
 impl Input {
     async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         match self {
             Self::Pty(w) => w.write_all(data).await,
-            Self::Pipe(w) => w.write_all(data).await,
+            Self::Pipe(w) => match w {
+                Some(w) => w.write_all(data).await,
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stdin is closed",
+                )),
+            },
+        }
+    }
+    fn close(&mut self) {
+        if let Self::Pipe(w) = self {
+            w.take();
         }
     }
     fn resize(&self, rows: u16, cols: u16) -> Result<()> {
@@ -295,6 +309,10 @@ impl Input {
 }
 async fn start(args: &Value, ledger: Shared) -> Result<Value> {
     let session = config::load_session(text(args, "session_id")?).await?;
+    ensure!(
+        session.state == config::SessionState::Open,
+        "session is closing"
+    );
     let command: Vec<String> = serde_json::from_value(args["command"].clone())?;
     ensure!(
         !command.is_empty()
@@ -380,7 +398,7 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = process.spawn()?;
-        let input = Input::Pipe(child.stdin.take().unwrap());
+        let input = Input::Pipe(child.stdin.take());
         let readers = vec![
             (
                 Box::new(child.stdout.take().unwrap()) as Box<dyn AsyncRead + Unpin + Send>,
@@ -403,17 +421,19 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
         .context("missing start ticks")?
         .to_owned();
     let (tx, mut rx) = mpsc::channel(8);
+    let (signals, mut signal_rx) = mpsc::channel(8);
     let id;
     let initial;
     {
         let mut state = ledger.lock().unwrap();
         id = format!("{}:{pid}:{ticks}", state.epoch);
-        let record = json!({"execution_id":id,"session_id":session.id,"pid":pid,"profile":profile,"io":io,"status":"running","exit_code":null,"started_sequence":state.sequence+1});
+        let record = json!({"execution_id":id,"session_id":session.id,"pid":pid,"profile":profile,"io":io,"status":"running","exit_code":null,"started_sequence":state.sequence+1,"session_state":"open","stdin_closed":false});
         state.executions.insert(
             id.clone(),
             Execution {
                 record,
                 actions: tx,
+                signals,
             },
         );
         state.append(&id, "started", json!({"profile":profile,"io":io,"pid":pid}));
@@ -435,32 +455,36 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
     tokio::spawn(async move {
         let status = loop {
             tokio::select! {
+                biased;
                 result=child.wait()=>break result,
+                Some(signal)=signal_rx.recv()=>apply_signal(&held,&owned_id,pid,signal),
                 action=rx.recv()=>match action {
-                    Some(Action::Input(bytes,receipt))=> {
-                        let written=tokio::time::timeout(Duration::from_secs(2),input.write(&bytes)).await.is_ok_and(|r|r.is_ok());
+                    Some(Action::Input(bytes,receipt,close))=> {
+                        // Interrupting a blocked write may leave partial input. Never
+                        // retry it; report uncertainty while handling signals promptly.
+                        let written=tokio::select! {
+                            biased;
+                            Some(signal)=signal_rx.recv()=> {apply_signal(&held,&owned_id,pid,signal);false},
+                            result=tokio::time::timeout(Duration::from_secs(2),input.write(&bytes))=>result.is_ok_and(|r|r.is_ok()),
+                        };
+                        if close {input.close();}
                         let delivery=if written{"written"}else{"delivery_unknown"};
                         let mut state=held.lock().unwrap();
                         let record=&mut state.executions.get_mut(&owned_id).unwrap().record;
-                        if record["input"]["sequence"]==receipt {record["input"]["delivery"]=json!(delivery);}
-                        state.append(&owned_id,"input",json!({"input_sequence":receipt,"delivery":delivery}));
+                        if close {record["stdin_closed"]=json!(true);}
+                        if record["input"]["sequence"]==receipt {record["input"]["delivery"]=json!(delivery);record["input"]["stdin_closed"]=json!(close);}
+                        state.append(&owned_id,"input",json!({"input_sequence":receipt,"delivery":delivery,"stdin_closed":close}));
                     }
                     Some(Action::Resize(rows,cols))=> {
                         let ok=input.resize(rows,cols).is_ok();
                         held.lock().unwrap().append(&owned_id,"resize",json!({"rows":rows,"cols":cols,"applied":ok}));
                     }
-                    Some(Action::Signal(signal))=> {
-                        // The child handle is not reaped outside this actor. Its PID cannot
-                        // be reused while this branch signals the owned process group.
-                        let ok=unsafe{libc::kill(-(pid as i32),signal)}==0;
-                        held.lock().unwrap().append(&owned_id,"signal",json!({"signal":signal,"sent":ok}));
-                    }
-                    None=> { let _=child.start_kill(); break child.wait().await; }
+                    None=> {apply_signal(&held,&owned_id,pid,libc::SIGKILL);break child.wait().await;}
                 }
             }
         };
         while let Ok(action) = rx.try_recv() {
-            if let Action::Input(_, receipt) = action {
+            if let Action::Input(_, receipt, _) = action {
                 let mut state = held.lock().unwrap();
                 let record = &mut state.executions.get_mut(&owned_id).unwrap().record;
                 if record["input"]["sequence"] == receipt {
@@ -486,11 +510,36 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
         let mut state = held.lock().unwrap();
         if let Some(execution) = state.executions.get_mut(&owned_id) {
             execution.record["status"] = json!("exited");
+            execution.record["stdin_closed"] = json!(true);
             execution.record["exit_code"] = json!(code);
         }
         state.append(&owned_id, "exit", json!({"exit_code":code}));
     });
     Ok(initial)
+}
+fn apply_signal(ledger: &Shared, id: &str, pid: u32, signal: i32) {
+    // Only this actor reaps the child, so its PID cannot be reused while we
+    // signal its process group, including while interrupting a stdin write.
+    let sent = unsafe { libc::kill(-(pid as i32), signal) } == 0;
+    ledger
+        .lock()
+        .unwrap()
+        .append(id, "signal", json!({"signal":signal,"sent":sent}));
+}
+async fn inspect_event_session(id: &str, ledger: &Shared) -> Result<Value> {
+    config::validate_session_id(id)?;
+    if let Ok(session) = config::load_session(id).await {
+        return Ok(json!(session));
+    }
+    let state = ledger.lock().unwrap();
+    ensure!(
+        state
+            .executions
+            .values()
+            .any(|e| e.record["session_id"] == id && e.record["session_state"] == "closed"),
+        "session history unavailable"
+    );
+    Ok(json!({"id":id,"state":"closed"}))
 }
 async fn handle(
     args: Value,
@@ -537,24 +586,82 @@ async fn handle(
         "inspect_session" => Ok(json!(
             config::load_session(text(&args, "session_id")?).await?
         )),
+        "inspect_event_session" => inspect_event_session(text(&args, "session_id")?, &ledger).await,
         "close_session" => {
             let _guard = starts.lock().await;
             let id = text(&args, "session_id")?;
-            config::load_session(id).await?;
-            let actions: Vec<_> = ledger
-                .lock()
-                .unwrap()
-                .executions
-                .values()
-                .filter(|e| e.record["session_id"] == id && e.record["status"] == "running")
-                .map(|e| e.actions.clone())
-                .collect();
-            for action in actions {
-                action.send(Action::Signal(libc::SIGKILL)).await?;
+            let path = config::session_path(id)?;
+            if !path.exists() {
+                return Ok(json!({"session_id":id,"closed":true,"pending":false}));
             }
-            tokio::fs::remove_file(config::session_path(id)?).await?;
+            let mut session = config::load_session(id).await?;
+            session.state = config::SessionState::Closing;
+            config::save_session(&session).await?;
+            let signals = {
+                let mut state = ledger.lock().unwrap();
+                let ids: Vec<_> = state
+                    .executions
+                    .iter()
+                    .filter(|(_, e)| {
+                        e.record["session_id"] == id && e.record["session_state"] != "closed"
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for execution in ids {
+                    if state.executions[&execution].record["session_state"] != "closing" {
+                        state.executions.get_mut(&execution).unwrap().record["session_state"] =
+                            json!("closing");
+                        state.append(&execution, "closing", json!({"session_state":"closing"}));
+                    }
+                }
+                state
+                    .executions
+                    .values()
+                    .filter(|e| e.record["session_id"] == id && e.record["status"] == "running")
+                    .map(|e| e.signals.clone())
+                    .collect::<Vec<_>>()
+            };
+            for signal in signals {
+                let _ = signal.try_send(libc::SIGKILL);
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let notify = ledger.lock().unwrap().changed.clone();
+                let changed = notify.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let running = ledger
+                    .lock()
+                    .unwrap()
+                    .executions
+                    .values()
+                    .any(|e| e.record["session_id"] == id && e.record["status"] == "running");
+                if !running {
+                    break;
+                }
+                if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                    return Ok(json!({"session_id":id,"closed":false,"pending":true}));
+                }
+            }
+            {
+                let mut state = ledger.lock().unwrap();
+                let ids: Vec<_> = state
+                    .executions
+                    .iter()
+                    .filter(|(_, e)| {
+                        e.record["session_id"] == id && e.record["session_state"] != "closed"
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for execution in ids {
+                    state.executions.get_mut(&execution).unwrap().record["session_state"] =
+                        json!("closed");
+                    state.append(&execution, "closed", json!({"session_state":"closed"}));
+                }
+            }
+            tokio::fs::remove_file(path).await?;
             ledger.lock().unwrap().changed.notify_waiters();
-            Ok(json!({"session_id":id,"closed":true}))
+            Ok(json!({"session_id":id,"closed":true,"pending":false}))
         }
         "start_execution" => {
             let _guard = starts.lock().await;
@@ -570,7 +677,7 @@ async fn handle(
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            config::load_session(text(&args, "session_id")?).await?;
+            inspect_event_session(text(&args, "session_id")?, &ledger).await?;
             let data = ledger.lock().unwrap().read(&args)?;
             if data["catch_up_required"] == true
                 || data["events"].as_array().is_some_and(|s| !s.is_empty())
@@ -579,7 +686,30 @@ async fn handle(
             }
             notified.await;
         },
-        "input_execution" | "resize_execution" | "signal_execution" => {
+        "signal_execution" => {
+            let id = text(&args, "execution_id")?;
+            let state = ledger.lock().unwrap();
+            let execution = state
+                .executions
+                .get(id)
+                .context("execution unavailable; bare/stale PIDs are rejected")?;
+            ensure!(
+                execution.record["status"] == "running",
+                "execution is not running"
+            );
+            let signal = match text(&args, "signal")? {
+                "INT" => libc::SIGINT,
+                "TERM" => libc::SIGTERM,
+                "KILL" => libc::SIGKILL,
+                _ => anyhow::bail!("signal must be INT, TERM or KILL"),
+            };
+            execution
+                .signals
+                .try_send(signal)
+                .context("signal queue full or closed; signal not accepted")?;
+            Ok(execution.record.clone())
+        }
+        "input_execution" | "resize_execution" => {
             let id = text(&args, "execution_id")?;
             let mut state = ledger.lock().unwrap();
             let execution = state
@@ -594,34 +724,50 @@ async fn handle(
             let permit = sender
                 .try_reserve()
                 .context("execution input queue full or closed; action not accepted")?;
-            let action = match text(&args, "op")? {
-                "input_execution" => {
-                    let bytes = text(&args, "text")?.as_bytes().to_vec();
-                    let seq = state.append(
-                        id,
-                        "input",
-                        json!({"delivery":"accepted","bytes":bytes.len()}),
-                    );
-                    state.executions.get_mut(id).unwrap().record["input"] =
-                        json!({"sequence":seq,"delivery":"accepted"});
-                    Action::Input(bytes, seq)
+            let action = if args["op"] == "input_execution" {
+                ensure!(
+                    execution.record["session_state"] != "closing",
+                    "session is closing"
+                );
+                let close = args
+                    .get("close_stdin")
+                    .map(|v| v.as_bool().context("close_stdin must be boolean"))
+                    .transpose()?
+                    .unwrap_or(false);
+                ensure!(
+                    !close || execution.record["io"] == "pipes",
+                    "close_stdin closes a pipe; use literal Ctrl-D for a PTY"
+                );
+                ensure!(
+                    args.get("text").is_some() || close,
+                    "text or close_stdin is required"
+                );
+                let bytes = if args.get("text").is_some() {
+                    text(&args, "text")?.as_bytes().to_vec()
+                } else {
+                    Vec::new()
+                };
+                if execution.record["stdin_closed"] == true {
+                    ensure!(bytes.is_empty() && close, "stdin is closed");
+                    return Ok(execution.record.clone());
                 }
-                "resize_execution" => {
-                    ensure!(execution.record["io"] == "pty", "resize requires a PTY");
-                    let rows = args["rows"].as_u64().context("missing rows")?;
-                    let cols = args["cols"].as_u64().context("missing cols")?;
-                    ensure!(
-                        (1..=1000).contains(&rows) && (1..=1000).contains(&cols),
-                        "invalid dimensions"
-                    );
-                    Action::Resize(rows as u16, cols as u16)
-                }
-                _ => Action::Signal(match text(&args, "signal")? {
-                    "INT" => libc::SIGINT,
-                    "TERM" => libc::SIGTERM,
-                    "KILL" => libc::SIGKILL,
-                    _ => anyhow::bail!("signal must be INT, TERM or KILL"),
-                }),
+                let seq = state.append(
+                    id,
+                    "input",
+                    json!({"delivery":"accepted","bytes":bytes.len(),"close_stdin":close}),
+                );
+                state.executions.get_mut(id).unwrap().record["input"] =
+                    json!({"sequence":seq,"delivery":"accepted","close_stdin":close});
+                Action::Input(bytes, seq, close)
+            } else {
+                ensure!(execution.record["io"] == "pty", "resize requires a PTY");
+                let rows = args["rows"].as_u64().context("missing rows")?;
+                let cols = args["cols"].as_u64().context("missing cols")?;
+                ensure!(
+                    (1..=1000).contains(&rows) && (1..=1000).contains(&cols),
+                    "invalid dimensions"
+                );
+                Action::Resize(rows as u16, cols as u16)
             };
             permit.send(action);
             Ok(state.executions[id].record.clone())
@@ -710,10 +856,10 @@ pub async fn run() -> Result<()> {
         .executions
         .values()
         .filter(|e| e.record["status"] == "running")
-        .map(|e| e.actions.clone())
+        .map(|e| e.signals.clone())
         .collect();
     for action in actions {
-        let _ = action.send(Action::Signal(libc::SIGKILL)).await;
+        let _ = action.try_send(libc::SIGKILL);
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {

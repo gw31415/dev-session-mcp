@@ -80,6 +80,10 @@ pub async fn call(name: &str, args: &Value) -> Result<Value> {
             Ok(json!({"content":[{"type":"image","data":STANDARD.encode(bytes),"mimeType":mime}]}))
         }
         "write_file" => {
+            ensure!(
+                session.state == config::SessionState::Open,
+                "session is closing"
+            );
             let content = text(args, "content")?;
             let parent = std::fs::canonicalize(target.parent().context("missing parent")?)?;
             let destination = parent.join(target.file_name().context("missing file name")?);

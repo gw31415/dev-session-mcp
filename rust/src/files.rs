@@ -95,6 +95,10 @@ impl Drop for Partial {
 
 pub async fn import(args: &Value) -> Result<Value> {
     let session = config::load_session(text(args, "session_id")?).await?;
+    ensure!(
+        session.state == config::SessionState::Open,
+        "session is closing"
+    );
     let origins = std::env::var("DEV_SESSION_MCP_FILE_ORIGINS").unwrap_or_default();
     let url = authorized_url(text(&args["file"], "download_url")?, &origins)?;
     ensure!(

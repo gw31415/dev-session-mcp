@@ -8,10 +8,20 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    #[default]
+    Open,
+    Closing,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub cwd: PathBuf,
+    #[serde(default)]
+    pub state: SessionState,
     #[serde(default)]
     pub permitted_directories: Vec<PathBuf>,
 }
@@ -48,6 +58,7 @@ pub async fn create_session(cwd: &Path, id: Option<&str>) -> Result<Session> {
     let session = Session {
         id,
         cwd: cwd.clone(),
+        state: SessionState::Open,
         permitted_directories: vec![cwd],
     };
     save_session(&session).await?;
