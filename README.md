@@ -65,4 +65,6 @@ pty-process 0.5.3 + 薄い独立brokerを実装しています。[選定理由�
 
 上流全体のsnapshotを同梱・build時に書換える構造は使いません。公開ライブラリAPIがないため必要部分を出典付きの派生モジュールとして保守し、通常のCargo依存とCargo.lockを使います。[更新方針](docs/UPSTREAM.md#dependency-and-update-policy) を参照してください。上流LICENSEのMIT本文と著作権表示を保持し、元のCargo欄のApache-2.0表記との不一致は [NOTICE](NOTICE.md) に記録しています。追加コードはMIT、推移的依存は各ライセンスに従います。
 
+[公開前監査の範囲と結果](docs/PUBLICATION-AUDIT.md) を保存しています。履歴・refs・release/issueの確認結果と、確認できなかった範囲を明記しています。
+
 出典: [公式Rust SDK](https://github.com/modelcontextprotocol/rust-sdk)、[Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)、[tunnel-client](https://github.com/openai/tunnel-client)、[client設定仕様](https://github.com/openai/tunnel-client/blob/master/docs/configuration.md)。
