@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -20,6 +20,7 @@ const NAME: &str = "execution.events";
 const MAX_SUBSCRIPTIONS: usize = 8;
 const MAX_BODY: usize = 64 * 1024;
 const MAX_LEASE: u64 = 24 * 60 * 60;
+const DELIVERY_HISTORY: usize = 16;
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -35,6 +36,12 @@ fn iso(seconds: u64) -> String {
 pub fn timestamp() -> String {
     iso(now())
 }
+fn millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Subscription {
@@ -49,6 +56,21 @@ struct Subscription {
     old_secret: Option<(String, u64)>,
     pending: Option<Pending>,
     suspended: bool,
+    #[serde(default)]
+    delivery_history: VecDeque<DeliveryAttempt>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct DeliveryAttempt {
+    event_id: String,
+    cursor: String,
+    queued_at_ms: Option<u64>,
+    first_event_at: Option<String>,
+    last_event_at: Option<String>,
+    attempt: u8,
+    started_at_ms: u64,
+    finished_at_ms: u64,
+    elapsed_ms: u64,
+    status: Option<u16>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Pending {
@@ -56,6 +78,8 @@ struct Pending {
     body: String,
     cursor: String,
     attempts: u8,
+    #[serde(default)]
+    queued_at_ms: Option<u64>,
 }
 #[derive(Clone, Default)]
 struct Sender {
@@ -68,6 +92,23 @@ impl Sender {
         subscription: &Subscription,
         event_id: &str,
         body: &str,
+    ) -> Result<(u16, Vec<u8>)> {
+        self.request(subscription, event_id, body, false).await
+    }
+    async fn verify(
+        &self,
+        subscription: &Subscription,
+        event_id: &str,
+        body: &str,
+    ) -> Result<(u16, Vec<u8>)> {
+        self.request(subscription, event_id, body, true).await
+    }
+    async fn request(
+        &self,
+        subscription: &Subscription,
+        event_id: &str,
+        body: &str,
+        read_response_body: bool,
     ) -> Result<(u16, Vec<u8>)> {
         ensure!(body.len() <= MAX_BODY, "event exceeds payload bound");
         let url = Url::parse(&subscription.url).map_err(|_| anyhow::anyhow!("invalid_callback"))?;
@@ -127,6 +168,12 @@ impl Sender {
             .await
             .map_err(|_| anyhow::anyhow!("timeout_or_transport"))?;
         let status = response.status().as_u16();
+        // Event receipt is the HTTP status. Waiting for an optional response body
+        // can turn an accepted event into a timeout and hold the whole outbox.
+        // Callback verification still needs its bounded challenge response.
+        if !read_response_body {
+            return Ok((status, Vec::new()));
+        }
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -204,6 +251,11 @@ impl Events {
             HashMap::new()
         };
         subscriptions.retain(|_, s| s.expires > now() && s.owner == unsafe { libc::geteuid() });
+        for subscription in subscriptions.values_mut() {
+            while subscription.delivery_history.len() > DELIVERY_HISTORY {
+                subscription.delivery_history.pop_front();
+            }
+        }
         ensure!(
             subscriptions.len() <= MAX_SUBSCRIPTIONS,
             "subscription limit exceeded"
@@ -358,6 +410,10 @@ impl Events {
             old_secret: prior.or_else(|| existing.as_ref().and_then(|s| s.old_secret.clone())),
             pending: existing.as_ref().and_then(|s| s.pending.clone()),
             suspended: false,
+            delivery_history: existing
+                .as_ref()
+                .map(|s| s.delivery_history.clone())
+                .unwrap_or_default(),
         };
         let cache_key = format!("{}:{}", subscription.owner, subscription.url);
         let verified = self
@@ -373,7 +429,7 @@ impl Events {
                 serde_json::to_string(&json!({"type":"verification","challenge":challenge}))?;
             let (status, bytes) = self
                 .sender
-                .post(&subscription, &verification_id, &body)
+                .verify(&subscription, &verification_id, &body)
                 .await?;
             let response: Value =
                 serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("challenge_failed"))?;
@@ -405,6 +461,7 @@ impl Events {
         if let Some(latest) = store.get(&id) {
             subscription.cursor = latest.cursor.clone();
             subscription.pending = latest.pending.clone();
+            subscription.delivery_history = latest.delivery_history.clone();
         }
         // Refresh preserves the serialized unacknowledged event even if an
         // earlier delivery completed while callback verification was in flight.
@@ -546,6 +603,7 @@ impl Events {
                     body,
                     cursor,
                     attempts: 0,
+                    queued_at_ms: Some(millis()),
                 });
                 self.save(&store).await?;
                 continue;
@@ -554,15 +612,42 @@ impl Events {
             if pending.attempts >= 5 {
                 anyhow::bail!("delivery attempts exhausted; pending cursor retained")
             }
+            let started_at_ms = millis();
+            let started = tokio::time::Instant::now();
             let response = self
                 .sender
                 .post(&subscription, &pending.event_id, &pending.body)
                 .await;
+            let finished_at_ms = millis();
+            let elapsed_ms = started.elapsed().as_millis() as u64;
             let status = response.as_ref().ok().map(|(status, _)| *status);
             let mut store = self.subscriptions.lock().await;
             let Some(s) = store.get_mut(id) else {
                 return Ok(());
             };
+            let body: Value = serde_json::from_str(&pending.body)?;
+            let events = body["data"]["events"].as_array();
+            s.delivery_history.push_back(DeliveryAttempt {
+                event_id: pending.event_id.clone(),
+                cursor: pending.cursor.clone(),
+                queued_at_ms: pending.queued_at_ms,
+                first_event_at: events
+                    .and_then(|v| v.first())
+                    .and_then(|v| v["timestamp"].as_str())
+                    .map(str::to_owned),
+                last_event_at: events
+                    .and_then(|v| v.last())
+                    .and_then(|v| v["timestamp"].as_str())
+                    .map(str::to_owned),
+                attempt: pending.attempts.saturating_add(1),
+                started_at_ms,
+                finished_at_ms,
+                elapsed_ms,
+                status,
+            });
+            while s.delivery_history.len() > DELIVERY_HISTORY {
+                s.delivery_history.pop_front();
+            }
             if status.is_some_and(|s| (200..300).contains(&s)) {
                 s.cursor = Some(pending.cursor.clone());
                 s.pending = None;
@@ -593,6 +678,69 @@ use tokio::io::AsyncWriteExt;
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn accepted_event_does_not_wait_for_callback_response_body() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        let receiver = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).await?;
+            let mut length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await?;
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((key, value)) = line.split_once(':') {
+                    if key.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse::<usize>()?;
+                    }
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).await?;
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n")
+                .await?;
+            let _ = hold.await;
+            Ok::<_, anyhow::Error>(())
+        });
+        let subscription = Subscription {
+            id: "sub_receipt".into(),
+            owner: unsafe { libc::geteuid() },
+            url: format!("http://{address}/callback"),
+            secret: format!("whsec_{}", STANDARD.encode([6; 32])),
+            session_id: "project".into(),
+            execution_id: None,
+            expires: now() + 60,
+            cursor: None,
+            old_secret: None,
+            pending: None,
+            suspended: false,
+            delivery_history: VecDeque::new(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            Sender {
+                allow_loopback: true,
+            }
+            .post(&subscription, "evt_receipt", "{}"),
+        )
+        .await;
+        let _ = release.send(());
+        receiver.await??;
+        let (status, body) =
+            result.context("accepted headers must not wait for response body")??;
+        assert_eq!(status, 200);
+        assert!(body.is_empty());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn signed_webhooks_preserve_exact_retry_body_and_support_key_rotation() {
@@ -665,6 +813,7 @@ mod tests {
             old_secret: Some((old, now() + 60)),
             pending: None,
             suspended: false,
+            delivery_history: VecDeque::new(),
         };
         let sender = Sender {
             allow_loopback: true,
