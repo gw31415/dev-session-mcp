@@ -311,7 +311,7 @@ impl Store {
                         .data
                         .checkpoints
                         .values()
-                        .any(|cp| same_work(cp, record) && cp["completed"] != true)
+                        .any(|cp| cp["execution_id"] == id.as_str() && cp["completed"] != true)
             })
             .min_by_key(|(id, _)| {
                 self.data
@@ -633,19 +633,11 @@ impl Store {
             self.data.legacy_keys = false;
         }
         self.data.checkpoints.insert(key, value.clone());
-        let complete = self
-            .data
-            .checkpoints
-            .values()
-            .filter(|cp| same_work(cp, &value))
-            .all(|cp| cp["completed"] == true);
-        for record in self
-            .data
-            .records
-            .values_mut()
-            .filter(|record| same_work(record, &value))
-        {
-            record["work_completed"] = json!(complete && record["status"] == "exited");
+        // Completion is phase-local evidence, independent of a reader's current
+        // pointer. Incomplete readers pin their referenced execution in retire_one.
+        // Moving a reader must neither erase completion nor complete another phase.
+        if completed {
+            self.data.records.get_mut(id).unwrap()["work_completed"] = json!(true);
         }
         if let Err(error) = self.save() {
             self.data = before;
@@ -740,10 +732,6 @@ pub fn project(mut data: Value, args: &Value) -> Result<Value> {
         .as_object_mut()
         .map(|v| v.remove("command"));
     Ok(data)
-}
-
-fn same_work(left: &Value, right: &Value) -> bool {
-    left["session_id"] == right["session_id"] && left["work_id"] == right["work_id"]
 }
 
 fn brief(record: &Value) -> Value {
@@ -890,42 +878,80 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn checkpoint_moves_between_work_phases_without_permanent_pins_or_losing_pending_work()
-    -> Result<()> {
+    fn same_work_phases_retire_without_losing_unfinished_readers_or_completion() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("recovery.json");
         let mut store = Store::open(path.clone())?;
-        for n in 0..160 {
+        let phase = |id: &str, status: &str| {
+            let mut value = record(id, status);
+            value["work_id"] = json!("common");
+            value["retain_work"] = json!(true);
+            value
+        };
+        let original_generation = store.data.generation.clone();
+        store.reserve(phase("unknown", "outcome_unknown"), None, "hash".into())?;
+        for n in 0..400 {
             let id = n.to_string();
-            let mut phase = record(&id, "exited");
-            phase["work_id"] = json!("common");
-            phase["retain_work"] = json!(true);
-            store.reserve(phase, None, "hash".into())?;
+            store.reserve(phase(&id, "exited"), Some(id.clone()), "hash".into())?;
             store.checkpoint(&json!({"execution_id":id,"reader_id":"owner","cursor":"epoch:0","expected_revision":n,"completed":true}))?;
+            if n == 0 {
+                // A second reader pins an explicitly completed phase, not its work.
+                store.checkpoint(&json!({"execution_id":id,"reader_id":"reviewer","cursor":"epoch:0","expected_revision":0}))?;
+            }
+            if n == 127 {
+                // Failure at the retention boundary must still allow a repair start.
+                let mut failed = phase("failed", "exited");
+                failed["exit_code"] = json!(1);
+                store.reserve(failed, None, "hash".into())?;
+                store.checkpoint(&json!({"execution_id":"failed","reader_id":"repair","cursor":"epoch:0","expected_revision":0}))?;
+                assert_eq!(store.record("0").unwrap()["work_completed"], true);
+            }
+            if n == 200 {
+                drop(store);
+                store = Store::open(path.clone())?;
+            }
         }
-        assert!(store.records().len() <= RECORDS);
-        let mut pending = record("pending", "exited");
-        pending["work_id"] = json!("common");
-        pending["retain_work"] = json!(true);
-        store.reserve(pending, None, "hash".into())?;
-        store.checkpoint(&json!({"execution_id":"pending","reader_id":"owner","cursor":"epoch:0","expected_revision":160}))?;
+        assert_eq!(store.records().len(), RECORDS);
+        for id in ["0", "failed", "unknown"] {
+            assert!(store.record(id).is_some(), "lost pinned phase {id}");
+        }
+        assert!(store.record("1").is_none());
         assert!(
             store
-                .data
-                .records
-                .values()
-                .all(|v| v["work_completed"] == false)
-        );
-        assert!(
-            store
-                .reserve(record("blocked", "exited"), None, "hash".into())
+                .replay("1", "hash", Some(&original_generation))
                 .is_err()
         );
-        store.checkpoint(&json!({"execution_id":"pending","reader_id":"owner","cursor":"epoch:0","expected_revision":161,"completed":true}))?;
-        store.reserve(record("allowed", "exited"), None, "hash".into())?;
+        // Moving an unfinished reader releases a previously completed phase only.
+        let cp = store.checkpoint(&json!({"execution_id":"399","reader_id":"reviewer","cursor":"epoch:0","expected_revision":1}))?;
+        assert_eq!(cp["completed"], false);
+        assert_eq!(cp["purpose"], "test purpose");
+        assert_eq!(cp["completion_condition"], "verified fixture exit");
+        store.checkpoint(&json!({"execution_id":"399","reader_id":"repair","cursor":"epoch:0","expected_revision":1}))?;
+        store.reserve(phase("repair-start", "starting"), None, "hash".into())?;
+        assert!(store.record("0").is_none());
+        assert!(store.record("failed").is_some()); // Never explicitly completed.
         drop(store);
         let store = Store::open(path)?;
-        assert!(store.record("allowed").is_some());
+        for id in ["failed", "unknown", "399", "repair-start"] {
+            assert!(store.record(id).is_some());
+        }
+        assert_eq!(
+            store.record("repair-start").unwrap()["status"],
+            "outcome_unknown"
+        );
+        assert!(
+            store
+                .replay("0", "hash", Some(&original_generation))
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .checkpoints()
+                .iter()
+                .filter(|cp| cp["completed"] == false)
+                .count(),
+            2
+        );
         Ok(())
     }
     #[test]

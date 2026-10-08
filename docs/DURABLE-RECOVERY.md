@@ -109,7 +109,7 @@ Limits per state directory:
 | Evidence | Bound and behavior |
 | --- | --- |
 | Execution records / retained start keys | 128 retained records; retire eligible completed history under pressure; refuse only if unfinished/pinned evidence occupies capacity |
-| Reader checkpoints | 128; retire fully completed other work if needed; reject when remaining readers are unfinished |
+| Reader checkpoints | 128; retire eligible completed executions if needed; reject when remaining readers are unfinished |
 | Durable output history | 1 MiB / 1024 events globally, oldest events removed |
 | Recovery snapshot | 4 MiB hard bound; new starts target at most 2 MiB metadata to leave space for logs and receipt/checkpoint growth; atomic replacement may require another 4 MiB |
 | Source argv | Existing 64 KiB serialized command bound |
@@ -128,16 +128,20 @@ epoch survives, so a reader's valid global cursor does not become a false future
 when another execution is retired.
 
 Unfinished `starting`/`running` and `outcome_unknown` records are never retired.
-Any incomplete reader checkpoint pins the retained phases of its `(session, work)` binding. Explicit `work_id`, `purpose`,
-or `completion_condition` also pins declared work even before its first checkpoint;
-confirmed process exit alone does not prove the work is complete. After verifying the
-condition, a reader can CAS `completed:true` on a checkpoint for a confirmed exited
-execution. Retirement requires explicit completion for declared work and no remaining unfinished
-readers of that work. Completion is persisted on its confirmed exited phase records,
-so moving a checkpoint to a later phase does not leave previously completed phases
-permanently pinned merely because their old checkpoint pointer moved. An incomplete
-checkpoint on a new phase pins all still-retained phases again; running/unknown phases
-are never marked complete by another phase's checkpoint. This is an explicit caller assertion, not an automatic
+An incomplete reader checkpoint pins only its referenced execution. Explicit `work_id`,
+`purpose`, or `completion_condition` also pins a declared phase before its first checkpoint;
+confirmed process exit alone does not prove completion. After verifying the condition,
+a reader can CAS `completed:true` on a checkpoint for a confirmed exited execution.
+This persists completion evidence for that phase (the existing `work_completed` field),
+without completing other phases of the same work. Retirement requires this evidence for
+declared phases and no unfinished reader referencing that execution. Later incomplete
+checkpoints do not erase the evidence: they pin their referenced phase until completed
+or moved. Moving readers cannot release a phase that was never explicitly completed.
+Thus a failed new phase does not pin completed history or prevent a repair start when
+completed history can be retired. Work purpose and completion condition remain on
+retained records and reader checkpoints, including when readers move between phases.
+Running/unknown phases are never marked complete by another phase's checkpoint.
+This is an explicit caller assertion, not an automatic
 work-completion inference. A full window of genuinely unfinished/unknown work still
 refuses new starts without discarding evidence. Operators must resolve pending work;
 no state reset or automatic replay is a recovery path.
@@ -277,11 +281,14 @@ No live schema/auth/subscription/service changes, push, or deployment were perfo
 - The lost-start-ACK fixture now consumes `job.cursor` directly and asserts receipt of
   its output; it no longer switches to `initial_cursor` to hide a replay-position bug.
   Completed replay is checked using the returned cursor as well.
-- Real stdio executes 400 additional commands, with and without keys, across repeated
-  bounded retirement. Old legacy and explicit-generation keys cannot run again, before
+- Real stdio executes 400 additional phases in one declared work, with and without keys,
+  across repeated bounded retirement. A failed phase at the window boundary remains
+  unfinished while repair commands continue, including across a broker restart. Old legacy and explicit-generation keys cannot run again, before
   or after broker restart. Unknown outcomes and unfinished readers remain discoverable.
   Unit tests additionally cover declared work before its first checkpoint, moving one
-  reader across 160 completed phases, completed-reader capacity release, metadata-size
+  reader across 400 completed phases, a second reader pinning a completed phase until
+  moving away, never-completed phase preservation after readers move, completed-reader
+  capacity release, metadata-size
   pressure, the true unfinished-record limit, preserved epoch watermarks, and v1 migration.
 
 The final stdio recovery run passed with zero read-timeout retries. A prior loaded run

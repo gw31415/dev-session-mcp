@@ -205,7 +205,7 @@ def run(binary):
             assert len(recovered["checkpoints"]) == 2
             assert any(v["execution_id"] == unknown["execution_id"] for v in recovered["executions"])
             assert (state / "recovery.json").stat().st_size < 4 * 1024 * 1024
-            # Continue beyond three retention windows, with both keyed and unkeyed starts.
+            # Continue one declared work beyond three windows, including a failed phase.
             retired_counter = project / "retired-starts"
             legacy_args = dict(session_id=session,command=["/bin/sh","-c",f"echo legacy >> {retired_counter}"],profile="host",io="pipes",idempotency_key="retire-legacy")
             retired_legacy = c.tool("start_execution",**legacy_args)
@@ -216,13 +216,28 @@ def run(binary):
             finish(c, retired_job)
             for n in range(400):
                 extra = {} if n % 2 else dict(idempotency_key=f"continued-{n}",key_generation=c.tool("list_sessions")["recovery"]["key_generation"])
-                short = c.tool("start_execution",session_id=session,command=["/bin/true"],profile="host",io="pipes",**extra)
+                short = c.tool("start_execution",session_id=session,command=["/bin/true"],profile="host",io="pipes",
+                               work_id="continued-work",purpose="repair the same work",completion_condition="phase verified",**extra)
                 finish(c, short)
+                c.tool("checkpoint_execution",execution_id=short["execution_id"],reader_id="owner",cursor=short["cursor"],expected_revision=n,completed=True)
+                if n == 127:
+                    failed = c.tool("start_execution",session_id=session,command=["/bin/false"],profile="host",io="pipes",
+                                    work_id="continued-work",purpose="repair the same work",completion_condition="phase verified")
+                    finish(c, failed)
+                    c.tool("checkpoint_execution",execution_id=failed["execution_id"],reader_id="failure-review",cursor=failed["cursor"],expected_revision=0)
+                if n == 200:
+                    c.close()
+                    broker.terminate(); broker.wait(timeout=8)
+                    broker = boot(); c = frontend()
             retained = c.tool("list_sessions")
             assert len(retained["executions"]) <= 128 and retained["recovery"]["retired_records"] > 256
             assert retained["recovery"]["key_generation"] != old_generation
             assert any(v["execution_id"] == unknown["execution_id"] for v in retained["executions"])
-            assert len(retained["checkpoints"]) == 2
+            assert len(retained["checkpoints"]) == 4
+            assert any(v["execution_id"] == failed["execution_id"] for v in retained["executions"])
+            failure_cp = next(v for v in retained["checkpoints"] if v["reader_id"] == "failure-review")
+            assert not failure_cp["completed"] and failure_cp["purpose"] == "repair the same work"
+            assert failure_cp["completion_condition"] == "phase verified"
             assert c.tool("start_execution",**args)["execution_id"] == job_id  # unfinished readers pin this work
             for old_args in (legacy_args,retired_args):
                 rejected = c.request("tools/call",{"name":"start_execution","arguments":old_args})
@@ -238,10 +253,11 @@ def run(binary):
             assert retired_counter.read_text() == "legacy\nkeyed\n"
             assert c.tool("start_execution",**unknown_args)["status"] == "outcome_unknown"
             fresh = c.tool("start_execution",session_id=session,command=["/bin/true"],profile="host",io="pipes",
+                           work_id="continued-work",purpose="repair the same work",completion_condition="phase verified",
                            idempotency_key="after-retirement-restart",key_generation=c.tool("list_sessions")["recovery"]["key_generation"])
             finish(c,fresh)
             assert (state / "recovery.json").stat().st_size < 4 * 1024 * 1024
-            print(f"PASS: start/input/checkpoint ACK loss; job.cursor recovery; two readers; Resources; restart/unknown; 400 starts; retirement/expired keys; read-only timeout retries={read_retries}")
+            print(f"PASS: start/input/checkpoint ACK loss; job.cursor recovery; two readers; Resources; restart/unknown; 400 same-work phases/failure repair; retirement/expired keys; read-only timeout retries={read_retries}")
         finally:
             for client in clients:
                 client.cleanup()
