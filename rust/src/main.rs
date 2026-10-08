@@ -4,6 +4,7 @@ mod broker;
 mod events;
 mod files;
 mod server;
+mod wait;
 mod workspace;
 
 use anyhow::Result;

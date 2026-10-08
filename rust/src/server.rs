@@ -94,6 +94,13 @@ fn definitions() -> Vec<Value> {
         true,
     );
     add(
+        "wait_execution",
+        "Bounded ordinary read-only tool, not Events streaming. Return output/state/exit after the required cursor, or immediately if terminal or a gap exists. max_wait_ms defaults to 1000 (0..10000); snapshots add at most 2000 ms transport budget. Timeout returns state and cursor with timed_out=true. Preserve global epoch:sequence cursors, deduplicate by sequence, and drain more pages explicitly. No automatic repeat, execution or stdin resend.",
+        json!({"execution_id":id,"cursor":id,"max_wait_ms":{"type":"integer","minimum":0,"maximum":10000,"default":1000}}),
+        &["execution_id", "cursor"],
+        true,
+    );
+    add(
         "read_delivery_diagnostics",
         "Read delivery lease, suspension, pending-batch and bounded HTTP timing history, separately from optional execution state. No callback URL, credentials or output bodies. Does not retry or refresh. HTTP receipt does not prove chat forwarding; absent subscriptions mean no retained evidence.",
         json!({"session_id":id,"execution_id":id}),
@@ -133,7 +140,7 @@ fn definitions() -> Vec<Value> {
 }
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(Implementation::new(env!("CARGO_PKG_NAME"),env!("CARGO_PKG_VERSION"))).with_instructions("Explicit project sessions and executions. Use execution.events subscriptions for batched output/state/exit; read_execution only for catch-up. Host execution has full OS-user rights; sandbox execution disables network. Input acceptance is not an application acknowledgement. No implicit shell, default execution, or legacy API.")
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(Implementation::new(env!("CARGO_PKG_NAME"),env!("CARGO_PKG_VERSION"))).with_instructions("Explicit project sessions and executions. Use execution.events subscriptions for batched output/state/exit; read_execution only for catch-up. Alternatively use wait_execution for one bounded ordinary tool response; it does not automatically continue work. Host execution has full OS-user rights; sandbox execution disables network. Input acceptance is not an application acknowledgement. No implicit shell, default execution, or legacy API.")
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tools.iter().find(|t| t.name == name).cloned()
@@ -164,13 +171,19 @@ impl ServerHandler for Server {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, McpError> {
         if self.get_tool(&request.name).is_none() {
             return Err(McpError::invalid_params("unknown tool", None));
         }
         let mut args = json!(request.arguments.unwrap_or_default());
-        let response = if request.name == "read_delivery_diagnostics" {
+        let response = if request.name == "wait_execution" {
+            tokio::select! {
+                biased;
+                _ = context.ct.cancelled() => Err(anyhow::anyhow!("wait_execution cancelled")),
+                result = crate::wait::execution(&self.broker, args) => result,
+            }
+        } else if request.name == "read_delivery_diagnostics" {
             self.events.diagnostics(args).await
         } else {
             args["op"] = json!(request.name);

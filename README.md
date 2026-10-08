@@ -12,6 +12,7 @@ Linux を複数プロジェクトの開発環境として使う独立した Rust
 | start_execution | 明示した argv を一度開始。profile は必須の host / sandbox、io は pty / pipes |
 | input_execution, resize_execution, signal_execution | 明示した execution_id へ stdin、端末サイズ、INT / TERM / KILL |
 | read_execution | cursor による再接続・欠落回収。通常の更新は Events |
+| wait_execution | 指定execution/cursorから出力・状態・終了を上限付きで待つ独自の通常read-only tool。[契約・検証・次の試験](docs/WAIT-EXECUTION.md) |
 | read_delivery_diagnostics | 実行状態と通知停止を分離するread-only診断。lease期限・未確認batch・HTTP status/送信時間。詳細と残工程は[配信診断](docs/DELIVERY-DIAGNOSTICS.md) |
 | read_file, write_file, list_directory, get_image | 上限付きファイル操作。write は sandbox 内の許可 root のみ |
 | import_file | 正式 fileParams の bytes を保存。管理者が確認した HTTPS origin の設定が必要 |
