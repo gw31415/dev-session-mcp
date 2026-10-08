@@ -421,24 +421,17 @@ impl Store {
         let (epoch, n) = cursor(record["cursor"].as_str().context("missing event cursor")?)?;
         let position = self.data.epoch_positions.entry(epoch.into()).or_default();
         *position = (*position).max(n);
-        record["work_completed"] = self
-            .data
-            .records
-            .get(&id)
-            .map(|v| v["work_completed"].clone())
-            .unwrap_or(Value::Null);
-        record["retention_order"] = self
-            .data
-            .records
-            .get(&id)
-            .map(|v| v["retention_order"].clone())
-            .unwrap_or(Value::Null);
-        record["command"] = self
-            .data
-            .records
-            .get(&id)
-            .map(|v| v["command"].clone())
-            .unwrap_or(Value::Null);
+        // Live process snapshots must not undo checkpoint-owned durable metadata.
+        for field in [
+            "work_completed",
+            "retain_work",
+            "purpose",
+            "completion_condition",
+            "retention_order",
+            "command",
+        ] {
+            record[field] = self.data.records[&id][field].clone();
+        }
         self.data.records.insert(id, record);
         let output = event["kind"] == "output";
         self.event_bytes += serde_json::to_vec(&event).unwrap().len();
@@ -636,8 +629,15 @@ impl Store {
         // Completion is phase-local evidence, independent of a reader's current
         // pointer. Incomplete readers pin their referenced execution in retire_one.
         // Moving a reader must neither erase completion nor complete another phase.
+        let record = self.data.records.get_mut(id).unwrap();
+        record["retain_work"] = json!(true);
+        for field in ["purpose", "completion_condition"] {
+            if !record[field].is_string() {
+                record[field] = value[field].clone();
+            }
+        }
         if completed {
-            self.data.records.get_mut(id).unwrap()["work_completed"] = json!(true);
+            record["work_completed"] = json!(true);
         }
         if let Err(error) = self.save() {
             self.data = before;
@@ -875,6 +875,59 @@ mod tests {
         drop(store);
         let store = Store::open(path)?;
         assert_eq!(store.checkpoints()[0]["completed"], false);
+        Ok(())
+    }
+    #[test]
+    fn checkpoint_promotes_metadata_free_start_until_explicit_completion() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("recovery.json");
+        let mut store = Store::open(path.clone())?;
+        let mut original = record("original", "running");
+        original["retain_work"] = json!(false);
+        original.as_object_mut().unwrap().remove("purpose");
+        original
+            .as_object_mut()
+            .unwrap()
+            .remove("completion_condition");
+        store.reserve(original.clone(), None, "hash".into())?;
+        store.checkpoint(&json!({"execution_id":"original","reader_id":"owner","cursor":"epoch:0","expected_revision":0,
+            "purpose":"late purpose","completion_condition":"late condition"}))?;
+        // A later process event carries stale metadata from before the checkpoint.
+        original["status"] = json!("exited");
+        store.append(
+            original,
+            json!({"execution_id":"original","sequence":0,"kind":"exited"}),
+        )?;
+        let mut next = record("next", "exited");
+        next["work_id"] = json!("original");
+        store.reserve(next, None, "hash".into())?;
+        store.checkpoint(&json!({"execution_id":"next","reader_id":"owner","cursor":"epoch:0","expected_revision":1}))?;
+        drop(store);
+        let mut store = Store::open(path)?;
+        for n in 0..RECORDS + 2 {
+            store.reserve(
+                record(&format!("filler-{n}"), "exited"),
+                None,
+                "hash".into(),
+            )?;
+        }
+        let original = store
+            .record("original")
+            .expect("uncompleted phase must survive reader move");
+        assert_eq!(original["retain_work"], true);
+        assert_eq!(original["purpose"], "late purpose");
+        assert_eq!(original["completion_condition"], "late condition");
+        assert_ne!(original["work_completed"], true);
+        assert!(
+            !store
+                .checkpoints()
+                .iter()
+                .any(|cp| cp["execution_id"] == "original")
+        );
+        store.checkpoint(&json!({"execution_id":"original","reader_id":"finisher","cursor":"epoch:0","expected_revision":0,"completed":true}))?;
+        store.reserve(record("after-completion", "exited"), None, "hash".into())?;
+        assert!(store.record("original").is_none());
+        assert!(store.record("next").is_some());
         Ok(())
     }
     #[test]

@@ -130,7 +130,10 @@ when another execution is retired.
 Unfinished `starting`/`running` and `outcome_unknown` records are never retired.
 An incomplete reader checkpoint pins only its referenced execution. Explicit `work_id`,
 `purpose`, or `completion_condition` also pins a declared phase before its first checkpoint;
-confirmed process exit alone does not prove completion. After verifying the condition,
+confirmed process exit alone does not prove completion. A first checkpoint also
+promotes a metadata-free start to durable declared work and preserves its purpose and
+completion condition on the execution. Process events and reader moves cannot undo
+this promotion; explicit completion is still required before retirement. After verifying the condition,
 a reader can CAS `completed:true` on a checkpoint for a confirmed exited execution.
 This persists completion evidence for that phase (the existing `work_completed` field),
 without completing other phases of the same work. Retirement requires this evidence for
@@ -250,7 +253,7 @@ launched with a temporary socket; no existing broker process was contacted.
 
 | Check | Result |
 | --- | --- |
-| `cargo test --locked --offline ... -- --test-threads=1` | 28 passed, 0 failed (including both stdin commit phases and retirement fault injection) |
+| `cargo test --locked --offline ... -- --test-threads=1` | 29 passed, 0 failed (including late checkpoint promotion, both stdin commit phases and retirement fault injection) |
 | `cargo build --locked --offline ...` | Passed |
 | `tests/recovery_stdio.py NEW OLD` | Passed; start/input/checkpoint ACK loss, two readers, Resources including escaped URIs, restart, unknown result, 400 starts, retired-key refusal, real unsent stdin, old-broker guard |
 | `tests/wait_execution_stdio.py NEW` | Passed |
@@ -291,10 +294,10 @@ No live schema/auth/subscription/service changes, push, or deployment were perfo
   capacity release, metadata-size
   pressure, the true unfinished-record limit, preserved epoch watermarks, and v1 migration.
 
-The final stdio recovery run passed with zero read-timeout retries. A prior loaded run
-hit the existing one-second snapshot deadline; the fixture now permits only that
+The late-checkpoint-promotion stdio recovery run passed with two read-timeout retries.
+The existing one-second snapshot deadline can be hit under load; the fixture permits only that
 specific read failure to be retried, with unchanged last received cursor and a finite
 20-second recovery budget. Start/input are never retried by this read-recovery path;
-other errors remain test failures. Final current/old-broker wait, diagnostics, stdio,
-and I/O-control regressions all passed. No production state reset, restart, schema,
+other errors remain test failures. Current/old-broker wait, diagnostics, stdio,
+and I/O-control regressions passed during the preceding phase-retention validation. No production state reset, restart, schema,
 auth, or subscription operation was performed.

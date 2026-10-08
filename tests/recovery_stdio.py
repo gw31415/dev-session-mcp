@@ -214,6 +214,15 @@ def run(binary):
             retired_args = dict(session_id=session,command=["/bin/sh","-c",f"echo keyed >> {retired_counter}"],profile="host",io="pipes",idempotency_key="retire-explicit",key_generation=old_generation)
             retired_job = c.tool("start_execution",**retired_args)
             finish(c, retired_job)
+            # No work metadata at start: checkpoint is the first declaration of intent.
+            late = c.tool("start_execution",session_id=session,command=["/bin/cat"],profile="host",io="pipes")
+            c.tool("checkpoint_execution",execution_id=late["execution_id"],reader_id="late-owner",cursor=late["cursor"],expected_revision=0,
+                   purpose="late purpose",completion_condition="late condition")
+            c.tool("input_execution",execution_id=late["execution_id"],close_stdin=True)
+            finish(c,late)  # Process events must preserve the checkpoint's promotion.
+            next_phase = c.tool("start_execution",session_id=session,command=["/bin/true"],profile="host",io="pipes",work_id=late["execution_id"])
+            finish(c,next_phase)
+            c.tool("checkpoint_execution",execution_id=next_phase["execution_id"],reader_id="late-owner",cursor=next_phase["cursor"],expected_revision=1)
             for n in range(400):
                 extra = {} if n % 2 else dict(idempotency_key=f"continued-{n}",key_generation=c.tool("list_sessions")["recovery"]["key_generation"])
                 short = c.tool("start_execution",session_id=session,command=["/bin/true"],profile="host",io="pipes",
@@ -233,7 +242,11 @@ def run(binary):
             assert len(retained["executions"]) <= 128 and retained["recovery"]["retired_records"] > 256
             assert retained["recovery"]["key_generation"] != old_generation
             assert any(v["execution_id"] == unknown["execution_id"] for v in retained["executions"])
-            assert len(retained["checkpoints"]) == 4
+            assert len(retained["checkpoints"]) == 5
+            late_record = next(v for v in retained["executions"] if v["execution_id"] == late["execution_id"])
+            assert late_record["retain_work"] and late_record["purpose"] == "late purpose"
+            assert late_record["completion_condition"] == "late condition"
+            assert not any(v["execution_id"] == late["execution_id"] for v in retained["checkpoints"])
             assert any(v["execution_id"] == failed["execution_id"] for v in retained["executions"])
             failure_cp = next(v for v in retained["checkpoints"] if v["reader_id"] == "failure-review")
             assert not failure_cp["completed"] and failure_cp["purpose"] == "repair the same work"
@@ -256,8 +269,12 @@ def run(binary):
                            work_id="continued-work",purpose="repair the same work",completion_condition="phase verified",
                            idempotency_key="after-retirement-restart",key_generation=c.tool("list_sessions")["recovery"]["key_generation"])
             finish(c,fresh)
+            c.tool("checkpoint_execution",execution_id=late["execution_id"],reader_id="finisher",cursor=late["cursor"],expected_revision=0,completed=True)
+            after = c.tool("start_execution",session_id=session,command=["/bin/true"],profile="host",io="pipes")
+            finish(c,after)
+            assert not any(v["execution_id"] == late["execution_id"] for v in c.tool("list_sessions")["executions"])
             assert (state / "recovery.json").stat().st_size < 4 * 1024 * 1024
-            print(f"PASS: start/input/checkpoint ACK loss; job.cursor recovery; two readers; Resources; restart/unknown; 400 same-work phases/failure repair; retirement/expired keys; read-only timeout retries={read_retries}")
+            print(f"PASS: late checkpoint promotion; start/input/checkpoint ACK loss; job.cursor recovery; two readers; Resources; restart/unknown; 400 same-work phases/failure repair; retirement/expired keys; read-only timeout retries={read_retries}")
         finally:
             for client in clients:
                 client.cleanup()
