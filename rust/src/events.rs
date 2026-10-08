@@ -34,7 +34,13 @@ fn iso(seconds: u64) -> String {
         .unwrap()
 }
 pub fn timestamp() -> String {
-    iso(now())
+    timestamp_ms(millis())
+}
+fn timestamp_ms(at_ms: u64) -> String {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(at_ms) * 1_000_000)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
 }
 fn millis() -> u64 {
     SystemTime::now()
@@ -80,6 +86,42 @@ struct Pending {
     attempts: u8,
     #[serde(default)]
     queued_at_ms: Option<u64>,
+}
+impl Subscription {
+    fn diagnostic(&self, observed_at_ms: u64, worker_running: bool) -> Value {
+        let expired = self.expires <= observed_at_ms / 1000;
+        let state = if expired {
+            "expired"
+        } else if self.suspended {
+            "suspended"
+        } else if !worker_running {
+            "worker_stopped"
+        } else {
+            "active"
+        };
+        // Explicit allowlist: never serialize the subscription or pending body.
+        let history: Vec<_> = self
+            .delivery_history
+            .iter()
+            .rev()
+            .take(DELIVERY_HISTORY)
+            .rev()
+            .map(|a| {
+                json!({"event_id":a.event_id,"attempt":a.attempt,
+                "queued_at_ms":a.queued_at_ms,"first_event_at":a.first_event_at,
+                "last_event_at":a.last_event_at,"started_at_ms":a.started_at_ms,
+                "finished_at_ms":a.finished_at_ms,"elapsed_ms":a.elapsed_ms,
+                "status":a.status})
+            })
+            .collect();
+        json!({"subscription_id":self.id,"execution_id":self.execution_id,
+            "lease_expires_at_unix_seconds":self.expires,"expired":expired,
+            "suspended":self.suspended,"worker_running":worker_running,"delivery_state":state,
+            "has_unacknowledged_batch":self.pending.is_some(),
+            "pending_queued_at_ms":self.pending.as_ref().and_then(|p| p.queued_at_ms),
+            "last_http_status":self.delivery_history.back().and_then(|a| a.status),
+            "delivery_history":history})
+    }
 }
 #[derive(Clone, Default)]
 struct Sender {
@@ -219,6 +261,18 @@ pub struct Events {
     sender: Sender,
 }
 impl Events {
+    #[cfg(test)]
+    pub(crate) fn empty_for_protocol_test(broker: Client, path: PathBuf) -> Self {
+        Self {
+            broker,
+            path,
+            subscriptions: Arc::new(AsyncMutex::new(HashMap::new())),
+            control: Arc::new(AsyncMutex::new(())),
+            workers: Arc::new(Mutex::new(HashMap::new())),
+            verified: Arc::new(AsyncMutex::new(HashMap::new())),
+            sender: Sender::default(),
+        }
+    }
     pub async fn new(broker: Client) -> Result<Self> {
         Self::load(
             broker,
@@ -305,6 +359,73 @@ impl Events {
     }
     pub fn list() -> Value {
         json!({"events":[{"name":NAME,"description":"Batched terminal/pipe output, input receipts, execution state and exit. Data only; recover sequence gaps with read_execution.","delivery":["webhook"],"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"execution_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false},"payloadSchema":{"type":"object","properties":{"events":{"type":"array","items":{"type":"object"}},"catch_up_required":{"type":"boolean"},"earliest_cursor":{"type":"string"}},"required":["events","catch_up_required","earliest_cursor"],"additionalProperties":false}}]})
+    }
+    /// Snapshot only: never load secrets, refresh a lease, or launch a worker.
+    pub async fn diagnostics(&self, params: Value) -> Result<Value> {
+        self.diagnostics_with(params, |request| self.broker.call(request))
+            .await
+    }
+    async fn diagnostics_with<F, Fut>(&self, params: Value, read: F) -> Result<Value>
+    where
+        F: Fn(Value) -> Fut,
+        Fut: std::future::Future<Output = Result<Value>>,
+    {
+        let args = params
+            .as_object()
+            .context("expected diagnostic arguments")?;
+        ensure!(
+            args.keys()
+                .all(|k| ["session_id", "execution_id"].contains(&k.as_str())),
+            "unknown diagnostic argument"
+        );
+        let session = workspace::text(&params, "session_id")?;
+        let execution = params
+            .get("execution_id")
+            .map(|_| workspace::text(&params, "execution_id"))
+            .transpose()?;
+        // Use the same session/retained-history and execution ownership checks
+        // as subscription creation. Do not expose broker errors or record bodies.
+        let info = read(json!({"op":"inspect_event_session","session_id":session}))
+            .await
+            .map_err(|_| anyhow::anyhow!("session diagnostics unavailable"))?;
+        let execution_state = if let Some(id) = execution {
+            let data = read(json!({"op":"read_execution","execution_id":id}))
+                .await
+                .map_err(|_| anyhow::anyhow!("execution diagnostics unavailable"))?;
+            ensure!(
+                data["execution"]["session_id"] == session,
+                "execution does not belong to this session"
+            );
+            json!({"execution_id":id,"status":data["execution"]["status"],
+                "exit_code":data["execution"]["exit_code"]})
+        } else {
+            Value::Null
+        };
+        let store = self.subscriptions.lock().await;
+        let observed_at_ms = millis();
+        let workers = self.workers.lock().unwrap();
+        let mut subscriptions: Vec<_> = store
+            .values()
+            .filter(|s| {
+                s.owner == unsafe { libc::geteuid() }
+                    && s.session_id == session
+                    && execution.is_none_or(|id| {
+                        s.execution_id.as_deref().is_none_or(|filter| filter == id)
+                    })
+            })
+            .map(|s| {
+                let worker_running = workers.get(&s.id).is_some_and(|w| !w.is_finished());
+                s.diagnostic(observed_at_ms, worker_running)
+            })
+            .collect();
+        subscriptions.sort_by(|a, b| {
+            a["subscription_id"]
+                .as_str()
+                .cmp(&b["subscription_id"].as_str())
+        });
+        Ok(json!({"observed_at_ms":observed_at_ms,"session_id":session,
+            "session_state":info["state"],"execution":execution_state,
+            "subscriptions":subscriptions}))
     }
     async fn identity(
         &self,
@@ -678,6 +799,204 @@ use tokio::io::AsyncWriteExt;
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    fn diagnostic_fixture() -> Subscription {
+        Subscription {
+            id: "sub_fixture".into(),
+            owner: unsafe { libc::geteuid() },
+            url: "https://callback.invalid/PRIVATE_URL".into(),
+            secret: "PRIVATE_KEY".into(),
+            old_secret: Some(("PRIVATE_OLD_KEY".into(), 999)),
+            session_id: "session".into(),
+            execution_id: None,
+            expires: 200,
+            cursor: Some("PRIVATE_CURSOR".into()),
+            suspended: false,
+            pending: Some(Pending {
+                event_id: "evt".into(),
+                body: "PRIVATE_BODY".into(),
+                cursor: "PRIVATE_PENDING_CURSOR".into(),
+                attempts: 1,
+                queued_at_ms: Some(100_000),
+            }),
+            delivery_history: VecDeque::from([DeliveryAttempt {
+                event_id: "evt".into(),
+                cursor: "PRIVATE_HISTORY_CURSOR".into(),
+                queued_at_ms: Some(100_000),
+                first_event_at: None,
+                last_event_at: None,
+                attempt: 1,
+                started_at_ms: 100_100,
+                finished_at_ms: 100_440,
+                elapsed_ms: 340,
+                status: Some(503),
+            }]),
+        }
+    }
+
+    #[test]
+    fn diagnostics_event_timestamps_preserve_milliseconds() {
+        assert_eq!(timestamp_ms(1_000), "1970-01-01T00:00:01Z");
+        assert_eq!(timestamp_ms(1_123), "1970-01-01T00:00:01.123Z");
+        assert_eq!(timestamp_ms(1_999), "1970-01-01T00:00:01.999Z");
+    }
+
+    #[test]
+    fn diagnostics_states_redaction_and_legacy_history() -> Result<()> {
+        let mut s = diagnostic_fixture();
+        let value = s.diagnostic(101_000, true);
+        assert_eq!(value["delivery_state"], "active");
+        assert_eq!(value["last_http_status"], 503);
+        assert_eq!(value["has_unacknowledged_batch"], true);
+        assert_eq!(value["lease_expires_at_unix_seconds"], 200);
+        assert_eq!(value["delivery_history"][0]["elapsed_ms"], 340);
+        assert_eq!(value["delivery_history"][0]["started_at_ms"], 100_100);
+        assert_eq!(value["delivery_history"][0]["finished_at_ms"], 100_440);
+        assert!(!value.to_string().contains("PRIVATE"));
+        assert_eq!(
+            s.diagnostic(101_000, false)["delivery_state"],
+            "worker_stopped"
+        );
+        s.suspended = true;
+        assert_eq!(s.diagnostic(101_000, true)["delivery_state"], "suspended");
+        assert_eq!(s.diagnostic(200_000, true)["delivery_state"], "expired");
+        s.delivery_history.back_mut().unwrap().status = None;
+        assert!(s.diagnostic(101_000, true)["last_http_status"].is_null());
+        for _ in 0..20 {
+            s.delivery_history.push_back(s.delivery_history[0].clone());
+        }
+        assert_eq!(
+            s.diagnostic(101_000, true)["delivery_history"]
+                .as_array()
+                .unwrap()
+                .len(),
+            16
+        );
+        let mut legacy = serde_json::to_value(&s)?;
+        legacy.as_object_mut().unwrap().remove("delivery_history");
+        legacy["pending"]
+            .as_object_mut()
+            .unwrap()
+            .remove("queued_at_ms");
+        let legacy: Subscription = serde_json::from_value(legacy)?;
+        let value = legacy.diagnostic(101_000, false);
+        assert_eq!(value["delivery_history"], json!([]));
+        assert!(value["last_http_status"].is_null());
+        assert!(value["pending_queued_at_ms"].is_null());
+        s.pending = None;
+        assert_eq!(
+            s.diagnostic(101_000, false)["has_unacknowledged_batch"],
+            false
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn diagnostics_read_only_filters_and_authorization() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let socket = root.path().join("unused-broker.sock");
+        // Exercise the production diagnostic path with synthetic read responses.
+        // No socket, callback, command execution or live secret store is used.
+        async fn read(request: Value) -> Result<Value> {
+            Ok(match request["op"].as_str().unwrap() {
+                "inspect_event_session" if request["session_id"] == "missing" => {
+                    anyhow::bail!("PRIVATE_BROKER_ERROR")
+                }
+                "inspect_event_session" => {
+                    json!({"state":if request["session_id"] == "closed" { "closed" } else { "open" },"private":"PRIVATE_SESSION"})
+                }
+                "read_execution" => json!({"execution":{
+                    "session_id":match request["execution_id"].as_str() { Some("wrong") => "other", Some("closed") => "closed", _ => "session" },
+                    "status":if request["execution_id"] == "closed" { "exited" } else { "running" },
+                    "command":["PRIVATE_COMMAND"],"text":"PRIVATE_OUTPUT"
+                }}),
+                _ => panic!("diagnostic performed a non-read operation"),
+            })
+        }
+        let path = root.path().join("must-not-be-read-or-written");
+        tokio::fs::write(&path, b"unchanged sentinel").await?;
+        let mut s = diagnostic_fixture();
+        s.expires = now() + 60;
+        s.suspended = true;
+        let mut foreign = s.clone();
+        foreign.id = "foreign".into();
+        foreign.owner ^= 1;
+        let mut other = s.clone();
+        other.id = "other".into();
+        other.session_id = "other".into();
+        let mut filtered = s.clone();
+        filtered.id = "filtered".into();
+        filtered.execution_id = Some("different".into());
+        let engine = Events {
+            broker: Client::test_socket(socket),
+            path: path.clone(),
+            subscriptions: Arc::new(AsyncMutex::new(
+                [s, foreign, other, filtered]
+                    .into_iter()
+                    .map(|s| (s.id.clone(), s))
+                    .collect(),
+            )),
+            control: Arc::new(AsyncMutex::new(())),
+            workers: Arc::new(Mutex::new(HashMap::new())),
+            verified: Arc::new(AsyncMutex::new(HashMap::new())),
+            sender: Sender::default(),
+        };
+        let before = serde_json::to_value(&*engine.subscriptions.lock().await)?;
+        for _ in 0..2 {
+            let value = engine
+                .diagnostics_with(
+                    json!({"session_id":"session","execution_id":"execution"}),
+                    read,
+                )
+                .await?;
+            assert_eq!(value["execution"]["status"], "running");
+            assert_eq!(value["subscriptions"].as_array().unwrap().len(), 1);
+            assert_eq!(value["subscriptions"][0]["delivery_state"], "suspended");
+            assert!(!value.to_string().contains("PRIVATE"));
+        }
+        let all = engine
+            .diagnostics_with(json!({"session_id":"session"}), read)
+            .await?;
+        assert!(all["execution"].is_null());
+        assert_eq!(all["subscriptions"].as_array().unwrap().len(), 2);
+        let closed = engine
+            .diagnostics_with(json!({"session_id":"closed","execution_id":"closed"}), read)
+            .await?;
+        assert_eq!(closed["session_state"], "closed");
+        assert_eq!(closed["execution"]["status"], "exited");
+        assert_eq!(
+            engine
+                .diagnostics_with(json!({"session_id":"empty"}), read)
+                .await?["subscriptions"],
+            json!([])
+        );
+        assert!(
+            engine
+                .diagnostics_with(json!({"session_id":"session","execution_id":"wrong"}), read)
+                .await
+                .is_err()
+        );
+        let error = engine
+            .diagnostics_with(json!({"session_id":"missing"}), read)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "session diagnostics unavailable");
+        for invalid in [
+            json!({}),
+            json!({"session_id":"session","owner":0}),
+            json!({"session_id":"session","execution_id":null}),
+        ] {
+            assert!(engine.diagnostics_with(invalid, read).await.is_err());
+        }
+        assert_eq!(
+            serde_json::to_value(&*engine.subscriptions.lock().await)?,
+            before
+        );
+        assert_eq!(tokio::fs::read(&path).await?, b"unchanged sentinel");
+        assert!(engine.workers.lock().unwrap().is_empty());
+        assert!(engine.verified.lock().await.is_empty());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn accepted_event_does_not_wait_for_callback_response_body() -> Result<()> {

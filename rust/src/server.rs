@@ -94,6 +94,13 @@ fn definitions() -> Vec<Value> {
         true,
     );
     add(
+        "read_delivery_diagnostics",
+        "Read delivery lease, suspension, pending-batch and bounded HTTP timing history, separately from optional execution state. No callback URL, credentials or output bodies. Does not retry or refresh. HTTP receipt does not prove chat forwarding; absent subscriptions mean no retained evidence.",
+        json!({"session_id":id,"execution_id":id}),
+        &["session_id"],
+        true,
+    );
+    add(
         "read_file",
         "Read up to 64 KiB UTF-8 text with a structured truncation flag. Host OS-user file access; relative path uses session cwd.",
         json!({"session_id":id,"path":path}),
@@ -163,8 +170,13 @@ impl ServerHandler for Server {
             return Err(McpError::invalid_params("unknown tool", None));
         }
         let mut args = json!(request.arguments.unwrap_or_default());
-        args["op"] = json!(request.name);
-        let result = match self.broker.call(args).await {
+        let response = if request.name == "read_delivery_diagnostics" {
+            self.events.diagnostics(args).await
+        } else {
+            args["op"] = json!(request.name);
+            self.broker.call(args).await
+        };
+        let result = match response {
             Ok(data) if request.name == "get_image" => serde_json::from_value(data)
                 .map_err(|_| McpError::internal_error("invalid image response", None))?,
             Ok(data) => {
@@ -276,4 +288,134 @@ pub async fn stdio() -> Result<()> {
         .waiting()
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn diagnostics_mcp_protocol_boundary_in_memory() -> Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let root = tempfile::tempdir()?;
+        // A deliberately absent broker: valid queries must return a sanitized
+        // tool error. This is NOT a real socket/stdio success test.
+        let broker = Client::test_socket(root.path().join("absent.sock"));
+        let events = Events::empty_for_protocol_test(
+            broker.clone(),
+            root.path().join("must-not-be-created.json"),
+        );
+        let server = EventService(Server {
+            broker,
+            events,
+            tools: serde_json::from_value(json!(definitions()))?,
+        });
+        let (server_io, client_io) = tokio::io::duplex(65536);
+        let task = tokio::spawn(async move {
+            server.serve(server_io).await?.waiting().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let mut client = BufReader::new(client_io);
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientInfo":{"name":"diagnostic-boundary","version":"1"},
+            "io.modelcontextprotocol/clientCapabilities":{}
+        });
+        let cases = [
+            ("server/discover", json!({}), None),
+            ("tools/list", json!({}), None),
+            (
+                "tools/call",
+                json!({"name":"read_delivery_diagnostics","arguments":{}}),
+                Some("missing string session_id"),
+            ),
+            (
+                "tools/call",
+                json!({"name":"read_delivery_diagnostics","arguments":{"session_id":"s","execution_id":null}}),
+                Some("missing string execution_id"),
+            ),
+            (
+                "tools/call",
+                json!({"name":"read_delivery_diagnostics","arguments":{"session_id":"s","owner":0,"secret":"PRIVATE_CANARY"}}),
+                Some("unknown diagnostic argument"),
+            ),
+            (
+                "tools/call",
+                json!({"name":"read_delivery_diagnostics","arguments":{"session_id":"s"}}),
+                Some("session diagnostics unavailable"),
+            ),
+            (
+                "tools/call",
+                json!({"name":"nonexistent_tool","arguments":{}}),
+                None,
+            ),
+            ("events/diagnostics", json!({}), None),
+        ];
+        for (i, (method, mut params, expected)) in cases.into_iter().enumerate() {
+            params["_meta"] = meta.clone();
+            let request = json!({"jsonrpc":"2.0","id":i,"method":method,"params":params});
+            client
+                .get_mut()
+                .write_all(format!("{request}\n").as_bytes())
+                .await?;
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_line(&mut line),
+            )
+            .await??;
+            let response: Value = serde_json::from_str(&line)?;
+            assert_eq!(response["id"], i);
+            assert!(!line.contains("PRIVATE_CANARY"));
+            assert!(!line.contains("absent.sock"));
+            if let Some(message) = expected {
+                assert!(
+                    response.get("error").is_none(),
+                    "tool failures belong in CallToolResult"
+                );
+                assert_eq!(response["result"]["isError"], true);
+                assert_eq!(response["result"]["content"][0]["text"], message);
+            } else {
+                match i {
+                    0 => assert_eq!(response["result"]["capabilities"]["events"], json!({})),
+                    1 => assert!(
+                        response["result"]["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|t| t["name"] == "read_delivery_diagnostics")
+                    ),
+                    6 => assert_eq!(response["error"]["code"], -32602),
+                    7 => assert_eq!(response["error"]["code"], -32601),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        assert_eq!(std::fs::read_dir(root.path())?.count(), 0);
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task).await???;
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_tool_is_discoverable_and_read_only() {
+        let tools = definitions();
+        let diagnostic = tools
+            .iter()
+            .find(|t| t["name"] == "read_delivery_diagnostics")
+            .unwrap();
+        assert_eq!(diagnostic["annotations"]["readOnlyHint"], true);
+        assert_eq!(diagnostic["annotations"]["destructiveHint"], false);
+        assert_eq!(diagnostic["inputSchema"]["required"], json!(["session_id"]));
+        assert_eq!(diagnostic["inputSchema"]["additionalProperties"], false);
+        assert_eq!(
+            diagnostic["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        // Exercise the same SDK conversion used when constructing the server.
+        let _: Vec<Tool> = serde_json::from_value(json!(tools)).unwrap();
+    }
 }

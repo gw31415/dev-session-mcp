@@ -59,7 +59,7 @@ if __name__ == '__main__':
             discovered = m.request('server/discover')['result']
             assert discovered['capabilities']['events'] == {}, discovered
             names = {t['name'] for t in m.request('tools/list')['result']['tools']}
-            assert names == {'open_session','list_sessions','close_session','start_execution','input_execution','resize_execution','signal_execution','read_execution','read_file','write_file','list_directory','get_image','import_file'}, names
+            assert names == {'open_session','list_sessions','close_session','start_execution','input_execution','resize_execution','signal_execution','read_execution','read_delivery_diagnostics','read_file','write_file','list_directory','get_image','import_file'}, names
             session = m.tool('open_session', cwd=str(project))['id']
             assert m.tool('open_session', cwd=str(project))['id'] == session
             assert m.tool('list_sessions')['executions'] == []
@@ -167,7 +167,7 @@ if __name__ == '__main__':
             else: raise AssertionError('broker must reap its managed child before removing the socket')
             m = MCP(state)
             m.tool('close_session',session_id=session)
-            print('PASS: stdio discovery/13 tools, sandbox files, separate pipes, PTY stdin/resize/signal, concurrency, frontend reconnect, PID/broker-epoch rejection, pipe EOF, independent backpressure signals, uncertain input receipt, bounded gap, private callback rejection, confirmed session close/terminal history, live broker shutdown')
+            print('PASS: stdio discovery/14 tools, sandbox files, separate pipes, PTY stdin/resize/signal, concurrency, frontend reconnect, PID/broker-epoch rejection, pipe EOF, independent backpressure signals, uncertain input receipt, bounded gap, private callback rejection, confirmed session close/terminal history, live broker shutdown')
         finally:
             if m.p.poll() is None: m.close()
             if (state/'broker.sock').exists(): broker(state,'shutdown')
