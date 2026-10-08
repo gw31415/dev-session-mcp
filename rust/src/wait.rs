@@ -30,11 +30,44 @@ fn response(mut data: Value, timed_out: bool) -> Value {
 }
 
 pub async fn execution(broker: &Client, args: Value) -> Result<Value> {
+    // Validate view even on timeout; observer position is never a detail ACK.
+    let view = args
+        .get("view")
+        .map(|v| v.as_str().context("invalid view"))
+        .transpose()?
+        .unwrap_or("detail");
+    ensure!(matches!(view, "summary" | "detail"), "invalid view");
+    ensure!(
+        view == "summary" || args.get("state_cursor").is_none(),
+        "state_cursor requires summary view"
+    );
+    for key in ["execution_id", "cursor"] {
+        crate::durable::short(&args, key, 128)?;
+    }
+    let mut observing = args.clone();
+    if let Some(cursor) = args.get("state_cursor") {
+        observing["cursor"] = cursor.clone();
+    }
+    let data = execution_detail(broker, observing).await?;
+    if view == "detail" {
+        return Ok(data);
+    }
+    let mut detail = snapshot(
+        broker,
+        &json!({"op":"read_execution","execution_id":args["execution_id"],"cursor":args["cursor"]}),
+    )
+    .await?;
+    detail["timed_out"] = data["timed_out"].clone();
+    crate::durable::project(detail, &args)
+}
+
+async fn execution_detail(broker: &Client, args: Value) -> Result<Value> {
     let object = args.as_object().context("expected arguments object")?;
     ensure!(
-        object
-            .keys()
-            .all(|key| matches!(key.as_str(), "execution_id" | "cursor" | "max_wait_ms")),
+        object.keys().all(|key| matches!(
+            key.as_str(),
+            "execution_id" | "cursor" | "max_wait_ms" | "view" | "state_cursor"
+        )),
         "unknown wait_execution argument"
     );
     for key in ["execution_id", "cursor"] {

@@ -11,15 +11,16 @@ Linux を複数プロジェクトの開発環境として使う独立した Rust
 | open_session, list_sessions, close_session | canonical cwd と permitted roots を持つ project metadata、実行一覧、管理対象の終了 |
 | start_execution | 明示した argv を一度開始。profile は必須の host / sandbox、io は pty / pipes |
 | input_execution, resize_execution, signal_execution | 明示した execution_id へ stdin、端末サイズ、INT / TERM / KILL |
-| read_execution | cursor による再接続・欠落回収。通常の更新は Events |
+| read_execution | 通常は `view:summary` で短い状態を取得。必要時にcursor差分detailを非破壊読取（互換用の既定値はdetail） |
+| checkpoint_execution | 読者別の詳細処理cursor・目的・完了条件をrevision CASで永続保存。[復旧契約](docs/DURABLE-RECOVERY.md) |
 | wait_execution | 指定execution/cursorから出力・状態・終了を上限付きで待つ独自の通常read-only tool。[契約・検証・次の試験](docs/WAIT-EXECUTION.md) |
 | read_delivery_diagnostics | 実行状態と通知停止を分離するread-only診断。lease期限・未確認batch・HTTP status/送信時間。詳細と残工程は[配信診断](docs/DELIVERY-DIAGNOSTICS.md) |
 | read_file, write_file, list_directory, get_image | 上限付きファイル操作。write は sandbox 内の許可 root のみ |
 | import_file | 正式 fileParams の bytes を保存。管理者が確認した HTTPS origin の設定が必要 |
 
-`open_session({"cwd":"/home/ubuntu/projects/example"})` は同じ canonical directory に同じ ID を返します。shell を自動起動しません。`start_execution({"session_id":"…","command":["/bin/bash"],"profile":"host","io":"pty"})` の返す execution_id を以後の操作に使います。ID は broker lifetime・実 PID・Linux process start ticks を含み、裸の PID や古い ID は拒否します。実行終了後の接続で command を再実行しません。
+`open_session({"cwd":"/home/ubuntu/projects/example"})` は同じ canonical directory に同じ ID を返します。shell を自動起動しません。`start_execution({"session_id":"…","command":["/bin/bash"],"profile":"host","io":"pty"})` の返す execution_id を以後の操作に使います。新しいIDはspawn前に保存するbroker epoch＋UUIDのopaque handleです。実 PID・Linux process start ticks は記録の別フィールドに保存します。裸のPIDや旧brokerの記録による実行制御は拒否し、保存済み履歴は読み取りで回収します。実行終了後の接続で command を再実行しません。
 
-単一 broker が子プロセス、実行状態、出力 journal を所有します。二重の JOBS map、selected/current job、暗黙の主 shell、編集 lock、強制 worktree、承認 console はありません。旧 execute/start/run、poll/read snapshots、stop aliases、HTTP/OAuth、legacy initialize は削除しました。MCP 2026-07-28 の `server/discover` と各 request の metadata を使います。
+単一 broker が子プロセス、実行状態、出力 journal を所有します。実行制御の所有者は1つです。selected/current job、暗黙の主 shell、編集 lock、強制 worktree、承認 console はありません。旧 execute/start/run、poll/read snapshots、stop aliases、HTTP/OAuth、legacy initialize は削除しました。MCP 2026-07-28 の `server/discover` と各 request の metadata を使います。
 
 ## Events と回収
 
@@ -37,7 +38,7 @@ PTY は stdout/stderr を terminal stream に合流し、ANSI を保持します
 
 同じ Ubuntu ユーザーを使う本人専用の trusted endpoint です。Tunnel runtime key と Events signing secrets を作業 command の環境へ継承せず、state directory は 0700、socket・秘密 store は 0600、Unix peer UID を検査します。ただし **同一 UID の host command は、読める credential file や Events store、同一 UID process の情報を読めます**。これは新 UID による秘密隔離を保証する設計ではありません。他人や信頼できない agent に公開しないでください。
 
-Tunnel / frontend の再起動を越えて broker と実行・journal を保持します。broker 自体の終了やホスト再起動では実行と journal を失います。Events subscription と未確認 batch は disk に保存し、frontend 再起動で再開します。broker lifetime が変わったら cursor gap を返します。daemon 化して別 process group に離脱した子孫は project 側で管理します。close_session は closing にして独立 signal 経路で終了を要求し、全管理 process の終了確認後に closed を返して metadata を削除します。5秒で確認できなければ closed:false/pending:true と metadata を残し、終了後に同じ close を再試行します。closing 中の新実行・編集は拒否します。終端の closing/exit/closed は既存 journal と実行記録、既存 Events lease で回収・配信できます。closed lease の期限は延長せず、追加の永続 tombstone は作りません。project ファイルは残します。
+Tunnel / frontend の再起動を越えて broker と実行・journal を保持します。broker 自体の終了やホスト再起動後、実行の継続は保証しません。新brokerはboundedなexecution/intent/log/checkpointを永続化し、終端未確認は `outcome_unknown` として保持します。[summary/detail・重複防止・容量上限・復旧契約](docs/DURABLE-RECOVERY.md)を参照してください。Events subscription と未確認 batch は disk に保存し、frontend 再起動で再開します。broker再起動後も旧epochの保存済み履歴を参照でき、履歴不足はgap、終端未確認は結果不明として返します。daemon 化して別 process group に離脱した子孫は project 側で管理します。close_session は closing にして独立 signal 経路で終了を要求し、全管理 process の終了確認後に closed を返して metadata を削除します。5秒で確認できなければ closed:false/pending:true と metadata を残し、終了後に同じ close を再試行します。closing 中の新実行・編集は拒否します。終端の closing/exit/closed は既存 journal と実行記録、既存 Events lease で回収・配信できます。closed lease の期限は延長しません。新しい復旧記録は購読のleaseとは独立して保持します。project ファイルは残します。
 
 ## Build と確認
 

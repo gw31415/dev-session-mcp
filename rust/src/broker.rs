@@ -45,17 +45,19 @@ struct Ledger {
     bytes: usize,
     executions: HashMap<String, Execution>,
     changed: Arc<Notify>,
+    durable: crate::durable::Store,
 }
 impl Ledger {
-    fn new() -> Self {
-        Self {
+    fn new() -> Result<Self> {
+        Ok(Self {
             epoch: uuid::Uuid::new_v4().simple().to_string(),
             sequence: 0,
             events: VecDeque::new(),
             bytes: 0,
             executions: HashMap::new(),
             changed: Arc::new(Notify::new()),
-        }
+            durable: crate::durable::Store::open(workspace::state_dir()?.join("recovery.json"))?,
+        })
     }
     fn append(&mut self, execution: &str, kind: &str, data: Value) -> u64 {
         self.sequence += 1;
@@ -64,6 +66,7 @@ impl Ledger {
         record.record["cursor"] = json!(format!("{}:{seq}", self.epoch));
         let event = json!({"sequence":seq,"execution_id":execution,"session_id":record.record["session_id"],"kind":kind,"timestamp":crate::events::timestamp(),"data":data});
         self.bytes += serde_json::to_vec(&event).unwrap().len();
+        self.durable.append(record.record.clone(), event.clone());
         self.events.push_back(event);
         while self.bytes > HISTORY_BYTES || self.events.len() > HISTORY_EVENTS {
             self.bytes -= serde_json::to_vec(&self.events.pop_front().unwrap())
@@ -76,6 +79,9 @@ impl Ledger {
     fn read(&self, args: &Value) -> Result<Value> {
         let execution = args.get("execution_id").and_then(Value::as_str);
         let session = args.get("session_id").and_then(Value::as_str);
+        if execution.is_some_and(|id| !self.executions.contains_key(id)) {
+            return self.durable.read(args);
+        }
         let record = execution
             .map(|id| {
                 self.executions
@@ -120,7 +126,7 @@ impl Ledger {
             end = seq;
         }
         Ok(
-            json!({"execution":record.map(|r|r.record.clone()),"events":events,"cursor":format!("{}:{end}",self.epoch),"earliest_cursor":format!("{}:{}",self.epoch,earliest.saturating_sub(1)),"catch_up_required":gap,"more":more}),
+            json!({"execution":record.map(|r|r.record.clone()),"events":events,"cursor":format!("{}:{end}",self.epoch),"earliest_cursor":format!("{}:{}",self.epoch,earliest.saturating_sub(1)),"catch_up_required":gap,"more":more,"persistence_ok":self.durable.healthy(),"durable_cursor":execution.map(|id| self.durable.durable_cursor(id)),"observed_cursor":format!("{}:{}",self.epoch,self.sequence)}),
         )
     }
 }
@@ -308,6 +314,28 @@ impl Input {
     }
 }
 async fn start(args: &Value, ledger: Shared) -> Result<Value> {
+    let mut canonical = args.clone();
+    canonical
+        .as_object_mut()
+        .context("expected arguments")?
+        .remove("op");
+    canonical.as_object_mut().unwrap().remove("idempotency_key");
+    if canonical.get("io").is_none() {
+        canonical["io"] = json!("pty");
+    }
+    let fingerprint = crate::durable::digest(&canonical)?;
+    let key = args
+        .get("idempotency_key")
+        .map(|_| -> Result<String> {
+            let key = crate::durable::short(args, "idempotency_key", 128)?;
+            crate::durable::digest(&json!([text(args, "session_id")?, key]))
+        })
+        .transpose()?;
+    if let Some(key) = &key {
+        if let Some(record) = ledger.lock().unwrap().durable.replay(key, &fingerprint)? {
+            return Ok(record);
+        }
+    }
     let session = config::load_session(text(args, "session_id")?).await?;
     ensure!(
         session.state == config::SessionState::Open,
@@ -359,7 +387,27 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
             anyhow::bail!("64 live executions reached; stop one before starting another");
         }
     }
-    // Reserve capacity before spawning; the start operation is serialized by the broker.
+    // Persist the recoverable ID before any spawn. A lost ACK must never cause a new child.
+    let id = format!("{}:{}", state.epoch, uuid::Uuid::new_v4().simple());
+    let work_id = if args.get("work_id").is_some() {
+        crate::durable::short(args, "work_id", 128)?
+    } else {
+        id.clone()
+    };
+    let purpose = args
+        .get("purpose")
+        .map(|_| crate::durable::short(args, "purpose", 2048))
+        .transpose()?;
+    let condition = args
+        .get("completion_condition")
+        .map(|_| crate::durable::short(args, "completion_condition", 2048))
+        .transpose()?;
+    let initial_cursor = format!("{}:{}", state.epoch, state.sequence);
+    let reserved = json!({"execution_id":id,"session_id":session.id,"work_id":work_id,
+        "purpose":purpose,"completion_condition":condition,"command":command,
+        "status":"starting","exit_code":null,"cursor":initial_cursor,"initial_cursor":initial_cursor,
+        "profile":profile,"io":io,"session_state":"open","stdin_closed":false});
+    state.durable.reserve(reserved.clone(), key, fingerprint)?;
     drop(state);
     let (mut child, mut input, readers) = if io == "pty" {
         let (pty, pts) = pty_process::open()?;
@@ -422,12 +470,15 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
         .to_owned();
     let (tx, mut rx) = mpsc::channel(8);
     let (signals, mut signal_rx) = mpsc::channel(8);
-    let id;
     let initial;
     {
         let mut state = ledger.lock().unwrap();
-        id = format!("{}:{pid}:{ticks}", state.epoch);
-        let record = json!({"execution_id":id,"session_id":session.id,"pid":pid,"profile":profile,"io":io,"status":"running","exit_code":null,"started_sequence":state.sequence+1,"session_state":"open","stdin_closed":false});
+        let mut record = reserved;
+        record.as_object_mut().unwrap().remove("command");
+        record["pid"] = json!(pid);
+        record["process_start_ticks"] = json!(ticks);
+        record["status"] = json!("running");
+        record["started_sequence"] = json!(state.sequence + 1);
         state.executions.insert(
             id.clone(),
             Execution {
@@ -498,23 +549,38 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
             }
         }
         drop(input);
+        let mut output_complete = true;
         for mut reader in pumps {
             if tokio::time::timeout(Duration::from_millis(500), &mut reader)
                 .await
                 .is_err()
             {
+                output_complete = false;
                 reader.abort();
             }
         }
-        let code = status.ok().and_then(|s| s.code());
+        use std::os::unix::process::ExitStatusExt;
+        let code = status.as_ref().ok().and_then(|s| s.code());
+        let signal = status.as_ref().ok().and_then(|s| s.signal());
+        let confirmed = status.is_ok();
         let mut state = held.lock().unwrap();
         if let Some(execution) = state.executions.get_mut(&owned_id) {
-            execution.record["status"] = json!("exited");
+            execution.record["status"] = json!(if confirmed {
+                "exited"
+            } else {
+                "outcome_unknown"
+            });
+            execution.record["exit_signal"] = json!(signal);
+            execution.record["output_complete"] = json!(output_complete);
             execution.record["stdin_closed"] = json!(true);
             execution.record["exit_code"] = json!(code);
         }
         state.append(&owned_id, "exit", json!({"exit_code":code}));
     });
+    ensure!(
+        ledger.lock().unwrap().durable.healthy(),
+        "start result persistence uncertain; retain execution ID via list_sessions, do not resend"
+    );
     Ok(initial)
 }
 fn apply_signal(ledger: &Shared, id: &str, pid: u32, signal: i32) {
@@ -548,9 +614,9 @@ async fn handle(
     shutdown: Arc<Notify>,
 ) -> Result<Value> {
     match text(&args, "op")? {
-        "ping" => {
-            Ok(json!({"pid":std::process::id(),"epoch":ledger.lock().unwrap().epoch,"protocol":2}))
-        }
+        "ping" => Ok(
+            json!({"pid":std::process::id(),"epoch":ledger.lock().unwrap().epoch,"protocol":2,"recovery":1}),
+        ),
         "shutdown" => {
             shutdown.notify_one();
             Ok(json!({"status":"stopping"}))
@@ -559,7 +625,25 @@ async fn handle(
             let _guard = starts.lock().await;
             let cwd = config::canonical_directory(Path::new(text(&args, "cwd")?))?;
             let session = config::create_session(&cwd, None).await?;
-            Ok(json!(session))
+            let state = ledger.lock().unwrap();
+            let mut value = json!(session);
+            value["executions"] = json!(
+                state
+                    .durable
+                    .records()
+                    .into_iter()
+                    .filter(|v| v["session_id"] == session.id)
+                    .collect::<Vec<_>>()
+            );
+            value["checkpoints"] = json!(
+                state
+                    .durable
+                    .checkpoints()
+                    .into_iter()
+                    .filter(|v| v["session_id"] == session.id)
+                    .collect::<Vec<_>>()
+            );
+            Ok(value)
         }
         "list_sessions" => {
             let mut entries = tokio::fs::read_dir(workspace::state_dir()?.join("sessions")).await?;
@@ -574,14 +658,10 @@ async fn handle(
                     sessions.push(data);
                 }
             }
-            let executions: Vec<_> = ledger
-                .lock()
-                .unwrap()
-                .executions
-                .values()
-                .map(|e| e.record.clone())
-                .collect();
-            Ok(json!({"sessions":sessions,"executions":executions}))
+            let state = ledger.lock().unwrap();
+            Ok(
+                json!({"sessions":sessions,"executions":state.durable.records(),"checkpoints":state.durable.checkpoints(),"persistence_ok":state.durable.healthy()}),
+            )
         }
         "inspect_session" => Ok(json!(
             config::load_session(text(&args, "session_id")?).await?
@@ -670,8 +750,21 @@ async fn handle(
         "event_position" => ledger.lock().unwrap().read(&args),
         "read_execution" => {
             text(&args, "execution_id")?;
-            ledger.lock().unwrap().read(&args)
+            let state = ledger.lock().unwrap();
+            let mut reading = args.clone();
+            if args["view"] == "summary" && args.get("cursor").is_none() {
+                reading["cursor"] = state.durable.record(text(&args, "execution_id")?)
+                    .context("execution unavailable; do not restart automatically")?["initial_cursor"].clone();
+            }
+            let data = state.read(&reading)?;
+            crate::durable::project(data, &args)
         }
+        "checkpoint_execution" => ledger.lock().unwrap().durable.checkpoint(&args),
+        "execution_source" => ledger
+            .lock()
+            .unwrap()
+            .durable
+            .source(text(&args, "execution_id")?),
         "wait_events" => loop {
             let notify = ledger.lock().unwrap().changed.clone();
             let notified = notify.notified();
@@ -801,7 +894,16 @@ pub async fn run() -> Result<()> {
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(state.join("broker.pid"), std::process::id().to_string())?;
-    let ledger = Arc::new(Mutex::new(Ledger::new()));
+    let ledger = Arc::new(Mutex::new(Ledger::new()?));
+    let flushing = ledger.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            interval.tick().await;
+            // Broker-owned output batching; never accesses any other service's state.
+            let _ = flushing.lock().unwrap().durable.flush();
+        }
+    });
     let starts = Arc::new(tokio::sync::Mutex::new(()));
     let shutdown = Arc::new(Notify::new());
     let slots = Arc::new(tokio::sync::Semaphore::new(32));

@@ -1,5 +1,7 @@
 # wait_execution — bounded ordinary tool
 
+追加のsummary view・state/detail cursor分離・永続復旧は [DURABLE-RECOVERY.md](DURABLE-RECOVERY.md) を参照。以下の既定detail契約は維持する。
+
 `wait_execution({"execution_id":"…","cursor":"epoch:sequence","max_wait_ms":1000})`
 
 指定executionの出力・状態event・終了を、通常の `tools/call` 応答として返す独自のread-only tool。HTTP通知のbatch・webhook・modelへの非同期配信を経由しない。公式Events streamingではなく、subscriptionや永続runnerも作らない。既存 `read_execution` / Events / stdin / executionの契約は変更しない。
@@ -12,7 +14,7 @@
 - 通常のtimeoutは最新snapshotに `timed_out:true` を加えて返す。deadline付近にevent・終了・gapを回収できた場合はfalse。timeoutは作業終了ではない。
 - 応答は既存の `execution, events, cursor, earliest_cursor, catch_up_required, more` と追加の `timed_out`。終了済みでも32KiBのpage制限があり、`more:true` なら残りを明示回収する。
 - cursorはbroker全体の `epoch:sequence`。他executionの更新だけでも返すcursorは進む。execution record内のcursorではなく、応答トップレベルのcursorを次回に渡す。同epoch内でsequence重複排除し、epochを跨いで同じsequenceを同一視しない。
-- journalは既存どおり全体1MiB/1024 events。`catch_up_required:true` は完全回収できない可能性を示し、保持分を返す。欠落の完全復元を約束しない。epoch変更後の旧execution_idはエラーであり、実行を自動再作成しない。
+- journalは既存どおり全体1MiB/1024 events。`catch_up_required:true` は完全回収できない可能性を示し、保持分を返す。欠落の完全復元を約束しない。旧brokerではepoch変更後の旧execution_idはエラー。永続復旧対応brokerでは保存済み記録を返し、終端未確認は `outcome_unknown` とする。どちらも実行を自動再作成しない。
 - caller cancelはSDKのrequest tokenで受け取り、future/socketをdropする。stdio EOFではrmcp 3.5.1が最大5秒の既存drainを行い、frontend終了時にsocketを閉じる（明示cancelの即解除とは異なる）。返答を受け取れなければ最後に受信済みのcursorから回収し、command/stdinは再送しない。
 - frontendごと最大4待機、超過は即エラー。内部は初回read＋最大1回wait＋timeout時readだけで、poll/retry loopはない。broker既存32接続上限も維持。多数frontend全体を跨ぐ予約枠保証はなく、飽和時はエラーをcallerへ返す。
 

@@ -60,8 +60,8 @@ fn definitions() -> Vec<Value> {
     );
     add(
         "start_execution",
-        "Start argv once. host uses FULL OS-user filesystem/network rights without approval; sandbox restricts writes to session roots and disables network, and requires io=pipes. PTY merges stdout/stderr. Subscribe to execution.events for batched push; read_execution is for reconnection/gaps. Returns the execution record. No automatic shell or implicit selected job.",
-        json!({"session_id":id,"command":{"type":"array","items":text,"minItems":1,"maxItems":256},"profile":{"type":"string","enum":["sandbox","host"]},"io":{"type":"string","enum":["pty","pipes"],"default":"pty"},"cwd":path}),
+        "Start argv once. Persist idempotency_key before sending; reuse only that key for an identical request to recover a lost ACK. Unknown outcomes never auto-restart. Optional work_id/purpose/completion_condition survive reconnect. host uses FULL OS-user filesystem/network rights without approval; sandbox restricts writes to session roots and disables network, and requires io=pipes. PTY merges stdout/stderr. Subscribe to execution.events for batched push; read_execution is for reconnection/gaps. Returns the execution record. No automatic shell or implicit selected job.",
+        json!({"session_id":id,"command":{"type":"array","items":text,"minItems":1,"maxItems":256},"profile":{"type":"string","enum":["sandbox","host"]},"io":{"type":"string","enum":["pty","pipes"],"default":"pty"},"cwd":path,"idempotency_key":id,"work_id":id,"purpose":{"type":"string","maxLength":2048},"completion_condition":{"type":"string","maxLength":2048}}),
         &["session_id", "command", "profile"],
         false,
     );
@@ -88,15 +88,15 @@ fn definitions() -> Vec<Value> {
     );
     add(
         "read_execution",
-        "Recover execution state and sequenced output after reconnect or an event gap. Pass the last cursor; deduplicate by sequence. History is bounded, catch_up_required marks loss, more means another bounded page remains. This is a recovery API; ordinary updates arrive through Events.",
-        json!({"execution_id":id,"cursor":id}),
+        "Use view=summary for compact state without consuming detail; view=detail (legacy default) reads sequenced output. Recover execution state after reconnect or an event gap. Pass the last cursor; deduplicate by sequence. History is bounded, catch_up_required marks loss, more means another bounded page remains. This is a recovery API; ordinary updates arrive through Events.",
+        json!({"execution_id":id,"cursor":id,"view":{"type":"string","enum":["summary","detail"],"default":"detail"}}),
         &["execution_id"],
         true,
     );
     add(
         "wait_execution",
-        "Bounded ordinary read-only tool, not Events streaming. Return output/state/exit after the required cursor, or immediately if terminal or a gap exists. max_wait_ms defaults to 1000 (0..10000); snapshots add at most 2000 ms transport budget. Timeout returns state and cursor with timed_out=true. Preserve global epoch:sequence cursors, deduplicate by sequence, and drain more pages explicitly. No automatic repeat, execution or stdin resend.",
-        json!({"execution_id":id,"cursor":id,"max_wait_ms":{"type":"integer","minimum":0,"maximum":10000,"default":1000}}),
+        "Use view=summary for compact updates; cursor is processed detail position, state_cursor optionally resumes observation independently. Default detail preserves legacy output. Bounded ordinary read-only tool, not Events streaming. Return output/state/exit after the required cursor, or immediately if terminal or a gap exists. max_wait_ms defaults to 1000 (0..10000); detail snapshots add at most 2000 ms transport budget; summary adds one snapshot and a capability probe (4000 ms total transport budget). Timeout returns state and cursor with timed_out=true. Preserve global epoch:sequence cursors, deduplicate by sequence, and drain more pages explicitly. No automatic repeat, execution or stdin resend.",
+        json!({"execution_id":id,"cursor":id,"state_cursor":id,"view":{"type":"string","enum":["summary","detail"],"default":"detail"},"max_wait_ms":{"type":"integer","minimum":0,"maximum":10000,"default":1000}}),
         &["execution_id", "cursor"],
         true,
     );
@@ -135,12 +135,78 @@ fn definitions() -> Vec<Value> {
         &["session_id", "path"],
         true,
     );
+    add(
+        "checkpoint_execution",
+        "Persist this reader's processed detail cursor and work purpose/completion condition using expected_revision (0 creates). CAS conflicts require reading list_sessions/open_session or the recovery resource. Reads never acknowledge output. Does not execute commands, resend stdin, or mark the work complete.",
+        json!({"execution_id":id,"reader_id":id,"cursor":id,"expected_revision":{"type":"integer","minimum":0},"purpose":{"type":"string","maxLength":2048},"completion_condition":{"type":"string","maxLength":2048}}),
+        &["execution_id", "reader_id", "cursor", "expected_revision"],
+        false,
+    );
+    tools.last_mut().unwrap()["annotations"]["destructiveHint"] = json!(false);
     tools.push(crate::files::tool());
     tools
 }
+async fn require_recovery(broker: &Client) -> anyhow::Result<()> {
+    let info = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        broker.call(json!({"op":"ping"})),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("broker capability check timed out; no command sent"))??;
+    anyhow::ensure!(
+        info["recovery"] == 1,
+        "broker does not support durable recovery; no command sent. Legacy detail tools remain available"
+    );
+    Ok(())
+}
+fn resource_args(uri: &str) -> anyhow::Result<Value> {
+    use anyhow::ensure;
+    ensure!(uri.len() <= 1024, "resource URI too long");
+    let url = url::Url::parse(uri)?;
+    ensure!(
+        url.scheme() == "dev-session" && url.host_str().is_none() && url.fragment().is_none(),
+        "invalid recovery URI"
+    );
+    if url.path() == "/recovery" {
+        ensure!(url.query().is_none(), "unexpected query");
+        return Ok(json!({"op":"list_sessions"}));
+    }
+    let mut args = if let Some(id) = url.path().strip_prefix("/executions/") {
+        json!({"op":"read_execution","execution_id":id})
+    } else if let Some(id) = url.path().strip_prefix("/source/") {
+        ensure!(url.query().is_none(), "unexpected source query");
+        json!({"op":"execution_source","execution_id":id})
+    } else {
+        anyhow::bail!("unknown recovery resource")
+    };
+    let encoded = format!("id={}", args["execution_id"].as_str().unwrap());
+    let decoded = url::form_urlencoded::parse(encoded.as_bytes())
+        .next()
+        .unwrap()
+        .1
+        .into_owned();
+    ensure!(
+        !decoded.is_empty()
+            && decoded.len() <= 128
+            && decoded
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-')),
+        "invalid execution resource ID"
+    );
+    args["execution_id"] = json!(decoded);
+    let mut seen = std::collections::HashSet::new();
+    for (key, value) in url.query_pairs() {
+        ensure!(
+            matches!(key.as_ref(), "cursor" | "view") && seen.insert(key.to_string()),
+            "invalid resource query"
+        );
+        args[key.as_ref()] = json!(value);
+    }
+    Ok(args)
+}
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(Implementation::new(env!("CARGO_PKG_NAME"),env!("CARGO_PKG_VERSION"))).with_instructions("Explicit project sessions and executions. Use execution.events subscriptions for batched output/state/exit; read_execution only for catch-up. Alternatively use wait_execution for one bounded ordinary tool response; it does not automatically continue work. Host execution has full OS-user rights; sandbox execution disables network. Input acceptance is not an application acknowledgement. No implicit shell, default execution, or legacy API.")
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build()).with_server_info(Implementation::new(env!("CARGO_PKG_NAME"),env!("CARGO_PKG_VERSION"))).with_instructions("Explicit project sessions and executions. Prefer read_execution/wait_execution view=summary; fetch detail only when needed. Keep state_cursor separate from processed detail cursor. Persist reader progress with checkpoint_execution CAS. On uncertain start/input results, never blindly resend; recover by IDs or idempotency_key through list_sessions/open_session. Existing execution.events subscriptions are optional. Alternatively use wait_execution for one bounded ordinary tool response; it does not automatically continue work. Host execution has full OS-user rights; sandbox execution disables network. Input acceptance is not an application acknowledgement. No implicit shell, default execution, or legacy API.")
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tools.iter().find(|t| t.name == name).cloned()
@@ -164,9 +230,56 @@ impl ServerHandler for Server {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
-        let mut result = ListToolsResult::default();
+        let mut result = ListToolsResult::default()
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private);
         result.tools = self.tools.clone();
         Ok(result)
+    }
+    async fn list_resources(
+        &self,
+        _: Option<PaginatedRequestParams>,
+        _: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListResourcesResult, McpError> {
+        let mut result = ListResourcesResult::default()
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private);
+        result.resources = vec![
+            Resource::new("dev-session:///recovery", "Execution recovery index")
+                .with_mime_type("application/json"),
+        ];
+        Ok(result)
+    }
+    async fn list_resource_templates(
+        &self,
+        _: Option<PaginatedRequestParams>,
+        _: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListResourceTemplatesResult, McpError> {
+        serde_json::from_value(json!({"resultType":"complete","ttlMs":0,"cacheScope":"private","resourceTemplates":[
+            {"uriTemplate":"dev-session:///executions/{execution_id}{?cursor,view}","name":"Execution state or bounded detail","mimeType":"application/json"},
+            {"uriTemplate":"dev-session:///source/{execution_id}","name":"Original execution argv","mimeType":"application/json"}
+        ]})).map_err(|_| McpError::internal_error("invalid resource templates",None))
+    }
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _: RequestContext<RoleServer>,
+    ) -> std::result::Result<ReadResourceResponse, McpError> {
+        require_recovery(&self.broker)
+            .await
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let args = resource_args(&request.uri)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let data = self.broker.call(args).await.map_err(|e| {
+            McpError::invalid_params(workspace::bounded(&e.to_string(), 1024, false).0, None)
+        })?;
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            serde_json::to_string(&data).unwrap(),
+            request.uri,
+        )])
+        .with_ttl_ms(0)
+        .with_cache_scope(CacheScope::Private)
+        .into())
     }
     async fn call_tool(
         &self,
@@ -177,6 +290,24 @@ impl ServerHandler for Server {
             return Err(McpError::invalid_params("unknown tool", None));
         }
         let mut args = json!(request.arguments.unwrap_or_default());
+        let needs_recovery = request.name == "checkpoint_execution"
+            || [
+                "idempotency_key",
+                "work_id",
+                "purpose",
+                "completion_condition",
+                "state_cursor",
+            ]
+            .iter()
+            .any(|key| args.get(key).is_some())
+            || args["view"] == "summary";
+        if needs_recovery {
+            if let Err(error) = require_recovery(&self.broker).await {
+                return Ok(
+                    CallToolResult::error(vec![ContentBlock::text(error.to_string())]).into(),
+                );
+            }
+        }
         let response = if request.name == "wait_execution" {
             tokio::select! {
                 biased;

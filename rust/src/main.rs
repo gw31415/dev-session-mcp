@@ -1,6 +1,7 @@
 mod base;
 use base::{config, sandbox};
 mod broker;
+mod durable;
 mod events;
 mod files;
 mod server;
