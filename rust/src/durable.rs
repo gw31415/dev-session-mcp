@@ -148,6 +148,26 @@ impl Store {
                         .is_some_and(|id| data.records.contains_key(id)),
                 "invalid reader checkpoint"
             );
+            let record = data
+                .records
+                .get_mut(checkpoint["execution_id"].as_str().unwrap())
+                .unwrap();
+            ensure!(
+                checkpoint["session_id"] == record["session_id"]
+                    && checkpoint["work_id"] == record["work_id"],
+                "checkpoint execution binding mismatch"
+            );
+            // Older v1/v2 snapshots may hold intent only in the checkpoint.
+            // Recover its durable pin before a reader can move to another phase.
+            record["retain_work"] = json!(true);
+            for field in ["purpose", "completion_condition"] {
+                let metadata = short(checkpoint, field, 2048)?;
+                if !record[field].is_string() {
+                    record[field] = json!(metadata);
+                }
+            }
+            // Repair retention metadata without inferring completion. Preserve
+            // existing completion evidence, but never synthesize it on load.
         }
         // Marker first: a crash during initial snapshot creation fails closed on restart.
         if !marker.exists() {
@@ -875,6 +895,78 @@ mod tests {
         drop(store);
         let store = Store::open(path)?;
         assert_eq!(store.checkpoints()[0]["completed"], false);
+        Ok(())
+    }
+    #[test]
+    fn legacy_checkpoint_intent_survives_migration_reader_move_and_retirement() -> Result<()> {
+        for version in [1, 2] {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join("recovery.json");
+            let mut store = Store::open(path.clone())?;
+            store.reserve(record("original", "exited"), None, "hash".into())?;
+            store.checkpoint(&json!({"execution_id":"original","reader_id":"owner","cursor":"epoch:0","expected_revision":0,
+                "purpose":"legacy purpose","completion_condition":"legacy condition"}))?;
+            drop(store);
+            // Model old metadata-free starts whose intent existed only in a checkpoint.
+            let mut snapshot: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            snapshot["version"] = json!(version);
+            let original = snapshot["records"]["original"].as_object_mut().unwrap();
+            for field in ["purpose", "completion_condition", "work_completed"] {
+                original.remove(field);
+            }
+            original.insert("retain_work".into(), json!(false));
+            if version == 1 {
+                for field in ["generation", "legacy_keys", "epoch_positions", "retired"] {
+                    snapshot.as_object_mut().unwrap().remove(field);
+                }
+            }
+            std::fs::write(&path, serde_json::to_vec(&snapshot)?)?;
+            let mut store = Store::open(path.clone())?;
+            assert_eq!(store.data.version, 2);
+            assert_eq!(store.record("original").unwrap()["retain_work"], true);
+            assert_ne!(store.record("original").unwrap()["work_completed"], true);
+            let mut next = record("next", "exited");
+            next["work_id"] = json!("original");
+            store.reserve(next, None, "hash".into())?;
+            store.checkpoint(&json!({"execution_id":"next","reader_id":"owner","cursor":"epoch:0","expected_revision":1}))?;
+            for n in 0..RECORDS + 2 {
+                store.reserve(
+                    record(&format!("filler-{n}"), "exited"),
+                    None,
+                    "hash".into(),
+                )?;
+            }
+            drop(store);
+            let mut store = Store::open(path.clone())?;
+            store.reserve(record("after-restart", "exited"), None, "hash".into())?;
+            let original = store
+                .record("original")
+                .expect("legacy unfinished phase lost");
+            assert_eq!(original["retain_work"], true);
+            assert_eq!(original["purpose"], "legacy purpose");
+            assert_eq!(original["completion_condition"], "legacy condition");
+            assert_ne!(original["work_completed"], true);
+            assert!(
+                !store
+                    .checkpoints()
+                    .iter()
+                    .any(|cp| cp["execution_id"] == "original")
+            );
+            store.checkpoint(&json!({"execution_id":"original","reader_id":"finisher","cursor":"epoch:0","expected_revision":0,"completed":true}))?;
+            store.reserve(record("after-completion", "exited"), None, "hash".into())?;
+            assert!(store.record("original").is_none());
+            assert!(store.record("next").is_some());
+            // Do not attach checkpoint intent to an unrelated execution on load.
+            let cp = snapshot["checkpoints"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap();
+            cp["work_id"] = json!("unrelated");
+            std::fs::write(&path, serde_json::to_vec(&snapshot)?)?;
+            assert!(Store::open(path).is_err());
+        }
         Ok(())
     }
     #[test]

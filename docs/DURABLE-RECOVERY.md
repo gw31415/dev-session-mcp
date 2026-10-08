@@ -154,7 +154,10 @@ A new legacy-key miss is accepted only until the first compaction; thereafter it
 rejected permanently. Fresh keyed operations must use the advertised generation.
 Existing tools-only clients that do not use keys can keep starting fresh commands;
 they still must not blindly resend after a lost ACK. Existing version-1 snapshots
-migrate to version 2 with their old intents intact. No production state is migrated by
+migrate to version 2 with their old intents intact. Loading v1 or older v2 snapshots
+also promotes executions referenced by existing checkpoints and restores missing work
+metadata from those checkpoints after checking their session/work binding. Loading
+does not infer completion. No production state is migrated by
 these local tests.
 
 Storage failures disable further starts and checkpoint mutations for that broker
@@ -253,7 +256,7 @@ launched with a temporary socket; no existing broker process was contacted.
 
 | Check | Result |
 | --- | --- |
-| `cargo test --locked --offline ... -- --test-threads=1` | 29 passed, 0 failed (including late checkpoint promotion, both stdin commit phases and retirement fault injection) |
+| `cargo test --locked --offline ... -- --test-threads=1` (checkpoint-promotion validation) | 29 passed, 0 failed (including late checkpoint promotion, both stdin commit phases and retirement fault injection) |
 | `cargo build --locked --offline ...` | Passed |
 | `tests/recovery_stdio.py NEW OLD` | Passed; start/input/checkpoint ACK loss, two readers, Resources including escaped URIs, restart, unknown result, 400 starts, retired-key refusal, real unsent stdin, old-broker guard |
 | `tests/wait_execution_stdio.py NEW` | Passed |
@@ -261,6 +264,7 @@ launched with a temporary socket; no existing broker process was contacted.
 | `tests/delivery_diagnostics_stdio.py NEW` | Passed |
 | `tests/stdio.py NEW` | Passed; existing catalog expectation updated to 16 tools |
 | `tests/io_control.py NEW` | Passed |
+| `cargo test --locked --offline ... durable::tests:: -- --test-threads=1` (snapshot normalization) | 15 passed; v1/v2 checkpoint intent survives reader move, retention pressure and restart until explicit completion; mismatched binding rejected |
 | `cargo fmt -- --check`, `git diff --check` | Passed |
 
 Build environment: `CARGO_INCREMENTAL=0`, `RUSTC_WRAPPER=`,
