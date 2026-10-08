@@ -60,8 +60,8 @@ fn definitions() -> Vec<Value> {
     );
     add(
         "start_execution",
-        "Start argv once. Persist idempotency_key before sending; reuse only that key for an identical request to recover a lost ACK. Unknown outcomes never auto-restart. Optional work_id/purpose/completion_condition survive reconnect. host uses FULL OS-user filesystem/network rights without approval; sandbox restricts writes to session roots and disables network, and requires io=pipes. PTY merges stdout/stderr. Subscribe to execution.events for batched push; read_execution is for reconnection/gaps. Returns the execution record. No automatic shell or implicit selected job.",
-        json!({"session_id":id,"command":{"type":"array","items":text,"minItems":1,"maxItems":256},"profile":{"type":"string","enum":["sandbox","host"]},"io":{"type":"string","enum":["pty","pipes"],"default":"pty"},"cwd":path,"idempotency_key":id,"work_id":id,"purpose":{"type":"string","maxLength":2048},"completion_condition":{"type":"string","maxLength":2048}}),
+        "Start argv once. Persist idempotency_key and recovery.key_generation from list/open before sending; reuse only that pair for an identical request to recover a lost ACK. Unknown outcomes never auto-restart. Optional work_id/purpose/completion_condition survive reconnect. host uses FULL OS-user filesystem/network rights without approval; sandbox restricts writes to session roots and disables network, and requires io=pipes. PTY merges stdout/stderr. Subscribe to execution.events for batched push; read_execution is for reconnection/gaps. Returns the execution record. No automatic shell or implicit selected job.",
+        json!({"session_id":id,"command":{"type":"array","items":text,"minItems":1,"maxItems":256},"profile":{"type":"string","enum":["sandbox","host"]},"io":{"type":"string","enum":["pty","pipes"],"default":"pty"},"cwd":path,"idempotency_key":id,"key_generation":id,"work_id":id,"purpose":{"type":"string","maxLength":2048},"completion_condition":{"type":"string","maxLength":2048}}),
         &["session_id", "command", "profile"],
         false,
     );
@@ -137,12 +137,11 @@ fn definitions() -> Vec<Value> {
     );
     add(
         "checkpoint_execution",
-        "Persist this reader's processed detail cursor and work purpose/completion condition using expected_revision (0 creates). CAS conflicts require reading list_sessions/open_session or the recovery resource. Reads never acknowledge output. Does not execute commands, resend stdin, or mark the work complete.",
-        json!({"execution_id":id,"reader_id":id,"cursor":id,"expected_revision":{"type":"integer","minimum":0},"purpose":{"type":"string","maxLength":2048},"completion_condition":{"type":"string","maxLength":2048}}),
+        "Persist this reader's processed detail cursor and work purpose/completion condition using expected_revision (0 creates). CAS conflicts require reading list_sessions/open_session or the recovery resource. Reads never acknowledge output. Set completed=true only after verifying work completion and confirmed process exit; this allows eventual history retirement. Does not execute commands or resend stdin.",
+        json!({"execution_id":id,"reader_id":id,"cursor":id,"completed":{"type":"boolean"},"expected_revision":{"type":"integer","minimum":0},"purpose":{"type":"string","maxLength":2048},"completion_condition":{"type":"string","maxLength":2048}}),
         &["execution_id", "reader_id", "cursor", "expected_revision"],
         false,
     );
-    tools.last_mut().unwrap()["annotations"]["destructiveHint"] = json!(false);
     tools.push(crate::files::tool());
     tools
 }
@@ -154,8 +153,8 @@ async fn require_recovery(broker: &Client) -> anyhow::Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("broker capability check timed out; no command sent"))??;
     anyhow::ensure!(
-        info["recovery"] == 1,
-        "broker does not support durable recovery; no command sent. Legacy detail tools remain available"
+        info["recovery"] == 2,
+        "broker lacks recovery v2; no command sent. Legacy detail tools remain available"
     );
     Ok(())
 }
@@ -206,7 +205,7 @@ fn resource_args(uri: &str) -> anyhow::Result<Value> {
 }
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build()).with_server_info(Implementation::new(env!("CARGO_PKG_NAME"),env!("CARGO_PKG_VERSION"))).with_instructions("Explicit project sessions and executions. Prefer read_execution/wait_execution view=summary; fetch detail only when needed. Keep state_cursor separate from processed detail cursor. Persist reader progress with checkpoint_execution CAS. On uncertain start/input results, never blindly resend; recover by IDs or idempotency_key through list_sessions/open_session. Existing execution.events subscriptions are optional. Alternatively use wait_execution for one bounded ordinary tool response; it does not automatically continue work. Host execution has full OS-user rights; sandbox execution disables network. Input acceptance is not an application acknowledgement. No implicit shell, default execution, or legacy API.")
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build()).with_server_info(Implementation::new(env!("CARGO_PKG_NAME"),env!("CARGO_PKG_VERSION"))).with_instructions("Explicit project sessions and executions. Prefer read_execution/wait_execution view=summary; fetch detail only when needed. Keep state_cursor separate from processed detail cursor. Persist reader progress with checkpoint_execution CAS; explicitly complete verified work so history can retire. Persist the start key with its key_generation; never refresh an expired generation to retry an old request. On uncertain start/input results, never blindly resend; recover by IDs or idempotency_key through list_sessions/open_session. Existing execution.events subscriptions are optional. Alternatively use wait_execution for one bounded ordinary tool response; it does not automatically continue work. Host execution has full OS-user rights; sandbox execution disables network. Input acceptance is not an application acknowledgement. No implicit shell, default execution, or legacy API.")
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tools.iter().find(|t| t.name == name).cloned()
@@ -293,6 +292,7 @@ impl ServerHandler for Server {
         let needs_recovery = request.name == "checkpoint_execution"
             || [
                 "idempotency_key",
+                "key_generation",
                 "work_id",
                 "purpose",
                 "completion_condition",

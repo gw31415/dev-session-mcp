@@ -60,13 +60,17 @@ impl Ledger {
         })
     }
     fn append(&mut self, execution: &str, kind: &str, data: Value) -> u64 {
+        let _ = self.append_checked(execution, kind, data);
+        self.sequence
+    }
+    fn append_checked(&mut self, execution: &str, kind: &str, data: Value) -> Result<u64> {
         self.sequence += 1;
         let seq = self.sequence;
         let record = self.executions.get_mut(execution).expect("owned execution");
         record.record["cursor"] = json!(format!("{}:{seq}", self.epoch));
         let event = json!({"sequence":seq,"execution_id":execution,"session_id":record.record["session_id"],"kind":kind,"timestamp":crate::events::timestamp(),"data":data});
         self.bytes += serde_json::to_vec(&event).unwrap().len();
-        self.durable.append(record.record.clone(), event.clone());
+        let persisted = self.durable.append(record.record.clone(), event.clone());
         self.events.push_back(event);
         while self.bytes > HISTORY_BYTES || self.events.len() > HISTORY_EVENTS {
             self.bytes -= serde_json::to_vec(&self.events.pop_front().unwrap())
@@ -74,11 +78,18 @@ impl Ledger {
                 .len();
         }
         self.changed.notify_waiters();
-        seq
+        persisted?;
+        Ok(seq)
     }
     fn read(&self, args: &Value) -> Result<Value> {
         let execution = args.get("execution_id").and_then(Value::as_str);
         let session = args.get("session_id").and_then(Value::as_str);
+        if let Some(id) = execution {
+            ensure!(
+                self.durable.record(id).is_some(),
+                "execution history unavailable or retired; never restart automatically"
+            );
+        }
         if execution.is_some_and(|id| !self.executions.contains_key(id)) {
             return self.durable.read(args);
         }
@@ -320,6 +331,15 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
         .context("expected arguments")?
         .remove("op");
     canonical.as_object_mut().unwrap().remove("idempotency_key");
+    canonical.as_object_mut().unwrap().remove("key_generation");
+    let generation = args
+        .get("key_generation")
+        .map(|_| crate::durable::short(args, "key_generation", 128))
+        .transpose()?;
+    ensure!(
+        generation.is_none() || args.get("idempotency_key").is_some(),
+        "key_generation requires idempotency_key"
+    );
     if canonical.get("io").is_none() {
         canonical["io"] = json!("pty");
     }
@@ -328,11 +348,21 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
         .get("idempotency_key")
         .map(|_| -> Result<String> {
             let key = crate::durable::short(args, "idempotency_key", 128)?;
-            crate::durable::digest(&json!([text(args, "session_id")?, key]))
+            if let Some(generation) = &generation {
+                crate::durable::digest(&json!([text(args, "session_id")?, generation, key]))
+            } else {
+                crate::durable::digest(&json!([text(args, "session_id")?, key]))
+            }
         })
         .transpose()?;
     if let Some(key) = &key {
-        if let Some(record) = ledger.lock().unwrap().durable.replay(key, &fingerprint)? {
+        if let Some(record) =
+            ledger
+                .lock()
+                .unwrap()
+                .durable
+                .replay(key, &fingerprint, generation.as_deref())?
+        {
             return Ok(record);
         }
     }
@@ -403,11 +433,21 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
         .map(|_| crate::durable::short(args, "completion_condition", 2048))
         .transpose()?;
     let initial_cursor = format!("{}:{}", state.epoch, state.sequence);
+    let retain_work = ["work_id", "purpose", "completion_condition"]
+        .iter()
+        .any(|key| args.get(key).is_some());
     let reserved = json!({"execution_id":id,"session_id":session.id,"work_id":work_id,
         "purpose":purpose,"completion_condition":condition,"command":command,
         "status":"starting","exit_code":null,"cursor":initial_cursor,"initial_cursor":initial_cursor,
-        "profile":profile,"io":io,"session_state":"open","stdin_closed":false});
+        "retain_work":retain_work,
+        "profile":profile,"io":io,"session_state":"open","stdin_closed":false,"key_generation":generation});
     state.durable.reserve(reserved.clone(), key, fingerprint)?;
+    let Ledger {
+        executions,
+        durable,
+        ..
+    } = &mut *state;
+    executions.retain(|id, _| durable.record(id).is_some());
     drop(state);
     let (mut child, mut input, readers) = if io == "pty" {
         let (pty, pts) = pty_process::open()?;
@@ -479,6 +519,7 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
         record["process_start_ticks"] = json!(ticks);
         record["status"] = json!("running");
         record["started_sequence"] = json!(state.sequence + 1);
+        record["start_cursor"] = json!(format!("{}:{}", state.epoch, state.sequence + 1));
         state.executions.insert(
             id.clone(),
             Execution {
@@ -615,7 +656,7 @@ async fn handle(
 ) -> Result<Value> {
     match text(&args, "op")? {
         "ping" => Ok(
-            json!({"pid":std::process::id(),"epoch":ledger.lock().unwrap().epoch,"protocol":2,"recovery":1}),
+            json!({"pid":std::process::id(),"epoch":ledger.lock().unwrap().epoch,"protocol":2,"recovery":2}),
         ),
         "shutdown" => {
             shutdown.notify_one();
@@ -627,6 +668,7 @@ async fn handle(
             let session = config::create_session(&cwd, None).await?;
             let state = ledger.lock().unwrap();
             let mut value = json!(session);
+            value["recovery"] = state.durable.recovery_info();
             value["executions"] = json!(
                 state
                     .durable
@@ -660,7 +702,7 @@ async fn handle(
             }
             let state = ledger.lock().unwrap();
             Ok(
-                json!({"sessions":sessions,"executions":state.durable.records(),"checkpoints":state.durable.checkpoints(),"persistence_ok":state.durable.healthy()}),
+                json!({"sessions":sessions,"executions":state.durable.records(),"checkpoints":state.durable.checkpoints(),"persistence_ok":state.durable.healthy(),"recovery":state.durable.recovery_info()}),
             )
         }
         "inspect_session" => Ok(json!(
@@ -844,14 +886,40 @@ async fn handle(
                     ensure!(bytes.is_empty() && close, "stdin is closed");
                     return Ok(execution.record.clone());
                 }
-                let seq = state.append(
-                    id,
-                    "input",
-                    json!({"delivery":"accepted","bytes":bytes.len(),"close_stdin":close}),
-                );
-                state.executions.get_mut(id).unwrap().record["input"] =
-                    json!({"sequence":seq,"delivery":"accepted","close_stdin":close});
-                Action::Input(bytes, seq, close)
+                let seq = state.sequence + 1;
+                state.executions.get_mut(id).unwrap().record["input"] = json!({"sequence":seq,"delivery":"prepared","queued":false,"close_stdin":close});
+                if state.append_checked(id, "input", json!({"input_sequence":seq,"delivery":"prepared","bytes":bytes.len(),"close_stdin":close})).is_err() {
+                    let receipt = &mut state.executions.get_mut(id).unwrap().record["input"];
+                    receipt["delivery"] = json!("not_sent");
+                    receipt["receipt_durable"] = Value::Null;
+                    state.append(id,"input",json!({"input_sequence":seq,"delivery":"not_sent","queued":false}));
+                    anyhow::bail!("stdin not sent: durable receipt commit failed; queued=false. A prepared receipt recovered after restart is delivery_unknown; do not resend automatically");
+                }
+                permit.send(Action::Input(bytes, seq, close));
+                let receipt = &mut state.executions.get_mut(id).unwrap().record["input"];
+                receipt["delivery"] = json!("accepted");
+                receipt["queued"] = json!(true);
+                receipt["receipt_durable"] = json!(true);
+                if state
+                    .append_checked(
+                        id,
+                        "input",
+                        json!({"input_sequence":seq,"delivery":"accepted","queued":true}),
+                    )
+                    .is_err()
+                {
+                    state.executions.get_mut(id).unwrap().record["input"]["delivery"] =
+                        json!("delivery_unknown");
+                    state.append(
+                        id,
+                        "input",
+                        json!({"input_sequence":seq,"delivery":"delivery_unknown","queued":true}),
+                    );
+                    anyhow::bail!(
+                        "stdin delivery_unknown: durable preparation succeeded and input was queued, but queue receipt commit failed; do not resend"
+                    );
+                }
+                return Ok(state.executions[id].record.clone());
             } else {
                 ensure!(execution.record["io"] == "pty", "resize requires a PTY");
                 let rows = args["rows"].as_u64().context("missing rows")?;
@@ -986,4 +1054,138 @@ pub async fn run() -> Result<()> {
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(state.join("broker.pid"));
     Ok(())
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::durable::{Store, WriteFault};
+
+    fn input_fixture(path: PathBuf) -> Result<(Shared, mpsc::Receiver<Action>)> {
+        let record = json!({"execution_id":"fixture","session_id":"session","work_id":"work",
+            "cursor":"epoch:0","initial_cursor":"epoch:0","status":"running","io":"pipes",
+            "session_state":"open","stdin_closed":false,"command":["/bin/cat"]});
+        let mut durable = Store::open(path)?;
+        durable.reserve(record.clone(), None, "hash".into())?;
+        let (actions, rx) = mpsc::channel(8);
+        let (signals, _) = mpsc::channel(8);
+        let ledger = Ledger {
+            epoch: "epoch".into(),
+            sequence: 0,
+            events: VecDeque::new(),
+            bytes: 0,
+            executions: HashMap::from([(
+                "fixture".into(),
+                Execution {
+                    record,
+                    actions,
+                    signals,
+                },
+            )]),
+            changed: Arc::new(Notify::new()),
+            durable,
+        };
+        Ok((Arc::new(Mutex::new(ledger)), rx))
+    }
+    async fn input(ledger: Shared) -> Result<Value> {
+        handle(json!({"op":"input_execution","execution_id":"fixture","text":"ONCE","close_stdin":true}),
+            ledger, Arc::new(tokio::sync::Mutex::new(())),Arc::new(Notify::new())).await
+    }
+    #[tokio::test]
+    async fn input_requires_durable_preparation_at_every_storage_boundary() -> Result<()> {
+        for stage in [
+            WriteFault::Disk,
+            WriteFault::Fsync,
+            WriteFault::Rename,
+            WriteFault::DirectoryFsync,
+        ] {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join("recovery.json");
+            let (ledger, mut rx) = input_fixture(path.clone())?;
+            ledger.lock().unwrap().durable.fail_write(stage, 0);
+            let error = input(ledger.clone()).await.unwrap_err();
+            assert!(error.to_string().contains("stdin not sent"), "{stage:?}");
+            assert!(
+                rx.try_recv().is_err(),
+                "input was queued after {stage:?} failure"
+            );
+            let state = ledger.lock().unwrap();
+            assert!(!state.durable.healthy());
+            assert_eq!(
+                state.executions["fixture"].record["input"]["delivery"],
+                "not_sent"
+            );
+            drop(state);
+            let restarted = Store::open(path)?;
+            if stage == WriteFault::DirectoryFsync {
+                // Rename succeeded, so even a visible prepared receipt cannot prove queue delivery.
+                assert_eq!(
+                    restarted.record("fixture").unwrap()["input"]["delivery"],
+                    "delivery_unknown"
+                );
+                assert!(restarted.record("fixture").unwrap()["input"]["queued"].is_null());
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn input_queue_receipt_failure_is_unknown_and_never_a_success_ack() -> Result<()> {
+        for stage in [
+            WriteFault::Disk,
+            WriteFault::Fsync,
+            WriteFault::Rename,
+            WriteFault::DirectoryFsync,
+        ] {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join("recovery.json");
+            let (ledger, mut rx) = input_fixture(path.clone())?;
+            ledger.lock().unwrap().durable.fail_write(stage, 1);
+            assert!(
+                input(ledger.clone())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("delivery_unknown")
+            );
+            match rx.try_recv()? {
+                Action::Input(bytes, receipt, close) => {
+                    assert_eq!(bytes, b"ONCE");
+                    assert_eq!(receipt, 1);
+                    assert!(close);
+                }
+                _ => panic!("wrong action"),
+            }
+            assert!(rx.try_recv().is_err());
+            let disk: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let receipt = &disk["records"]["fixture"]["input"];
+            assert_eq!(receipt["sequence"], 1); // The pre-send snapshot must include the receipt itself.
+            assert!(matches!(
+                receipt["delivery"].as_str(),
+                Some("prepared" | "accepted")
+            ));
+            assert_eq!(disk["events"][0]["data"]["delivery"], "prepared");
+            let restarted = Store::open(path)?;
+            assert_eq!(
+                restarted.record("fixture").unwrap()["input"]["delivery"],
+                "delivery_unknown"
+            );
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn accepted_input_has_a_durable_receipt_and_exactly_one_queued_action() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("recovery.json");
+        let (ledger, mut rx) = input_fixture(path.clone())?;
+        let ack = input(ledger).await?;
+        assert_eq!(ack["input"]["delivery"], "accepted");
+        assert_eq!(ack["input"]["queued"], true);
+        let disk: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        assert_eq!(disk["records"]["fixture"]["input"], ack["input"]);
+        assert_eq!(disk["events"][0]["data"]["delivery"], "prepared");
+        assert_eq!(disk["events"][1]["data"]["delivery"], "accepted");
+        assert!(matches!(rx.try_recv()?, Action::Input(_, 1, true)));
+        assert!(rx.try_recv().is_err());
+        Ok(())
+    }
 }

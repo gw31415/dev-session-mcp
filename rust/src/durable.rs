@@ -21,7 +21,19 @@ struct Data {
     intents: BTreeMap<String, Value>,
     checkpoints: BTreeMap<String, Value>,
     events: VecDeque<Value>,
+    #[serde(default)]
+    generation: String,
+    #[serde(default = "legacy_default")]
+    legacy_keys: bool,
+    #[serde(default)]
+    epoch_positions: BTreeMap<String, u64>,
+    #[serde(default)]
+    retired: u64,
 }
+fn legacy_default() -> bool {
+    true
+}
+
 pub struct Store {
     path: PathBuf,
     data: Data,
@@ -30,6 +42,8 @@ pub struct Store {
     event_bytes: usize,
     dirty: bool,
     durable_positions: BTreeMap<String, Value>,
+    #[cfg(test)]
+    write_fault: Option<(WriteFault, usize)>,
 }
 impl Store {
     pub fn open(path: PathBuf) -> Result<Self> {
@@ -39,13 +53,16 @@ impl Store {
             path.exists() || !marker.exists(),
             "recovery snapshot lost; refusing a fresh idempotency keyspace"
         );
-        let data = if path.exists() {
+        let mut data = if path.exists() {
             ensure!(
                 std::fs::metadata(&path)?.len() <= STORE_BYTES as u64,
                 "recovery store oversized"
             );
             let data: Data = serde_json::from_slice(&std::fs::read(&path)?)?;
-            ensure!(data.version == 1, "unsupported recovery store version");
+            ensure!(
+                matches!(data.version, 1 | 2),
+                "unsupported recovery store version"
+            );
             data
         } else {
             Data {
@@ -53,6 +70,30 @@ impl Store {
                 ..Data::default()
             }
         };
+        if data.version == 1 {
+            data.version = 2;
+            data.generation = uuid::Uuid::new_v4().simple().to_string();
+            data.legacy_keys = true;
+            for record in data.records.values_mut() {
+                record["retain_work"] = json!(
+                    record["purpose"].is_string()
+                        || record["completion_condition"].is_string()
+                        || record["work_id"] != record["execution_id"]
+                );
+                let (epoch, n) =
+                    cursor(record["cursor"].as_str().context("invalid record cursor")?)?;
+                let position = data.epoch_positions.entry(epoch.into()).or_default();
+                *position = (*position).max(n);
+            }
+        }
+        ensure!(
+            !data.generation.is_empty() && data.generation.len() <= 128,
+            "invalid recovery key generation"
+        );
+        ensure!(
+            data.epoch_positions.len() <= RECORDS,
+            "invalid epoch position bounds"
+        );
         ensure!(
             data.records.len() <= RECORDS && data.checkpoints.len() <= CHECKPOINTS,
             "invalid recovery store bounds"
@@ -135,8 +176,17 @@ impl Store {
             event_bytes,
             dirty: false,
             durable_positions: BTreeMap::new(),
+            #[cfg(test)]
+            write_fault: None,
         };
         for record in store.data.records.values_mut() {
+            if matches!(
+                record["input"]["delivery"].as_str(),
+                Some("prepared" | "accepted")
+            ) {
+                record["input"]["delivery"] = json!("delivery_unknown");
+                record["input"]["queued"] = Value::Null;
+            }
             if matches!(record["status"].as_str(), Some("running" | "starting")) {
                 record["status"] = json!("outcome_unknown");
                 record["history_tail_unknown"] = json!(true);
@@ -154,7 +204,7 @@ impl Store {
         let bytes = serde_json::to_vec(&self.data)?;
         ensure!(
             bytes.len() <= STORE_BYTES,
-            "recovery store capacity reached; no automatic eviction of execution or idempotency records"
+            "recovery snapshot size limit reached; refusing an uncommitted mutation"
         );
         let result = (|| -> Result<()> {
             let temporary = self.path.with_extension("tmp");
@@ -163,9 +213,17 @@ impl Store {
                 .truncate(true)
                 .write(true)
                 .open(&temporary)?;
+            #[cfg(test)]
+            self.inject(WriteFault::Disk)?;
             file.write_all(&bytes)?;
+            #[cfg(test)]
+            self.inject(WriteFault::Fsync)?;
             file.sync_all()?;
+            #[cfg(test)]
+            self.inject(WriteFault::Rename)?;
             std::fs::rename(temporary, &self.path)?;
+            #[cfg(test)]
+            self.inject(WriteFault::DirectoryFsync)?;
             std::fs::File::open(self.path.parent().context("recovery path has no parent")?)?
                 .sync_all()?;
             Ok(())
@@ -195,7 +253,12 @@ impl Store {
     pub fn record(&self, id: &str) -> Option<&Value> {
         self.data.records.get(id)
     }
-    pub fn replay(&self, key: &str, fingerprint: &str) -> Result<Option<Value>> {
+    pub fn replay(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        generation: Option<&str>,
+    ) -> Result<Option<Value>> {
         ensure!(
             !self.fault,
             "recovery persistence unavailable; do not resend"
@@ -208,10 +271,98 @@ impl Store {
             let mut record = brief(
                 &self.data.records[intent["execution_id"].as_str().context("invalid intent")?],
             );
+            record["observed_cursor"] = record["cursor"].clone();
+            record["cursor"] = record
+                .get("start_cursor")
+                .cloned()
+                .unwrap_or_else(|| record["initial_cursor"].clone());
             record["replayed"] = json!(true);
             return Ok(Some(record));
         }
+        ensure!(
+            match generation {
+                Some(g) => g == self.data.generation,
+                None => self.data.legacy_keys,
+            },
+            "idempotency generation retired or invalid; never refresh the generation to retry an old request"
+        );
         Ok(None)
+    }
+    pub fn recovery_info(&self) -> Value {
+        json!({"key_generation":self.data.generation,"legacy_keys_accepted":self.data.legacy_keys,
+            "retired_records":self.data.retired,"record_limit":RECORDS,"checkpoint_limit":CHECKPOINTS})
+    }
+    fn retire_one(&mut self, exclude: Option<&str>, needs_checkpoint: bool) -> bool {
+        let candidate = self
+            .data
+            .records
+            .iter()
+            .filter(|(id, record)| {
+                record["status"] == "exited"
+                    && (record["retain_work"] != true || record["work_completed"] == true)
+                    && exclude != Some(id.as_str())
+                    && (!needs_checkpoint
+                        || self
+                            .data
+                            .checkpoints
+                            .values()
+                            .any(|cp| cp["execution_id"] == id.as_str()))
+                    && !self
+                        .data
+                        .checkpoints
+                        .values()
+                        .any(|cp| same_work(cp, record) && cp["completed"] != true)
+            })
+            .min_by_key(|(id, _)| {
+                self.data
+                    .records
+                    .get(*id)
+                    .and_then(|v| v["retention_order"].as_u64())
+                    .unwrap_or(0)
+            })
+            .map(|(id, _)| id.clone());
+        let Some(id) = candidate else {
+            return false;
+        };
+        self.data.records.remove(&id);
+        self.data.intents.retain(|_, v| v["execution_id"] != id);
+        self.data.checkpoints.retain(|_, v| v["execution_id"] != id);
+        self.data.events.retain(|v| v["execution_id"] != id);
+        self.data.retired = self.data.retired.saturating_add(1);
+        self.data.epoch_positions.retain(|epoch, _| {
+            self.data.records.values().any(|v| {
+                v["cursor"]
+                    .as_str()
+                    .and_then(|s| cursor(s).ok())
+                    .is_some_and(|(e, _)| e == epoch)
+            })
+        });
+        true
+    }
+    // Retire only completed and unpinned evidence; never forget an old key in a valid keyspace.
+    fn make_room(&mut self, incoming: usize) -> Result<()> {
+        let mut retired = false;
+        while self.data.records.len() + incoming > RECORDS
+            || serde_json::to_vec(&(
+                &self.data.records,
+                &self.data.intents,
+                &self.data.checkpoints,
+                &self.data.epoch_positions,
+            ))?
+            .len()
+                > 2 * 1024 * 1024
+        {
+            ensure!(
+                self.retire_one(None, false),
+                "recovery capacity occupied by unfinished/unknown work; no execution started"
+            );
+            retired = true;
+        }
+        if retired {
+            self.data.generation = uuid::Uuid::new_v4().simple().to_string();
+            self.data.legacy_keys = false;
+        }
+        Ok(())
     }
     pub fn reserve(
         &mut self,
@@ -223,30 +374,65 @@ impl Store {
             !self.fault,
             "recovery persistence unavailable; no execution started"
         );
-        ensure!(
-            self.data.records.len() < RECORDS,
-            "128 durable executions reached; no execution started and no idempotency keys evicted"
-        );
         let before = self.data.clone();
-        let id = record["execution_id"]
-            .as_str()
-            .context("missing execution ID")?
-            .to_owned();
-        self.data.records.insert(id.clone(), record);
-        if let Some(key) = key {
-            self.data
-                .intents
-                .insert(key, json!({"fingerprint":fingerprint,"execution_id":id}));
-        }
-        if let Err(error) = self.save() {
+        let result = (|| -> Result<()> {
+            self.make_room(1)?;
+            let mut record = record;
+            record["retention_order"] = json!(self.data.retired + self.data.records.len() as u64);
+            let id = record["execution_id"]
+                .as_str()
+                .context("missing execution ID")?
+                .to_owned();
+            let (epoch, n) = cursor(
+                record["cursor"]
+                    .as_str()
+                    .context("missing recovery cursor")?,
+            )?;
+            let position = self.data.epoch_positions.entry(epoch.into()).or_default();
+            *position = (*position).max(n);
+            self.data.records.insert(id.clone(), record);
+            if let Some(key) = key {
+                self.data
+                    .intents
+                    .insert(key, json!({"fingerprint":fingerprint,"execution_id":id}));
+            }
+            self.make_room(0)?;
+            self.save()
+        })();
+        if let Err(error) = result {
             self.data = before;
             return Err(error);
         }
+        self.event_bytes = self
+            .data
+            .events
+            .iter()
+            .map(|v| serde_json::to_vec(v).unwrap().len())
+            .sum();
         Ok(())
     }
-    pub fn append(&mut self, mut record: Value, mut event: Value) {
+    pub fn append(&mut self, mut record: Value, mut event: Value) -> Result<()> {
         let id = record["execution_id"].as_str().unwrap().to_owned();
+        ensure!(
+            self.data.records.contains_key(&id),
+            "execution evidence retired; cannot resurrect it"
+        );
         event["cursor"] = record["cursor"].clone();
+        let (epoch, n) = cursor(record["cursor"].as_str().context("missing event cursor")?)?;
+        let position = self.data.epoch_positions.entry(epoch.into()).or_default();
+        *position = (*position).max(n);
+        record["work_completed"] = self
+            .data
+            .records
+            .get(&id)
+            .map(|v| v["work_completed"].clone())
+            .unwrap_or(Value::Null);
+        record["retention_order"] = self
+            .data
+            .records
+            .get(&id)
+            .map(|v| v["retention_order"].clone())
+            .unwrap_or(Value::Null);
         record["command"] = self
             .data
             .records
@@ -264,9 +450,10 @@ impl Store {
         }
         self.dirty = true;
         // Output is batched; intent, lifecycle, input receipts and checkpoints commit synchronously.
-        if !output && self.flush().is_err() {
-            self.fault = true;
+        if !output {
+            self.flush()?;
         }
+        Ok(())
     }
     pub fn flush(&mut self) -> Result<()> {
         if self.dirty {
@@ -288,21 +475,17 @@ impl Store {
         let id = crate::workspace::text(args, "execution_id")?;
         let record = self
             .record(id)
-            .context("execution unavailable; outcome unknown, never restart automatically")?;
+            .context("execution history unavailable or retired; outcome unknown from this read, never restart automatically")?;
         let (epoch, _) = cursor(
             record["cursor"]
                 .as_str()
                 .context("missing recovery cursor")?,
         )?;
-        let end = self
+        let end = *self
             .data
-            .records
-            .values()
-            .filter_map(|v| cursor(v["cursor"].as_str()?).ok())
-            .filter(|(e, _)| *e == epoch)
-            .map(|(_, n)| n)
-            .max()
-            .unwrap_or(0);
+            .epoch_positions
+            .get(epoch)
+            .context("missing history position")?;
         let earliest = self
             .data
             .events
@@ -369,6 +552,7 @@ impl Store {
                         | "cursor"
                         | "purpose"
                         | "completion_condition"
+                        | "completed"
                 )),
             "unknown checkpoint argument"
         );
@@ -385,22 +569,15 @@ impl Store {
             previous.map_or(0, |v| v["revision"].as_u64().unwrap()) == revision,
             "checkpoint revision conflict; read current checkpoint before retry"
         );
-        ensure!(
-            previous.is_some() || self.data.checkpoints.len() < CHECKPOINTS,
-            "checkpoint capacity reached"
-        );
+
         let (epoch, sequence) = cursor(&position)?;
         let (record_epoch, _) =
             cursor(record["cursor"].as_str().context("invalid record cursor")?)?;
-        let record_sequence = self
+        let record_sequence = *self
             .data
-            .records
-            .values()
-            .filter_map(|v| cursor(v["cursor"].as_str()?).ok())
-            .filter(|(e, _)| *e == record_epoch)
-            .map(|(_, n)| n)
-            .max()
-            .unwrap_or(0);
+            .epoch_positions
+            .get(record_epoch)
+            .context("missing history position")?;
         ensure!(
             epoch == record_epoch && sequence <= record_sequence,
             "checkpoint cursor does not belong to execution history"
@@ -432,18 +609,90 @@ impl Store {
             !purpose.is_empty() && !condition.is_empty(),
             "purpose and completion_condition required for checkpoint"
         );
+        let completed = args
+            .get("completed")
+            .map(|v| v.as_bool().context("completed must be boolean"))
+            .transpose()?
+            .unwrap_or_else(|| {
+                previous.is_some_and(|v| v["execution_id"] == id && v["completed"] == true)
+            });
+        ensure!(
+            !completed || record["status"] == "exited",
+            "only confirmed exited work can be completed"
+        );
         let value = json!({"execution_id":id,"work_id":record["work_id"],"session_id":record["session_id"],
-            "reader_id":reader,"detail_cursor":position,"revision":revision.checked_add(1).context("revision exhausted")?,
+            "reader_id":reader,"detail_cursor":position,"completed":completed,"revision":revision.checked_add(1).context("revision exhausted")?,
             "purpose":purpose,"completion_condition":condition});
         let before = self.data.clone();
+        if !self.data.checkpoints.contains_key(&key) && self.data.checkpoints.len() >= CHECKPOINTS {
+            ensure!(
+                self.retire_one(Some(id), true),
+                "checkpoint capacity occupied by unfinished readers"
+            );
+            self.data.generation = uuid::Uuid::new_v4().simple().to_string();
+            self.data.legacy_keys = false;
+        }
         self.data.checkpoints.insert(key, value.clone());
+        let complete = self
+            .data
+            .checkpoints
+            .values()
+            .filter(|cp| same_work(cp, &value))
+            .all(|cp| cp["completed"] == true);
+        for record in self
+            .data
+            .records
+            .values_mut()
+            .filter(|record| same_work(record, &value))
+        {
+            record["work_completed"] = json!(complete && record["status"] == "exited");
+        }
         if let Err(error) = self.save() {
             self.data = before;
             return Err(error);
         }
+        self.event_bytes = self
+            .data
+            .events
+            .iter()
+            .map(|v| serde_json::to_vec(v).unwrap().len())
+            .sum();
         Ok(value)
     }
 }
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum WriteFault {
+    Disk,
+    Fsync,
+    Rename,
+    DirectoryFsync,
+}
+#[cfg(test)]
+impl Store {
+    pub(crate) fn fail_write(&mut self, stage: WriteFault, skip: usize) {
+        self.write_fault = Some((stage, skip));
+    }
+    fn inject(&mut self, stage: WriteFault) -> Result<()> {
+        if let Some((target, remaining)) = self.write_fault.as_mut() {
+            if *target == stage {
+                if *remaining == 0 {
+                    return Err(
+                        std::io::Error::from_raw_os_error(if stage == WriteFault::Disk {
+                            libc::ENOSPC
+                        } else {
+                            libc::EIO
+                        })
+                        .into(),
+                    );
+                }
+                *remaining -= 1;
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn short(args: &Value, key: &str, limit: usize) -> Result<String> {
     let s = crate::workspace::text(args, key)?;
     ensure!(!s.is_empty() && s.len() <= limit, "invalid {key} length");
@@ -493,6 +742,10 @@ pub fn project(mut data: Value, args: &Value) -> Result<Value> {
     Ok(data)
 }
 
+fn same_work(left: &Value, right: &Value) -> bool {
+    left["session_id"] == right["session_id"] && left["work_id"] == right["work_id"]
+}
+
 fn brief(record: &Value) -> Value {
     let mut value = record.clone();
     value.as_object_mut().unwrap().remove("command");
@@ -534,20 +787,155 @@ mod tests {
         )?;
         drop(store);
         let store = Store::open(path)?;
-        let replay = store.replay("key", "hash")?.unwrap();
+        let replay = store.replay("key", "hash", None)?.unwrap();
         assert_eq!(replay["execution_id"], "execution");
         assert_eq!(replay["status"], "outcome_unknown");
         assert!(!replay.to_string().contains("SOURCE_CANARY"));
-        assert!(store.replay("key", "different").is_err());
+        assert!(store.replay("key", "different", None).is_err());
         Ok(())
     }
     #[test]
-    fn bounded_store_preserves_keys_and_rejects_extra_records() -> Result<()> {
+    fn retirement_continues_over_three_windows_without_reusing_old_keys() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("recovery.json");
+        let mut store = Store::open(path.clone())?;
+        let original_generation = store.data.generation.clone();
+        store.reserve(
+            record("pinned", "exited"),
+            Some("pinned-key".into()),
+            "hash".into(),
+        )?;
+        store.checkpoint(&json!({"execution_id":"pinned","reader_id":"reader","cursor":"epoch:0","expected_revision":0}))?;
+        store.reserve(
+            record("unknown", "outcome_unknown"),
+            Some("unknown-key".into()),
+            "hash".into(),
+        )?;
+        for n in 0..400 {
+            let generation = store.data.generation.clone();
+            let key = format!("{generation}:{n}");
+            assert!(store.replay(&key, "hash", Some(&generation))?.is_none());
+            store.reserve(record(&n.to_string(), "exited"), Some(key), "hash".into())?;
+        }
+        assert!(store.records().len() <= RECORDS);
+        assert!(store.data.generation != original_generation);
+        assert!(
+            store
+                .replay(
+                    &format!("{original_generation}:0"),
+                    "hash",
+                    Some(&original_generation)
+                )
+                .is_err()
+        );
+        assert!(store.replay("never-used-legacy-key", "hash", None).is_err());
+        assert!(store.replay("unknown-key", "hash", None)?.is_some());
+        assert!(store.record("pinned").is_some());
+        drop(store);
+        let mut store = Store::open(path.clone())?;
+        assert!(
+            store
+                .replay(
+                    &format!("{original_generation}:0"),
+                    "hash",
+                    Some(&original_generation)
+                )
+                .is_err()
+        );
+        store.checkpoint(&json!({"execution_id":"pinned","reader_id":"reader","cursor":"epoch:0","expected_revision":1,"completed":true}))?;
+        store.reserve(record("next", "exited"), None, "hash".into())?;
+        assert!(store.record("pinned").is_none());
+        assert!(store.replay("pinned-key", "hash", None).is_err());
+        assert!(store.record("unknown").is_some());
+        assert!(std::fs::metadata(path)?.len() <= STORE_BYTES as u64);
+        Ok(())
+    }
+    #[test]
+    fn declared_work_is_pinned_until_explicit_completion_even_without_initial_reader() -> Result<()>
+    {
         let temp = tempfile::tempdir()?;
         let mut store = Store::open(temp.path().join("recovery.json"))?;
+        let mut work = record("work", "exited");
+        work["retain_work"] = json!(true);
+        store.reserve(work, None, "hash".into())?;
+        for n in 0..150 {
+            store.reserve(record(&n.to_string(), "exited"), None, "hash".into())?;
+        }
+        assert!(store.record("work").is_some());
+        store.checkpoint(&json!({"execution_id":"work","reader_id":"owner","cursor":"epoch:0","expected_revision":0,"completed":true}))?;
+        store.reserve(record("next", "exited"), None, "hash".into())?;
+        assert!(store.record("work").is_none());
+        Ok(())
+    }
+    #[test]
+    fn completed_readers_can_retire_at_checkpoint_capacity_without_losing_pending_readers()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("recovery.json");
+        let mut store = Store::open(path.clone())?;
+        for id in ["old", "new"] {
+            store.reserve(record(id, "exited"), None, "hash".into())?;
+        }
+        for n in 0..CHECKPOINTS {
+            store.checkpoint(&json!({"execution_id":"old","reader_id":n.to_string(),"cursor":"epoch:0","expected_revision":0,"completed":true}))?;
+        }
+        let before = store.data.generation.clone();
+        store.checkpoint(&json!({"execution_id":"new","reader_id":"pending","cursor":"epoch:0","expected_revision":0}))?;
+        assert_ne!(store.data.generation, before);
+        assert!(store.record("old").is_none());
+        assert_eq!(store.checkpoints().len(), 1);
+        drop(store);
+        let store = Store::open(path)?;
+        assert_eq!(store.checkpoints()[0]["completed"], false);
+        Ok(())
+    }
+    #[test]
+    fn checkpoint_moves_between_work_phases_without_permanent_pins_or_losing_pending_work()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("recovery.json");
+        let mut store = Store::open(path.clone())?;
+        for n in 0..160 {
+            let id = n.to_string();
+            let mut phase = record(&id, "exited");
+            phase["work_id"] = json!("common");
+            phase["retain_work"] = json!(true);
+            store.reserve(phase, None, "hash".into())?;
+            store.checkpoint(&json!({"execution_id":id,"reader_id":"owner","cursor":"epoch:0","expected_revision":n,"completed":true}))?;
+        }
+        assert!(store.records().len() <= RECORDS);
+        let mut pending = record("pending", "exited");
+        pending["work_id"] = json!("common");
+        pending["retain_work"] = json!(true);
+        store.reserve(pending, None, "hash".into())?;
+        store.checkpoint(&json!({"execution_id":"pending","reader_id":"owner","cursor":"epoch:0","expected_revision":160}))?;
+        assert!(
+            store
+                .data
+                .records
+                .values()
+                .all(|v| v["work_completed"] == false)
+        );
+        assert!(
+            store
+                .reserve(record("blocked", "exited"), None, "hash".into())
+                .is_err()
+        );
+        store.checkpoint(&json!({"execution_id":"pending","reader_id":"owner","cursor":"epoch:0","expected_revision":161,"completed":true}))?;
+        store.reserve(record("allowed", "exited"), None, "hash".into())?;
+        drop(store);
+        let store = Store::open(path)?;
+        assert!(store.record("allowed").is_some());
+        Ok(())
+    }
+    #[test]
+    fn unresolved_capacity_refuses_without_retiring_work_or_rotating_keys() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut store = Store::open(temp.path().join("recovery.json"))?;
+        let generation = store.data.generation.clone();
         for n in 0..RECORDS {
             store.reserve(
-                record(&n.to_string(), "exited"),
+                record(&n.to_string(), "outcome_unknown"),
                 Some(n.to_string()),
                 "hash".into(),
             )?;
@@ -557,9 +945,112 @@ mod tests {
                 .reserve(record("overflow", "starting"), None, "hash".into())
                 .is_err()
         );
-        assert!(store.replay("0", "hash")?.is_some());
+        assert_eq!(store.data.generation, generation);
         assert_eq!(store.records().len(), RECORDS);
-        assert!(std::fs::metadata(&store.path)?.len() <= STORE_BYTES as u64);
+        assert!(store.replay("0", "hash", None)?.is_some());
+        Ok(())
+    }
+    #[test]
+    fn retirement_commit_failure_does_not_forget_existing_key_in_memory_or_on_disk() -> Result<()> {
+        for stage in [
+            WriteFault::Disk,
+            WriteFault::Fsync,
+            WriteFault::Rename,
+            WriteFault::DirectoryFsync,
+        ] {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join("recovery.json");
+            let mut store = Store::open(path.clone())?;
+            let generation = store.data.generation.clone();
+            for n in 0..RECORDS {
+                store.reserve(
+                    record(&n.to_string(), "exited"),
+                    Some(n.to_string()),
+                    "hash".into(),
+                )?;
+            }
+            store.fail_write(stage, 0);
+            assert!(
+                store
+                    .reserve(
+                        record("overflow", "starting"),
+                        Some("overflow".into()),
+                        "hash".into()
+                    )
+                    .is_err()
+            );
+            assert!(store.record("0").is_some());
+            assert!(!store.healthy());
+            let store = Store::open(path)?;
+            if store.data.generation == generation {
+                assert!(store.replay("0", "hash", None)?.is_some());
+            } else {
+                assert!(store.replay("0", "hash", None).is_err());
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn metadata_pressure_retires_completed_but_preserves_unknown_records() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut store = Store::open(temp.path().join("recovery.json"))?;
+        let mut unknown = record("unknown", "outcome_unknown");
+        unknown["command"] = json!(["u".repeat(60000)]);
+        store.reserve(unknown, None, "hash".into())?;
+        for n in 0..70 {
+            let mut rec = record(&n.to_string(), "exited");
+            rec["command"] = json!(["x".repeat(60000)]);
+            store.reserve(rec, None, "hash".into())?;
+        }
+        assert!(store.records().len() < RECORDS);
+        assert!(store.data.retired > 0);
+        assert!(store.record("unknown").is_some());
+        Ok(())
+    }
+    #[test]
+    fn retirement_preserves_global_epoch_cursor_watermarks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("recovery.json");
+        let mut store = Store::open(path.clone())?;
+        store.reserve(record("pinned", "outcome_unknown"), None, "hash".into())?;
+        let mut last = record("last", "exited");
+        last["cursor"] = json!("epoch:99");
+        store.reserve(last, None, "hash".into())?;
+        for n in 0..127 {
+            store.reserve(
+                record(&n.to_string(), "outcome_unknown"),
+                None,
+                "hash".into(),
+            )?;
+        }
+        assert!(store.record("last").is_none());
+        drop(store);
+        let mut store = Store::open(path)?;
+        let page = store.read(&json!({"execution_id":"pinned","cursor":"epoch:99"}))?;
+        assert_eq!(page["cursor"], "epoch:99");
+        assert_eq!(page["catch_up_required"], false);
+        store.checkpoint(&json!({"execution_id":"pinned","reader_id":"reader","cursor":"epoch:99","expected_revision":0}))?;
+        Ok(())
+    }
+    #[test]
+    fn migrated_v1_start_and_replay_use_safe_beginning_not_latest_cursor() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("recovery.json");
+        let mut store = Store::open(path.clone())?;
+        let mut rec = record("execution", "exited");
+        rec["cursor"] = json!("epoch:9");
+        store.reserve(rec, Some("key".into()), "hash".into())?;
+        let mut data: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        data["version"] = json!(1);
+        for field in ["generation", "legacy_keys", "epoch_positions", "retired"] {
+            data.as_object_mut().unwrap().remove(field);
+        }
+        std::fs::write(&path, serde_json::to_vec(&data)?)?;
+        let store = Store::open(path)?;
+        let replay = store.replay("key", "hash", None)?.unwrap();
+        assert_eq!(replay["cursor"], "epoch:0");
+        assert_eq!(replay["observed_cursor"], "epoch:9");
+        assert_eq!(store.data.version, 2);
         Ok(())
     }
     #[test]
@@ -596,7 +1087,7 @@ mod tests {
         store.reserve(rec.clone(), None, "hash".into())?;
         for n in 1..=80 {
             rec["cursor"] = json!(format!("epoch:{n}"));
-            store.append(rec.clone(), json!({"execution_id":"execution","sequence":n,"kind":"output","data":{"text":"x".repeat(16000)}}));
+            store.append(rec.clone(), json!({"execution_id":"execution","sequence":n,"kind":"output","data":{"text":"x".repeat(16000)}}))?;
         }
         assert!(store.healthy());
         let args = json!({"execution_id":"execution","cursor":"epoch:0","view":"summary"});

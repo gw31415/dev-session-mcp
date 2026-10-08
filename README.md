@@ -9,10 +9,10 @@ Linux を複数プロジェクトの開発環境として使う独立した Rust
 | ツール | 用途 |
 | --- | --- |
 | open_session, list_sessions, close_session | canonical cwd と permitted roots を持つ project metadata、実行一覧、管理対象の終了 |
-| start_execution | 明示した argv を一度開始。profile は必須の host / sandbox、io は pty / pipes |
+| start_execution | 新規開始前に取得した `key_generation` とキーを保存して重複防止。明示した argv を一度開始。profile は必須の host / sandbox、io は pty / pipes |
 | input_execution, resize_execution, signal_execution | 明示した execution_id へ stdin、端末サイズ、INT / TERM / KILL |
 | read_execution | 通常は `view:summary` で短い状態を取得。必要時にcursor差分detailを非破壊読取（互換用の既定値はdetail） |
-| checkpoint_execution | 読者別の詳細処理cursor・目的・完了条件をrevision CASで永続保存。[復旧契約](docs/DURABLE-RECOVERY.md) |
+| checkpoint_execution | 読者別の詳細処理cursor・目的・完了条件をrevision CASで永続保存。検証済み完了は `completed:true` として履歴縮約を許可。[復旧契約](docs/DURABLE-RECOVERY.md) |
 | wait_execution | 指定execution/cursorから出力・状態・終了を上限付きで待つ独自の通常read-only tool。[契約・検証・次の試験](docs/WAIT-EXECUTION.md) |
 | read_delivery_diagnostics | 実行状態と通知停止を分離するread-only診断。lease期限・未確認batch・HTTP status/送信時間。詳細と残工程は[配信診断](docs/DELIVERY-DIAGNOSTICS.md) |
 | read_file, write_file, list_directory, get_image | 上限付きファイル操作。write は sandbox 内の許可 root のみ |
@@ -26,7 +26,7 @@ Linux を複数プロジェクトの開発環境として使う独立した Rust
 
 `server/discover` は `capabilities.events` を宣言し、`events/list` に `execution.events` を返します。`events/subscribe` / `events/unsubscribe` は公式 webhook 形式です。session_id、任意の execution_id で絞り、出力・開始・終了・入力受領を最大 100 ms 待ってまとめて配信します。[配信仕様と限界](docs/EVENTS.md)。
 
-イベントは sequence と cursor を持ちます。重複・順序逆転を受け入れ、sequence で重複を除きます。Webhook の 2xx は受領確認であり、アプリ処理完了を証明しません。`input_execution` の返答は **accepted**、OS 書込みは後続の **written / delivery_unknown**。`close_stdin:true` は pipes の送信済み text の後で write descriptor を閉じて EOF を送ります。PTY の Ctrl-D は text の `\u0004` で渡す別操作です。write が途中で失敗した可能性や返答喪失がある場合、入力を自動再送しません。無出力だけで入力待ちと断定しません。
+イベントは sequence と cursor を持ちます。重複・順序逆転を受け入れ、sequence で重複を除きます。Webhook の 2xx は受領確認であり、アプリ処理完了を証明しません。`input_execution` はreceipt/eventを **prepared** として永続化してからキュー投入し、保存失敗なら未送信エラー。投入後の返答は **accepted**、OS 書込みは後続の **written / delivery_unknown**。投入後の受付記録保存失敗も成功ACKにせず **delivery_unknown** を返します。`close_stdin:true` は pipes の送信済み text の後で write descriptor を閉じて EOF を送ります。PTY の Ctrl-D は text の `\u0004` で渡す別操作です。write が途中で失敗した可能性や返答喪失がある場合、入力を自動再送しません。無出力だけで入力待ちと断定しません。
 
 journal は全実行で直近 **1 MiB / 1,024 events**、回収 page は **32 KiB**、実行記録と session は各 **64 件**です。満杯なら完了記録を古い順に捨て、live 実行は勝手に停止しません。`catch_up_required` が履歴欠落を示し、`more` なら次の page を回収します。Events は最大 8 subscriptions、outbox は各 1 batch、完全 body は最大 64 KiB。遅い callback が子プロセスの出力 reader を止めません。完全なログは project のファイルへ保存してください。
 

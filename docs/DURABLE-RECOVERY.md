@@ -15,7 +15,7 @@ No Tasks capability is advertised. The official extension can later adapt the sa
 records, but a start ACK and a task representing process termination are different
 contracts. There is no second process owner or Tasks-specific execution store.
 
-The broker advertises `recovery: 1` in its private ping response. The frontend checks
+The broker advertises `recovery: 2` in its private ping response. The frontend checks
 this before new recovery-dependent operations. An old retained broker must never
 silently ignore an idempotency key and launch twice. Legacy default detail operations
 still work with the old broker; new recovery requests fail before sending a command.
@@ -51,16 +51,25 @@ are stored metadata, not executable instructions or authorization.
 
 ## Start intent and uncertain results
 
-Choose and persist an `idempotency_key` **before** `start_execution`. Optional
+For a new operation, read `recovery.key_generation` from `open_session`,
+`list_sessions`, or the recovery Resource. Persist that `key_generation` together with
+an `idempotency_key` **before** `start_execution`. A retry must use the same pair;
+never replace a retired generation with the current one to retry an old operation.
+Optional
 `work_id`, `purpose`, and `completion_condition` associate the operation with the work.
-Keys are scoped to the project session. An identical keyed retry returns the recorded
-execution with `replayed: true`; a changed request using that key is rejected. Omitted
+Keys are scoped to `(project session, generation)`. An identical retained keyed retry
+returns the recorded execution with `replayed: true`; a changed request using that key
+is rejected. Both first ACK and replay `cursor` refer to the persisted `start_cursor`
+before child output, even if the replayed status is already `exited`. Clients can pass
+`job.cursor` directly to read/wait; no manual switch to `initial_cursor` is required.
+For migrated records lacking `start_cursor`, replay falls back conservatively to
+`initial_cursor`. Replay's `observed_cursor` carries the latest state position. Omitted
 `io` and `io: "pty"` are equivalent; other arguments must be identical. Original argv
 is retained for explicit source retrieval, not repeated in normal execution records.
 
 The broker serializes starts, mints an opaque execution ID, and atomically commits
-intent before spawning. The intent and key cannot be evicted to make room for a new
-command. The process PID/start ticks are saved once available. The pre-spawn recovery
+intent before spawning. A key can only be removed together with completed history and atomic retirement
+of its keyspace generation; its old pair can never launch again. The process PID/start ticks are saved once available. The pre-spawn recovery
 ID survives the unavoidable spawn/record crash window.
 
 A timeout or disconnect is **not** proof that start/input failed. Recover by IDs,
@@ -71,6 +80,17 @@ An intent without confirmed start/termination evidence returns `outcome_unknown`
 It does not automatically try to start again, even if the crash happened before spawn.
 This is duplicate suppression with explicit uncertainty, not an exactly-once execution
 claim. There is deliberately no stdin retry key in this change.
+
+Stdin has a two-phase receipt. Before queueing, the broker sets both the record's
+`input` receipt and a `prepared` event and requires a successful atomic durable commit.
+Any write/fsync/rename/directory-fsync failure prevents queueing and returns
+`stdin not sent` with `queued=false`; receipt durability is unknown, not asserted false.
+After queueing, `accepted` means queue acceptance only. That receipt is also committed
+before a success ACK. Failure of this second commit returns `delivery_unknown` with
+`queued=true`, never success or permission to resend. The actor subsequently records
+`written` or `delivery_unknown` independently of queue acceptance. Recovered `prepared`
+and `accepted` receipts become `delivery_unknown` with unknown queue status: even a
+persisted preparation cannot establish whether a crash happened before or after queueing.
 
 ## Storage, limits, and recovery
 
@@ -88,19 +108,53 @@ Limits per state directory:
 
 | Evidence | Bound and behavior |
 | --- | --- |
-| Execution records / start keys | 128 records; refuse new starts at capacity; no automatic key eviction |
-| Reader checkpoints | 128; refuse new reader/work bindings at capacity |
+| Execution records / retained start keys | 128 retained records; retire eligible completed history under pressure; refuse only if unfinished/pinned evidence occupies capacity |
+| Reader checkpoints | 128; retire fully completed other work if needed; reject when remaining readers are unfinished |
 | Durable output history | 1 MiB / 1024 events globally, oldest events removed |
-| Recovery snapshot | 4 MiB; atomic replacement can temporarily require another 4 MiB |
+| Recovery snapshot | 4 MiB hard bound; new starts target at most 2 MiB metadata to leave space for logs and receipt/checkpoint growth; atomic replacement may require another 4 MiB |
 | Source argv | Existing 64 KiB serialized command bound |
 | Purpose / completion condition | 2048 UTF-8 bytes each |
 
-The existing live process limit remains 64; evicted terminal live records remain
-recoverable through the durable store. Metadata growth can also hit the 4 MiB limit
-before the count limits. A storage failure disables further starts and checkpoint
-writes in that broker lifetime and exposes `persistence_ok: false`; reads remain useful
-as evidence. There is no automatic cleanup/reset API that could forget deduplication.
-State archival/reset at capacity needs a separately reviewed lifecycle decision.
+The existing live process limit remains 64. New starts compact the oldest eligible
+completed records when the record or metadata budget requires room. This is a retained
+window, not a lifetime execution limit. Each compaction atomically rotates the
+server-minted key generation with the record/key removal. A key miss in any previous
+(or unknown) generation is rejected; no unbounded tombstone/key set is required.
+Retained intents may still be replayed with their original generation, even after a
+rotation. Original argv, logs, and completed checkpoints for a retired execution are
+removed together. A read of retired evidence returns an explicit unavailable/retired
+error, not an empty successful result. Epoch watermarks remain while any record in that
+epoch survives, so a reader's valid global cursor does not become a false future cursor
+when another execution is retired.
+
+Unfinished `starting`/`running` and `outcome_unknown` records are never retired.
+Any incomplete reader checkpoint pins the retained phases of its `(session, work)` binding. Explicit `work_id`, `purpose`,
+or `completion_condition` also pins declared work even before its first checkpoint;
+confirmed process exit alone does not prove the work is complete. After verifying the
+condition, a reader can CAS `completed:true` on a checkpoint for a confirmed exited
+execution. Retirement requires explicit completion for declared work and no remaining unfinished
+readers of that work. Completion is persisted on its confirmed exited phase records,
+so moving a checkpoint to a later phase does not leave previously completed phases
+permanently pinned merely because their old checkpoint pointer moved. An incomplete
+checkpoint on a new phase pins all still-retained phases again; running/unknown phases
+are never marked complete by another phase's checkpoint. This is an explicit caller assertion, not an automatic
+work-completion inference. A full window of genuinely unfinished/unknown work still
+refuses new starts without discarding evidence. Operators must resolve pending work;
+no state reset or automatic replay is a recovery path.
+
+Legacy keys without a generation remain replayable while their intents are retained.
+A new legacy-key miss is accepted only until the first compaction; thereafter it is
+rejected permanently. Fresh keyed operations must use the advertised generation.
+Existing tools-only clients that do not use keys can keep starting fresh commands;
+they still must not blindly resend after a lost ACK. Existing version-1 snapshots
+migrate to version 2 with their old intents intact. No production state is migrated by
+these local tests.
+
+Storage failures disable further starts and checkpoint mutations for that broker
+lifetime and expose `persistence_ok:false`. Reads remain evidence. Snapshot retirement
+and generation change commit together before spawn: even a rename followed by a failed
+directory fsync yields either the old retained key or an expired generation/unknown
+intent after restart, never an admissible forgotten old key.
 
 On broker restart, persisted terminal evidence remains available. `running` or
 `starting` becomes `outcome_unknown` with a recovery reason and
@@ -119,8 +173,11 @@ an old execution's outcome; errors do not claim failure or success.
 `checkpoint_execution` is the only new tool. Supply `execution_id`, `reader_id`,
 `cursor`, and `expected_revision` (0 for creation). Supply purpose/completion condition
 on creation unless inherited from start. The key is `(session_id, work_id, reader_id)`.
-It stores the processed `detail_cursor`, purpose, completion condition, and a revision.
+It stores the processed `detail_cursor`, purpose, completion condition, completion
+assertion, and a revision.
 An existing binding can move to the next execution in the same work through CAS.
+At reader capacity, fully completed other work may be retired atomically with the CAS
+and generation change; the mutation is therefore advertised as potentially destructive.
 Within one execution the cursor cannot move backwards or cross epochs; global sequence
 gaps caused by other executions remain valid. Successful read alone never writes it.
 
@@ -128,7 +185,10 @@ Two readers have independent acknowledgements. CAS conflict, lost checkpoint ACK
 uncertain storage requires reading the current record and reconciling; it does not
 justify re-executing a command or treating unprocessed detail as acknowledged.
 The server validates position/revision, while the reader attests that it processed the
-page. A checkpoint neither certifies the completion condition nor schedules more work.
+page. The caller must verify the completion condition before explicitly setting `completed:true`;
+the server validates confirmed exit, not the semantic truth of that condition. Omission
+preserves the completion flag for the same execution and defaults false for a new one.
+A checkpoint never schedules more work.
 
 `list_sessions` and reopening the same project with `open_session` return executions
 and checkpoints, including archived/unknown records. Thus recovery does not depend
@@ -168,7 +228,11 @@ reader CAS, failed writes, summary position separation, durable history truncati
 restart uncertainty, and missing/corrupt snapshot refusal. `tests/recovery_stdio.py` uses a temporary state directory
 and short children for dropped start ACK, duplicate concurrent retries, frontend
 reconnect, summary/detail/Resource equivalence, two readers and CAS conflict, broker
-SIGKILL/restart, unknown outcome, and durable capacity refusal.
+SIGKILL/restart, unknown outcome, and 400 fresh starts across repeated retirement
+windows. Retired legacy and generation-bound keys are rejected before and after restart.
+Real stdin persistence failure leaves the child input empty. Unit fault injection also
+covers disk writes, fsync, rename, directory fsync, queue-ACK failure, retirement commit
+failure, metadata pressure, completed-reader release, and genuinely unresolved capacity.
 
 Existing wait/stdio/IO/diagnostics tests continue to exercise the default detail
 contract. Live client Tasks support, chat delivery, deployment, and production
@@ -182,9 +246,9 @@ launched with a temporary socket; no existing broker process was contacted.
 
 | Check | Result |
 | --- | --- |
-| `cargo test --locked --offline ... -- --test-threads=1` | 17 passed, 0 failed |
+| `cargo test --locked --offline ... -- --test-threads=1` | 28 passed, 0 failed (including both stdin commit phases and retirement fault injection) |
 | `cargo build --locked --offline ...` | Passed |
-| `tests/recovery_stdio.py NEW OLD` | Passed; start/input/checkpoint ACK loss, two readers, Resources including escaped URIs, restart, unknown result, capacity, old-broker guard |
+| `tests/recovery_stdio.py NEW OLD` | Passed; start/input/checkpoint ACK loss, two readers, Resources including escaped URIs, restart, unknown result, 400 starts, retired-key refusal, real unsent stdin, old-broker guard |
 | `tests/wait_execution_stdio.py NEW` | Passed |
 | `tests/wait_execution_stdio.py NEW OLD` | Passed against retained 3d207fc fixture |
 | `tests/delivery_diagnostics_stdio.py NEW` | Passed |
@@ -195,10 +259,35 @@ launched with a temporary socket; no existing broker process was contacted.
 Build environment: `CARGO_INCREMENTAL=0`, `RUSTC_WRAPPER=`,
 `CARGO_TARGET_DIR=/tmp/dev-session-diagnostics-target`, `CARGO_BUILD_JOBS=1`.
 Builds used a free-disk guard that terminates their own process group at 200 MiB.
-About 1290 MiB remained after validation; no Mycast target was modified.
+About 1280 MiB remained during blocker validation; no Mycast target was modified.
 
 An initial per-output-chunk full snapshot caused a real wait snapshot deadline failure
 under a 1.2 MB output fixture. Bounded output batching and incremental history byte
 accounting fixed that failure; the same fixture now passes. Output since the last
 commit may be lost on crash, so unknown history tails are explicitly reported.
 No live schema/auth/subscription/service changes, push, or deployment were performed.
+
+### Review blockers addressed
+
+- Input receipt and prepared event are now committed together before queue insertion.
+  ENOSPC/write, file fsync, rename, and directory-fsync fault injection verifies no
+  queued action on preparation failure. The same four faults after queue insertion
+  verify an unknown error instead of a success ACK. A real pipe child also receives
+  zero bytes when temporary-snapshot creation fails.
+- The lost-start-ACK fixture now consumes `job.cursor` directly and asserts receipt of
+  its output; it no longer switches to `initial_cursor` to hide a replay-position bug.
+  Completed replay is checked using the returned cursor as well.
+- Real stdio executes 400 additional commands, with and without keys, across repeated
+  bounded retirement. Old legacy and explicit-generation keys cannot run again, before
+  or after broker restart. Unknown outcomes and unfinished readers remain discoverable.
+  Unit tests additionally cover declared work before its first checkpoint, moving one
+  reader across 160 completed phases, completed-reader capacity release, metadata-size
+  pressure, the true unfinished-record limit, preserved epoch watermarks, and v1 migration.
+
+The final stdio recovery run passed with zero read-timeout retries. A prior loaded run
+hit the existing one-second snapshot deadline; the fixture now permits only that
+specific read failure to be retried, with unchanged last received cursor and a finite
+20-second recovery budget. Start/input are never retried by this read-recovery path;
+other errors remain test failures. Final current/old-broker wait, diagnostics, stdio,
+and I/O-control regressions all passed. No production state reset, restart, schema,
+auth, or subscription operation was performed.

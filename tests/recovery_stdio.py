@@ -34,6 +34,7 @@ def run(binary):
                "DEV_SESSION_MCP_BROKER_SOCKET": str(state / "broker.sock")}
         processes = []
         clients = []
+        read_retries = 0
 
         def boot():
             p = subprocess.Popen([binary, "broker"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -56,10 +57,22 @@ def run(binary):
             return c
 
         def finish(c, job):
+            nonlocal read_retries
             cursor = job["cursor"]
             all_events = []
-            for _ in range(100):
-                page = c.tool("wait_execution", execution_id=job["execution_id"], cursor=cursor, max_wait_ms=100)
+            deadline = time.monotonic() + 20
+            for _ in range(200):
+                assert time.monotonic() < deadline, "fixture recovery deadline exceeded"
+                response = c.request("tools/call", {"name":"wait_execution", "arguments":dict(execution_id=job["execution_id"], cursor=cursor, max_wait_ms=100)})
+                assert "error" not in response, response.get("error")
+                result = response["result"]
+                if result.get("isError"):
+                    assert "snapshot deadline exceeded" in result["content"][0]["text"], result["content"]
+                    # Only a read is retried, from the SAME last received cursor. Never resend start/input.
+                    read_retries += 1
+                    time.sleep(.02)
+                    continue
+                page = result["structuredContent"]
                 all_events.extend(page["events"])
                 cursor = page["cursor"]
                 if page["execution"]["status"] != "running" and not page["more"]:
@@ -90,15 +103,19 @@ def run(binary):
             stream.close()
             job = c.tool("start_execution", **args)
             assert job["replayed"] and counter.read_text() == "once\n"
-            end, _ = finish(c, job)
+            end, replay_events = finish(c, job)
+            assert "DETAIL_CANARY" in json.dumps(replay_events), "job.cursor skipped output after ACK loss"
             assert end["execution"]["status"] == "exited"
             job_id = job["execution_id"]
-            initial = job["initial_cursor"]
+            initial = job["cursor"]
             summary = c.tool("read_execution", execution_id=job_id, cursor=initial, view="summary")
             assert "DETAIL_CANARY" not in json.dumps(summary) and "events" not in summary
             assert summary["detail_cursor"] == initial and summary["state_cursor"] != initial
             implicit = c.tool("read_execution", execution_id=job_id, view="summary")
-            assert implicit["detail_cursor"] == initial and implicit["detail_available"]
+            assert implicit["detail_cursor"] == job["initial_cursor"] and implicit["detail_available"]
+            replay = c.tool("start_execution",**args)
+            assert replay["cursor"] == initial
+            assert "DETAIL_CANARY" in json.dumps(c.tool("read_execution",execution_id=job_id,cursor=replay["cursor"]))
             detail = c.tool("read_execution", execution_id=job_id, cursor=initial)
             assert "DETAIL_CANARY" in json.dumps(detail)
             assert detail == c.tool("read_execution", execution_id=job_id, cursor=initial)
@@ -188,17 +205,43 @@ def run(binary):
             assert len(recovered["checkpoints"]) == 2
             assert any(v["execution_id"] == unknown["execution_id"] for v in recovered["executions"])
             assert (state / "recovery.json").stat().st_size < 4 * 1024 * 1024
-            # Fill the durable limit; completed records/keys must not be silently evicted.
-            for n in range(128 - len(recovered["executions"])):
-                short = c.tool("start_execution",session_id=session,command=["/bin/true"],profile="host",io="pipes",idempotency_key=f"capacity-{n}")
+            # Continue beyond three retention windows, with both keyed and unkeyed starts.
+            retired_counter = project / "retired-starts"
+            legacy_args = dict(session_id=session,command=["/bin/sh","-c",f"echo legacy >> {retired_counter}"],profile="host",io="pipes",idempotency_key="retire-legacy")
+            retired_legacy = c.tool("start_execution",**legacy_args)
+            finish(c, retired_legacy)
+            old_generation = c.tool("list_sessions")["recovery"]["key_generation"]
+            retired_args = dict(session_id=session,command=["/bin/sh","-c",f"echo keyed >> {retired_counter}"],profile="host",io="pipes",idempotency_key="retire-explicit",key_generation=old_generation)
+            retired_job = c.tool("start_execution",**retired_args)
+            finish(c, retired_job)
+            for n in range(400):
+                extra = {} if n % 2 else dict(idempotency_key=f"continued-{n}",key_generation=c.tool("list_sessions")["recovery"]["key_generation"])
+                short = c.tool("start_execution",session_id=session,command=["/bin/true"],profile="host",io="pipes",**extra)
                 finish(c, short)
-            rejected = c.request("tools/call", {"name":"start_execution","arguments":dict(session_id=session,
-                command=["/bin/true"],profile="host",io="pipes",idempotency_key="overflow")})
-            assert rejected["result"]["isError"]
-            assert c.tool("start_execution",**args)["execution_id"] == job_id
+            retained = c.tool("list_sessions")
+            assert len(retained["executions"]) <= 128 and retained["recovery"]["retired_records"] > 256
+            assert retained["recovery"]["key_generation"] != old_generation
+            assert any(v["execution_id"] == unknown["execution_id"] for v in retained["executions"])
+            assert len(retained["checkpoints"]) == 2
+            assert c.tool("start_execution",**args)["execution_id"] == job_id  # unfinished readers pin this work
+            for old_args in (legacy_args,retired_args):
+                rejected = c.request("tools/call",{"name":"start_execution","arguments":old_args})
+                assert rejected["result"]["isError"]
+            assert retired_counter.read_text() == "legacy\nkeyed\n"
             assert counter.read_text() == "once\n"
+            c.close()
+            broker.terminate(); broker.wait(timeout=8)
+            broker = boot(); c = frontend()
+            for old_args in (legacy_args,retired_args):
+                rejected = c.request("tools/call",{"name":"start_execution","arguments":old_args})
+                assert rejected["result"]["isError"]
+            assert retired_counter.read_text() == "legacy\nkeyed\n"
+            assert c.tool("start_execution",**unknown_args)["status"] == "outcome_unknown"
+            fresh = c.tool("start_execution",session_id=session,command=["/bin/true"],profile="host",io="pipes",
+                           idempotency_key="after-retirement-restart",key_generation=c.tool("list_sessions")["recovery"]["key_generation"])
+            finish(c,fresh)
             assert (state / "recovery.json").stat().st_size < 4 * 1024 * 1024
-            print("PASS: isolated start/input ACK loss/reconnect/idempotency/CAS/two readers/Resources/summary gaps/broker restart/unknown outcome/capacity")
+            print(f"PASS: start/input/checkpoint ACK loss; job.cursor recovery; two readers; Resources; restart/unknown; 400 starts; retirement/expired keys; read-only timeout retries={read_retries}")
         finally:
             for client in clients:
                 client.cleanup()
@@ -211,6 +254,38 @@ def run(binary):
                 process.stderr.close()
             # The crash fixture's only orphan is a one-second sleep, never production.
             time.sleep(1.1)
+
+def input_storage_failure(binary):
+    with tempfile.TemporaryDirectory(prefix="dev-session-input-fault-") as directory:
+        root = Path(directory); state = root / "state"; received = root / "received"
+        env = {"PATH":os.defpath,"LANG":"C.UTF-8","DEV_SESSION_MCP_STATE_DIR":str(state),
+               "DEV_SESSION_MCP_BROKER_SOCKET":str(state / "broker.sock")}
+        process = subprocess.Popen([binary,"broker"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+        client = None
+        try:
+            deadline = time.monotonic()+5
+            while not (state / "broker.sock").exists():
+                assert process.poll() is None and time.monotonic() < deadline
+                time.sleep(.02)
+            client = RecoveryFrontend(binary,env)
+            session = client.tool("open_session",cwd=str(root))["id"]
+            job = client.tool("start_execution",session_id=session,command=["/bin/sh","-c",f"exec cat > {received}"],profile="host",io="pipes")
+            # Fail the real temporary-file open in this isolated broker; never touch production state.
+            (state / "recovery.tmp").mkdir()
+            failed = client.request("tools/call",{"name":"input_execution","arguments":dict(execution_id=job["execution_id"],text="MUST_NOT_SEND",close_stdin=True)})
+            assert failed["result"]["isError"] and "stdin not sent" in failed["result"]["content"][0]["text"]
+            time.sleep(.1)
+            assert not received.exists() or received.read_bytes() == b""
+            record = client.tool("read_execution",execution_id=job["execution_id"])
+            assert record["execution"]["input"]["delivery"] == "not_sent" and not record["persistence_ok"]
+            client.tool("signal_execution",execution_id=job["execution_id"],signal="TERM")
+            print("PASS: real stdin remains unsent when receipt persistence fails")
+        finally:
+            if client: client.cleanup()
+            process.terminate()
+            try: process.wait(timeout=8)
+            except subprocess.TimeoutExpired: process.kill(); process.wait()
+            process.stderr.close()
 
 def old_backend_guard(binary, old_binary):
     with tempfile.TemporaryDirectory(prefix="dev-session-old-backend-") as directory:
@@ -244,5 +319,6 @@ def old_backend_guard(binary, old_binary):
 if __name__ == "__main__":
     binary = str(Path(sys.argv[1]).resolve())
     run(binary)
+    input_storage_failure(binary)
     if len(sys.argv) > 2:
         old_backend_guard(binary,str(Path(sys.argv[2]).resolve()))
