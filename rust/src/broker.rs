@@ -204,6 +204,9 @@ impl Client {
         if let Some(origins) = std::env::var_os("DEV_SESSION_MCP_FILE_ORIGINS") {
             command.env("DEV_SESSION_MCP_FILE_ORIGINS", origins);
         }
+        if let Some(path) = std::env::var_os(crate::profiles::ENV) {
+            command.env(crate::profiles::ENV, path);
+        }
         use std::os::unix::process::CommandExt;
         unsafe {
             command.pre_exec(|| {
@@ -347,6 +350,23 @@ impl Input {
     }
 }
 async fn start(args: &Value, ledger: Shared) -> Result<Value> {
+    ensure!(
+        args.as_object()
+            .is_some_and(|map| map.keys().all(|key| matches!(
+                key.as_str(),
+                "op" | "session_id"
+                    | "command"
+                    | "profile"
+                    | "io"
+                    | "cwd"
+                    | "idempotency_key"
+                    | "key_generation"
+                    | "work_id"
+                    | "purpose"
+                    | "completion_condition"
+            ))),
+        "unknown start argument"
+    );
     let mut canonical = args.clone();
     canonical
         .as_object_mut()
@@ -403,14 +423,14 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
     );
     let profile = text(args, "profile")?;
     ensure!(
-        ["host", "sandbox"].contains(&profile),
-        "profile must be host or sandbox"
+        ["host", "sandbox"].contains(&profile) || crate::profiles::custom(profile),
+        "profile must be host, sandbox or admin:<id>"
     );
     let io = args.get("io").and_then(Value::as_str).unwrap_or("pty");
     ensure!(["pty", "pipes"].contains(&io), "io must be pty or pipes");
     ensure!(
-        profile != "sandbox" || io == "pipes",
-        "sandbox profile uses pipes; host PTY retains full OS-user rights"
+        profile == "host" || io == "pipes",
+        "sandbox and admin profiles require pipes; host PTY retains full OS-user rights"
     );
     let cwd = if let Some(path) = args.get("cwd").and_then(Value::as_str) {
         config::canonical_directory(Path::new(path))?
@@ -425,6 +445,18 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
                 .any(|root| cwd.starts_with(root)),
         "sandbox cwd must lie within session permitted roots"
     );
+    // Resolve exactly once for a NEW start, after idempotent replay. Edits never
+    // change a running execution or cause an old key to execute a new definition.
+    let admin = if crate::profiles::custom(profile) {
+        Some(crate::profiles::resolve(profile)?)
+    } else {
+        None
+    };
+    let mut prepared = if let Some(def) = &admin {
+        Some(def.command(&command, &cwd, &session.cwd, &session.permitted_directories)?)
+    } else {
+        None
+    };
     let mut state = ledger.lock().unwrap();
     if state.executions.len() >= EXECUTIONS {
         let candidate = state
@@ -458,11 +490,14 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
     let retain_work = ["work_id", "purpose", "completion_condition"]
         .iter()
         .any(|key| args.get(key).is_some());
-    let reserved = json!({"execution_id":id,"session_id":session.id,"work_id":work_id,
+    let mut reserved = json!({"execution_id":id,"session_id":session.id,"work_id":work_id,
         "purpose":purpose,"completion_condition":condition,"command":command,
         "status":"starting","exit_code":null,"cursor":initial_cursor,"initial_cursor":initial_cursor,
         "retain_work":retain_work,
         "profile":profile,"io":io,"session_state":"open","stdin_closed":false,"key_generation":generation});
+    if let Some(def) = &admin {
+        reserved["execution_policy"] = def.metadata()?;
+    }
     state.durable.reserve(reserved.clone(), key, fingerprint)?;
     let Ledger {
         executions,
@@ -491,7 +526,9 @@ async fn start(args: &Value, ledger: Shared) -> Result<Value> {
             )],
         )
     } else {
-        let mut process = if profile == "sandbox" {
+        let mut process = if let Some(process) = prepared.take() {
+            process
+        } else if profile == "sandbox" {
             sandbox::command(&command, &cwd, &session.permitted_directories)?
         } else {
             let mut p = tokio::process::Command::new(&command[0]);
@@ -678,7 +715,7 @@ async fn handle(
 ) -> Result<Value> {
     match text(&args, "op")? {
         "ping" => Ok(
-            json!({"pid":std::process::id(),"epoch":ledger.lock().unwrap().epoch,"protocol":2,"recovery":2}),
+            json!({"pid":std::process::id(),"epoch":ledger.lock().unwrap().epoch,"protocol":2,"recovery":2,"admin_profiles":1}),
         ),
         "shutdown" => {
             shutdown.notify_one();
@@ -690,6 +727,7 @@ async fn handle(
             let session = config::create_session(&cwd, None).await?;
             let state = ledger.lock().unwrap();
             let mut value = json!(session);
+            value["execution_profiles"] = crate::profiles::catalog();
             value["recovery"] = state.durable.recovery_info();
             value["executions"] = json!(
                 state
@@ -724,7 +762,7 @@ async fn handle(
             }
             let state = ledger.lock().unwrap();
             Ok(
-                json!({"sessions":sessions,"executions":state.durable.records(),"checkpoints":state.durable.checkpoints(),"persistence_ok":state.durable.healthy(),"recovery":state.durable.recovery_info()}),
+                json!({"execution_profiles":crate::profiles::catalog(),"sessions":sessions,"executions":state.durable.records(),"checkpoints":state.durable.checkpoints(),"persistence_ok":state.durable.healthy(),"recovery":state.durable.recovery_info()}),
             )
         }
         "inspect_session" => Ok(json!(

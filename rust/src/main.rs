@@ -4,6 +4,7 @@ mod broker;
 mod durable;
 mod events;
 mod files;
+mod profiles;
 mod server;
 mod wait;
 mod workspace;

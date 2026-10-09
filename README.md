@@ -9,7 +9,7 @@ Linux を複数プロジェクトの開発環境として使う独立した Rust
 | ツール | 用途 |
 | --- | --- |
 | open_session, list_sessions, close_session | canonical cwd と permitted roots を持つ project metadata、実行一覧、管理対象の終了 |
-| start_execution | 新規開始前に取得した `key_generation` とキーを保存して重複防止。明示した argv を一度開始。profile は必須の host / sandbox、io は pty / pipes |
+| start_execution | 新規開始前に取得した `key_generation` とキーを保存して重複防止。明示した argv を一度開始。profile は必須の host / sandbox / admin:<id>、io は pty / pipes（admin は pipes のみ） |
 | input_execution, resize_execution, signal_execution | 明示した execution_id へ stdin、端末サイズ、INT / TERM / KILL |
 | read_execution | 通常は `view:summary` で短い状態を取得。必要時にcursor差分detailを非破壊読取（互換用の既定値はdetail） |
 | checkpoint_execution | 読者別の詳細処理cursor・目的・完了条件をrevision CASで永続保存。検証済み完了は `completed:true` として履歴縮約を許可。[復旧契約](docs/DURABLE-RECOVERY.md) |
@@ -21,6 +21,8 @@ Linux を複数プロジェクトの開発環境として使う独立した Rust
 `open_session({"cwd":"/home/ubuntu/projects/example"})` は同じ canonical directory に同じ ID を返します。shell を自動起動しません。`start_execution({"session_id":"…","command":["/bin/bash"],"profile":"host","io":"pty"})` の返す execution_id を以後の操作に使います。新しいIDはspawn前に保存するbroker epoch＋UUIDのopaque handleです。実 PID・Linux process start ticks は記録の別フィールドに保存します。裸のPIDや旧brokerの記録による実行制御は拒否し、保存済み履歴は読み取りで回収します。実行終了後の接続で command を再実行しません。
 
 単一 broker が子プロセス、実行状態、出力 journal を所有します。実行制御の所有者は1つです。selected/current job、暗黙の主 shell、編集 lock、強制 worktree、承認 console はありません。旧 execute/start/run、poll/read snapshots、stop aliases、HTTP/OAuth、legacy initialize は削除しました。MCP 2026-07-28 の `server/discover` と各 request の metadata を使います。
+
+管理者定義profileは `/etc/dev-session-mcp/profiles.json`（broker起動環境の `DEV_SESSION_MCP_PROFILES` で変更可）のargv配列から読み込みます。`profile:"admin:<id>"` は標準Codex sandboxとは独立した生bwrap設定で、安全性は管理者定義です。設定は新規開始ごとに反映し、同じkeyの再送は元の実行・定義hashを返します。[設定・境界・反映方法](docs/SANDBOX-PROFILES-DESIGN.md)、[未検証のサンプル](examples/admin-profiles.json)を確認してください。設定やOS権限を本番へ自動適用しません。
 
 ## Events と回収
 

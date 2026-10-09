@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "workspace-host-network",
+      "bwrap": "/usr/bin/bwrap",
+      "args": [
+        "--new-session", "--die-with-parent",
+        "--ro-bind", "/", "/",
+        "--dev", "/dev", "--proc", "/proc",
+        "{{writable_roots}}",
+        "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+        "--cap-drop", "ALL", "--chdir", "{{cwd}}"
+      ]
+    }
+  ]
+}

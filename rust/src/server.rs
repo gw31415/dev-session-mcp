@@ -60,8 +60,8 @@ fn definitions() -> Vec<Value> {
     );
     add(
         "start_execution",
-        "Start argv once. Persist idempotency_key and recovery.key_generation from list/open before sending; reuse only that pair for an identical request to recover a lost ACK. Unknown outcomes never auto-restart. Optional work_id/purpose/completion_condition survive reconnect. host uses FULL OS-user filesystem/network rights without approval; sandbox restricts writes to session roots and disables network, and requires io=pipes. PTY merges stdout/stderr. Subscribe to execution.events for batched push; read_execution is for reconnection/gaps. Returns the execution record. No automatic shell or implicit selected job.",
-        json!({"session_id":id,"command":{"type":"array","items":text,"minItems":1,"maxItems":256},"profile":{"type":"string","enum":["sandbox","host"]},"io":{"type":"string","enum":["pty","pipes"],"default":"pty"},"cwd":path,"idempotency_key":id,"key_generation":id,"work_id":id,"purpose":{"type":"string","maxLength":2048},"completion_condition":{"type":"string","maxLength":2048}}),
+        "Start argv once. Persist idempotency_key and recovery.key_generation from list/open before sending; reuse only that pair for an identical request to recover a lost ACK. Unknown outcomes never auto-restart. Optional work_id/purpose/completion_condition survive reconnect. host uses FULL OS-user filesystem/network rights without approval; sandbox restricts writes to session roots and disables network, and requires io=pipes. admin:<id> selects operator-defined raw bubblewrap (pipes only), NOT standard sandbox guarantees; discover IDs/hashes in list_sessions.execution_profiles. Same-key replay retains original policy even after config edits. PTY merges stdout/stderr. Subscribe to execution.events for batched push; read_execution is for reconnection/gaps. Returns the execution record. No automatic shell or implicit selected job.",
+        json!({"session_id":id,"command":{"type":"array","items":text,"minItems":1,"maxItems":256},"profile":{"type":"string","pattern":"^(sandbox|host|admin:[A-Za-z0-9_-]{1,64})$","maxLength":70},"io":{"type":"string","enum":["pty","pipes"],"default":"pty"},"cwd":path,"idempotency_key":id,"key_generation":id,"work_id":id,"purpose":{"type":"string","maxLength":2048},"completion_condition":{"type":"string","maxLength":2048}}),
         &["session_id", "command", "profile"],
         false,
     );
@@ -289,6 +289,23 @@ impl ServerHandler for Server {
             return Err(McpError::invalid_params("unknown tool", None));
         }
         let mut args = json!(request.arguments.unwrap_or_default());
+        if request.name == "start_execution"
+            && args["profile"]
+                .as_str()
+                .is_some_and(crate::profiles::custom)
+        {
+            let support = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                self.broker.call(json!({"op":"ping"})),
+            )
+            .await;
+            if !matches!(support, Ok(Ok(ref info)) if info["admin_profiles"] == 1) {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "broker lacks admin profiles v1; no command sent",
+                )])
+                .into());
+            }
+        }
         let needs_recovery = request.name == "checkpoint_execution"
             || [
                 "idempotency_key",
