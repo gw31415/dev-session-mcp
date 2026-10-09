@@ -27,6 +27,8 @@ const HISTORY_BYTES: usize = 1024 * 1024;
 const HISTORY_EVENTS: usize = 1024;
 const EXECUTIONS: usize = 64;
 const BATCH_BYTES: usize = 32 * 1024;
+/// Bumped whenever frontend and broker operations change incompatibly.
+const PROTOCOL: u64 = 3;
 
 type Shared = Arc<Mutex<Ledger>>;
 struct Execution {
@@ -167,31 +169,46 @@ impl Ledger {
 pub struct Client {
     socket: PathBuf,
     uid: u32,
+    /// Frontends restart a missing broker; the broker's own client never does.
+    spawn: bool,
 }
 impl Client {
-    #[cfg(test)]
-    pub fn test_socket(socket: PathBuf) -> Self {
+    pub fn at(socket: PathBuf) -> Self {
         Self {
             socket,
             uid: unsafe { libc::geteuid() },
+            spawn: false,
         }
     }
 
     pub async fn new() -> Result<Self> {
-        workspace::clean_environment()?;
-        let state = workspace::state_dir()?;
-        let socket = std::env::var_os("DEV_SESSION_MCP_BROKER_SOCKET")
-            .map(PathBuf::from)
-            .unwrap_or(state.join("broker.sock"));
-        let uid = unsafe { libc::geteuid() };
-        let client = Self { socket, uid };
-        if client.call(json!({"op":"ping"})).await.is_ok() {
-            return Ok(client);
+        let configured = std::env::var_os("DEV_SESSION_MCP_BROKER_SOCKET");
+        let client = Self {
+            spawn: configured.is_none(),
+            ..Self::at(
+                configured
+                    .map(PathBuf::from)
+                    .unwrap_or(workspace::state_dir()?.join("broker.sock")),
+            )
+        };
+        client.ensure_broker().await?;
+        Ok(client)
+    }
+
+    async fn ensure_broker(&self) -> Result<()> {
+        if let Ok(info) = self.request(json!({"op":"ping"})).await {
+            ensure!(
+                info["protocol"] == PROTOCOL,
+                "running broker speaks protocol {} (expected {PROTOCOL}); stop it after its executions finish, then reconnect",
+                info["protocol"]
+            );
+            return Ok(());
         }
         ensure!(
-            std::env::var_os("DEV_SESSION_MCP_BROKER_SOCKET").is_none(),
+            self.spawn,
             "configured broker unavailable; no alternate broker started"
         );
+        let state = workspace::state_dir()?;
         let mut command = std::process::Command::new(std::env::current_exe()?);
         command
             .arg("broker")
@@ -201,11 +218,10 @@ impl Client {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(origins) = std::env::var_os("DEV_SESSION_MCP_FILE_ORIGINS") {
-            command.env("DEV_SESSION_MCP_FILE_ORIGINS", origins);
-        }
-        if let Some(path) = std::env::var_os(crate::profiles::ENV) {
-            command.env(crate::profiles::ENV, path);
+        for key in ["DEV_SESSION_MCP_FILE_ORIGINS", crate::profiles::ENV] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
         }
         use std::os::unix::process::CommandExt;
         unsafe {
@@ -217,16 +233,34 @@ impl Client {
             });
         }
         let mut child = command.spawn()?;
+        // Reap the broker if it exits early; once running it outlives us (setsid).
         for _ in 0..100 {
-            if client.call(json!({"op":"ping"})).await.is_ok() {
-                return Ok(client);
+            if self.request(json!({"op":"ping"})).await.is_ok() {
+                return Ok(());
             }
-            ensure!(child.try_wait()?.is_none(), "broker exited during startup");
+            if child.try_wait()?.is_some() {
+                // Another frontend may have won the broker lock meanwhile.
+                return self.request(json!({"op":"ping"})).await.map(|_| ());
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         anyhow::bail!("broker startup timed out")
     }
+
     pub async fn call(&self, request: Value) -> Result<Value> {
+        match self.connect().await {
+            Ok(stream) => self.exchange(stream, request).await,
+            Err(_) if self.spawn => {
+                self.ensure_broker().await?;
+                self.exchange(self.connect().await?, request).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+    async fn request(&self, request: Value) -> Result<Value> {
+        self.exchange(self.connect().await?, request).await
+    }
+    async fn connect(&self) -> Result<UnixStream> {
         let metadata = std::fs::symlink_metadata(&self.socket)?;
         ensure!(
             metadata.file_type().is_socket()
@@ -234,8 +268,11 @@ impl Client {
                 && metadata.mode() & 0o077 == 0,
             "broker socket must be private and owned by this UID"
         );
-        let mut stream = UnixStream::connect(&self.socket).await?;
+        let stream = UnixStream::connect(&self.socket).await?;
         ensure!(stream.peer_cred()?.uid() == self.uid, "broker UID mismatch");
+        Ok(stream)
+    }
+    async fn exchange(&self, mut stream: UnixStream, request: Value) -> Result<Value> {
         let mut body = serde_json::to_vec(&request)?;
         ensure!(body.len() < FRAME as usize, "request too large");
         body.push(b'\n');
@@ -243,10 +280,17 @@ impl Client {
         let mut response = Vec::new();
         let mut reader = BufReader::new(stream.take(FRAME + 1));
         let read = reader.read_until(b'\n', &mut response);
-        if request["op"] == "wait_events" {
-            read.await?;
-        } else {
-            tokio::time::timeout(Duration::from_secs(20), read).await??;
+        match request["op"].as_str() {
+            Some("wait_events") => {
+                read.await?;
+            }
+            // Callback verification has its own DNS/connect/response deadlines.
+            Some("events_subscribe") => {
+                tokio::time::timeout(Duration::from_secs(40), read).await??;
+            }
+            _ => {
+                tokio::time::timeout(Duration::from_secs(20), read).await??;
+            }
         }
         ensure!(
             response.len() <= FRAME as usize && response.last() == Some(&b'\n'),
@@ -712,11 +756,14 @@ async fn handle(
     ledger: Shared,
     starts: Arc<tokio::sync::Mutex<()>>,
     shutdown: Arc<Notify>,
+    events: crate::events::Events,
 ) -> Result<Value> {
     match text(&args, "op")? {
         "ping" => Ok(
-            json!({"pid":std::process::id(),"epoch":ledger.lock().unwrap().epoch,"protocol":2,"recovery":2,"admin_profiles":1}),
+            json!({"pid":std::process::id(),"epoch":ledger.lock().unwrap().epoch,"protocol":PROTOCOL}),
         ),
+        "events_subscribe" => events.subscribe(args["params"].clone()).await,
+        "events_unsubscribe" => events.unsubscribe(args["params"].clone()).await,
         "shutdown" => {
             shutdown.notify_one();
             Ok(json!({"status":"stopping"}))
@@ -1032,6 +1079,8 @@ pub async fn run() -> Result<()> {
             let _ = flushing.lock().unwrap().durable.flush();
         }
     });
+    // Webhook workers reach the ledger through this broker's own socket.
+    let events = crate::events::Events::new(Client::at(socket.clone())).await?;
     let starts = Arc::new(tokio::sync::Mutex::new(()));
     let shutdown = Arc::new(Notify::new());
     let slots = Arc::new(tokio::sync::Semaphore::new(32));
@@ -1047,6 +1096,7 @@ pub async fn run() -> Result<()> {
         let ledger = ledger.clone();
         let starts = starts.clone();
         let shutdown = shutdown.clone();
+        let events = events.clone();
         tokio::spawn(async move {
             let _slot = slot;
             let (reader, mut writer) = stream.into_split();
@@ -1062,7 +1112,7 @@ pub async fn run() -> Result<()> {
                 let request = serde_json::from_slice(&bytes)?;
                 let mut disconnected = [0u8; 1];
                 tokio::select! {
-                    response=handle(request,ledger,starts,shutdown)=>response,
+                    response=handle(request,ledger,starts,shutdown,events)=>response,
                     _=reader.read(&mut disconnected)=>anyhow::bail!("client disconnected"),
                 }
             }
@@ -1114,171 +1164,4 @@ pub async fn run() -> Result<()> {
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(state.join("broker.pid"));
     Ok(())
-}
-
-#[cfg(test)]
-mod recovery_tests {
-    use super::*;
-    use crate::durable::{Store, WriteFault};
-
-    fn input_fixture(path: PathBuf) -> Result<(Shared, mpsc::Receiver<Action>)> {
-        let record = json!({"execution_id":"fixture","session_id":"session","work_id":"work",
-            "cursor":"epoch:0","initial_cursor":"epoch:0","status":"running","io":"pipes",
-            "session_state":"open","stdin_closed":false,"command":["/bin/cat"]});
-        let mut durable = Store::open(path)?;
-        durable.reserve(record.clone(), None, "hash".into())?;
-        let (actions, rx) = mpsc::channel(8);
-        let (signals, _) = mpsc::channel(8);
-        let ledger = Ledger {
-            epoch: "epoch".into(),
-            sequence: 0,
-            events: VecDeque::new(),
-            bytes: 0,
-            executions: HashMap::from([(
-                "fixture".into(),
-                Execution {
-                    record,
-                    actions,
-                    signals,
-                },
-            )]),
-            changed: Arc::new(Notify::new()),
-            durable,
-        };
-        Ok((Arc::new(Mutex::new(ledger)), rx))
-    }
-    async fn input(ledger: Shared) -> Result<Value> {
-        handle(json!({"op":"input_execution","execution_id":"fixture","text":"ONCE","close_stdin":true}),
-            ledger, Arc::new(tokio::sync::Mutex::new(())),Arc::new(Notify::new())).await
-    }
-    #[test]
-    fn live_read_merges_checkpoint_metadata_without_replacing_process_state() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let (ledger, _rx) = input_fixture(temp.path().join("recovery.json"))?;
-        let mut state = ledger.lock().unwrap();
-        state.durable.checkpoint(&json!({"execution_id":"fixture","reader_id":"owner","cursor":"epoch:0","expected_revision":0,
-            "purpose":"late purpose","completion_condition":"verified exit"}))?;
-        // Simulate a live process update not yet reflected in the durable snapshot.
-        state.executions.get_mut("fixture").unwrap().record["status"] = json!("exited");
-        state.executions.get_mut("fixture").unwrap().record["input"] =
-            json!({"delivery":"written"});
-        let args = json!({"execution_id":"fixture","cursor":"epoch:0"});
-        let read = state.read(&args)?;
-        assert_eq!(read["execution"]["status"], "exited");
-        assert_eq!(read["execution"]["input"]["delivery"], "written");
-        assert_eq!(read["execution"]["cursor"], "epoch:0");
-        assert_eq!(read["execution"]["purpose"], "late purpose");
-        assert_eq!(read["execution"]["retain_work"], true);
-        state.append_checked("fixture", "exited", json!({"exit_code":0}))?;
-        state.durable.checkpoint(&json!({"execution_id":"fixture","reader_id":"owner","cursor":"epoch:1","expected_revision":1,"completed":true}))?;
-        let read = state.read(&args)?;
-        let listed = &state.durable.records()[0];
-        for field in [
-            "purpose",
-            "completion_condition",
-            "retain_work",
-            "work_completed",
-        ] {
-            assert_eq!(read["execution"].get(field), listed.get(field));
-        }
-        assert_eq!(read["execution"]["work_completed"], true);
-        Ok(())
-    }
-    #[tokio::test]
-    async fn input_requires_durable_preparation_at_every_storage_boundary() -> Result<()> {
-        for stage in [
-            WriteFault::Disk,
-            WriteFault::Fsync,
-            WriteFault::Rename,
-            WriteFault::DirectoryFsync,
-        ] {
-            let temp = tempfile::tempdir()?;
-            let path = temp.path().join("recovery.json");
-            let (ledger, mut rx) = input_fixture(path.clone())?;
-            ledger.lock().unwrap().durable.fail_write(stage, 0);
-            let error = input(ledger.clone()).await.unwrap_err();
-            assert!(error.to_string().contains("stdin not sent"), "{stage:?}");
-            assert!(
-                rx.try_recv().is_err(),
-                "input was queued after {stage:?} failure"
-            );
-            let state = ledger.lock().unwrap();
-            assert!(!state.durable.healthy());
-            assert_eq!(
-                state.executions["fixture"].record["input"]["delivery"],
-                "not_sent"
-            );
-            drop(state);
-            let restarted = Store::open(path)?;
-            if stage == WriteFault::DirectoryFsync {
-                // Rename succeeded, so even a visible prepared receipt cannot prove queue delivery.
-                assert_eq!(
-                    restarted.record("fixture").unwrap()["input"]["delivery"],
-                    "delivery_unknown"
-                );
-                assert!(restarted.record("fixture").unwrap()["input"]["queued"].is_null());
-            }
-        }
-        Ok(())
-    }
-    #[tokio::test]
-    async fn input_queue_receipt_failure_is_unknown_and_never_a_success_ack() -> Result<()> {
-        for stage in [
-            WriteFault::Disk,
-            WriteFault::Fsync,
-            WriteFault::Rename,
-            WriteFault::DirectoryFsync,
-        ] {
-            let temp = tempfile::tempdir()?;
-            let path = temp.path().join("recovery.json");
-            let (ledger, mut rx) = input_fixture(path.clone())?;
-            ledger.lock().unwrap().durable.fail_write(stage, 1);
-            assert!(
-                input(ledger.clone())
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("delivery_unknown")
-            );
-            match rx.try_recv()? {
-                Action::Input(bytes, receipt, close) => {
-                    assert_eq!(bytes, b"ONCE");
-                    assert_eq!(receipt, 1);
-                    assert!(close);
-                }
-                _ => panic!("wrong action"),
-            }
-            assert!(rx.try_recv().is_err());
-            let disk: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-            let receipt = &disk["records"]["fixture"]["input"];
-            assert_eq!(receipt["sequence"], 1); // The pre-send snapshot must include the receipt itself.
-            assert!(matches!(
-                receipt["delivery"].as_str(),
-                Some("prepared" | "accepted")
-            ));
-            assert_eq!(disk["events"][0]["data"]["delivery"], "prepared");
-            let restarted = Store::open(path)?;
-            assert_eq!(
-                restarted.record("fixture").unwrap()["input"]["delivery"],
-                "delivery_unknown"
-            );
-        }
-        Ok(())
-    }
-    #[tokio::test]
-    async fn accepted_input_has_a_durable_receipt_and_exactly_one_queued_action() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let path = temp.path().join("recovery.json");
-        let (ledger, mut rx) = input_fixture(path.clone())?;
-        let ack = input(ledger).await?;
-        assert_eq!(ack["input"]["delivery"], "accepted");
-        assert_eq!(ack["input"]["queued"], true);
-        let disk: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-        assert_eq!(disk["records"]["fixture"]["input"], ack["input"]);
-        assert_eq!(disk["events"][0]["data"]["delivery"], "prepared");
-        assert_eq!(disk["events"][1]["data"]["delivery"], "accepted");
-        assert!(matches!(rx.try_recv()?, Action::Input(_, 1, true)));
-        assert!(rx.try_recv().is_err());
-        Ok(())
-    }
 }

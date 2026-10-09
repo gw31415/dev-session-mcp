@@ -1,14 +1,15 @@
 [package]
 name = "dev-session-mcp"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
-description = "Persistent Rust stdio development MCP for Secure MCP Tunnel"
+description = "Persistent development-host MCP server over stdio and Streamable HTTP"
 default-run = "dev-session-mcp"
 
 [dependencies]
-rmcp = { version = "=3.5.1", features = ["transport-io"] }
+rmcp = { version = "=3.5.1", features = ["transport-io", "transport-streamable-http-server"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"
 anyhow = "1"
@@ -48,5 +49,4 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3"
-axum = "0.8"
 futures-util = "0.3"

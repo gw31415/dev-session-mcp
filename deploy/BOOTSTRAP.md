@@ -1,3 +1,0 @@
-# Preparation request for an existing Linux connection
-
-Use the current Ubuntu account and existing SSH/Tailscale connection. Inspect OS/CPU, installed toolchain, active Tunnel/broker process and sessions. Clone/build dev-session-mcp in its independent directory, and run local checks with temporary state. Keep existing binaries/config/state intact. Prepare a versioned binary and clean-env wrapper with a new v3 state path, then report the exact proposed cutover and rollback steps. Do not kill active sessions, replace the production runtime, create keys/grants/users, widen permissions, or change network settings as part of source preparation. Actual cutover and ChatGPT Events delivery require coordinated runtime verification. See [INSTALL](INSTALL.md).

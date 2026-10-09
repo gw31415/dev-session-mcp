@@ -1,0 +1,25 @@
+[Unit]
+Description=dev-session-mcp Streamable HTTP frontend (publish only behind an authenticating proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/projects
+# Same state and broker settings as every other frontend (see deploy/dev-session-mcp-stdio).
+Environment=HOME=/home/ubuntu
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+Environment=DEV_SESSION_MCP_STATE_DIR=/home/ubuntu/.local/state/dev-session-mcp-v3
+Environment=DEV_SESSION_MCP_FILE_ORIGINS=
+ExecStart=/opt/dev-session-mcp/bin/dev-session-mcp http --listen 127.0.0.1:8808 --allowed-host mcp.example.com
+Restart=on-failure
+RestartSec=5
+UMask=0077
+# Keep the shared broker and its executions alive when this frontend restarts.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

@@ -12,6 +12,8 @@ pub fn state_dir() -> Result<PathBuf> {
                 .join(".local/state/dev-session-mcp"),
         ))
 }
+/// The broker is always spawned with a cleared environment; refuse to run it
+/// with transport credentials (client-side MCP_*, tunnel keys) inherited.
 pub fn clean_environment() -> Result<()> {
     ensure!(
         !std::env::vars_os().any(|(k, _)| {
@@ -22,7 +24,7 @@ pub fn clean_environment() -> Result<()> {
                 || k == "OPENAI_ADMIN_KEY"
                 || k == "CREDENTIALS_DIRECTORY"
         }),
-        "transport environment detected; use the fixed clean-env launcher"
+        "transport environment detected; the broker must be started by a frontend"
     );
     Ok(())
 }

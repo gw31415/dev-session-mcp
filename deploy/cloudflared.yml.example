@@ -1,0 +1,8 @@
+# cloudflared config for a named tunnel; protect the hostname with a
+# Cloudflare Access self-hosted application before connecting any client.
+tunnel: REPLACE_WITH_TUNNEL_ID
+credentials-file: /etc/cloudflared/REPLACE_WITH_TUNNEL_ID.json
+ingress:
+  - hostname: mcp.example.com
+    service: http://127.0.0.1:8808
+  - service: http_status:404

@@ -1,25 +1,17 @@
 # Bounded durable execution recovery
 
-Local implementation for parent review. No live frontend, broker, auth, subscription,
-webhook, or service configuration is changed by this commit. Existing executions
-must not be interrupted to activate it. Build only in the dev-session target;
-VPS rollout and any broker transition remain a separate reviewed operation.
+## Contract
 
-## Contract and compatibility
+The same tools are served over stdio and Streamable HTTP, to 2026-07-28
+(`server/discover`) and 2025 (`initialize`) clients alike. Start ACKs and the default
+detail read/wait shape are unchanged. No Tasks capability is advertised: a start ACK
+and a task representing process termination are different contracts, and there is
+no second process owner or Tasks-specific execution store.
 
-The server remains MCP 2026-07-28 (`server/discover`, per-request metadata).
-Existing tools-only clients keep the original start ACK and default detail read/wait
-shape (with additive evidence fields). This does not introduce support for the
-2025 initialize handshake, which the existing server already rejected.
-No Tasks capability is advertised. The official extension can later adapt the same
-records, but a start ACK and a task representing process termination are different
-contracts. There is no second process owner or Tasks-specific execution store.
-
-The broker advertises `recovery: 2` in its private ping response. The frontend checks
-this before new recovery-dependent operations. An old retained broker must never
-silently ignore an idempotency key and launch twice. Legacy default detail operations
-still work with the old broker; new recovery requests fail before sending a command.
-No live broker is upgraded or restarted automatically to gain these features.
+Every frontend checks the broker's private protocol number when it connects and
+sends nothing to a broker of a different version, so a retained old broker can never
+silently ignore an idempotency key and launch twice. No live broker is upgraded or
+restarted automatically.
 
 ## Short observation and explicit detail
 
@@ -230,78 +222,3 @@ Primary sources checked on 2026-10-08:
 - [Resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources)
 - [Client matrix](https://modelcontextprotocol.io/extensions/client-matrix): no Tasks
   support column at review time; actual client capability remains unconfirmed.
-
-## Regression scope
-
-`durable::tests` covers reserved-intent crash, request mismatch, bounded key retention,
-reader CAS, failed writes, summary position separation, durable history truncation,
-restart uncertainty, and missing/corrupt snapshot refusal. `tests/recovery_stdio.py` uses a temporary state directory
-and short children for dropped start ACK, duplicate concurrent retries, frontend
-reconnect, summary/detail/Resource equivalence, two readers and CAS conflict, broker
-SIGKILL/restart, unknown outcome, and 400 fresh starts across repeated retirement
-windows. Retired legacy and generation-bound keys are rejected before and after restart.
-Real stdin persistence failure leaves the child input empty. Unit fault injection also
-covers disk writes, fsync, rename, directory fsync, queue-ACK failure, retirement commit
-failure, metadata pressure, completed-reader release, and genuinely unresolved capacity.
-
-Existing wait/stdio/IO/diagnostics tests continue to exercise the default detail
-contract. Live client Tasks support, chat delivery, deployment, and production
-execution continuity are not claimed by these isolated tests.
-
-## Local validation (2026-10-08)
-
-All tests used temporary state / synthetic data and short local children. The old
-broker fixture was the repository's `artifacts/deployment-3d207fc-20261008/dev-session-mcp`,
-launched with a temporary socket; no existing broker process was contacted.
-
-| Check | Result |
-| --- | --- |
-| `cargo test --locked --offline ... -- --test-threads=1` (checkpoint-promotion validation) | 29 passed, 0 failed (including late checkpoint promotion, both stdin commit phases and retirement fault injection) |
-| `cargo build --locked --offline ...` | Passed |
-| `tests/recovery_stdio.py NEW OLD` | Passed; start/input/checkpoint ACK loss, two readers, Resources including escaped URIs, restart, unknown result, 400 starts, retired-key refusal, real unsent stdin, old-broker guard |
-| `tests/wait_execution_stdio.py NEW` | Passed |
-| `tests/wait_execution_stdio.py NEW OLD` | Passed against retained 3d207fc fixture |
-| `tests/delivery_diagnostics_stdio.py NEW` | Passed |
-| `tests/stdio.py NEW` | Passed; existing catalog expectation updated to 16 tools |
-| `tests/io_control.py NEW` | Passed |
-| `cargo test --locked --offline ... durable::tests:: -- --test-threads=1` (snapshot normalization) | 15 passed; v1/v2 checkpoint intent survives reader move, retention pressure and restart until explicit completion; mismatched binding rejected |
-| `cargo fmt -- --check`, `git diff --check` | Passed |
-
-Build environment: `CARGO_INCREMENTAL=0`, `RUSTC_WRAPPER=`,
-`CARGO_TARGET_DIR=/tmp/dev-session-diagnostics-target`, `CARGO_BUILD_JOBS=1`.
-Builds used a free-disk guard that terminates their own process group at 200 MiB.
-About 1280 MiB remained during blocker validation; no Mycast target was modified.
-
-An initial per-output-chunk full snapshot caused a real wait snapshot deadline failure
-under a 1.2 MB output fixture. Bounded output batching and incremental history byte
-accounting fixed that failure; the same fixture now passes. Output since the last
-commit may be lost on crash, so unknown history tails are explicitly reported.
-No live schema/auth/subscription/service changes, push, or deployment were performed.
-
-### Review blockers addressed
-
-- Input receipt and prepared event are now committed together before queue insertion.
-  ENOSPC/write, file fsync, rename, and directory-fsync fault injection verifies no
-  queued action on preparation failure. The same four faults after queue insertion
-  verify an unknown error instead of a success ACK. A real pipe child also receives
-  zero bytes when temporary-snapshot creation fails.
-- The lost-start-ACK fixture now consumes `job.cursor` directly and asserts receipt of
-  its output; it no longer switches to `initial_cursor` to hide a replay-position bug.
-  Completed replay is checked using the returned cursor as well.
-- Real stdio executes 400 additional phases in one declared work, with and without keys,
-  across repeated bounded retirement. A failed phase at the window boundary remains
-  unfinished while repair commands continue, including across a broker restart. Old legacy and explicit-generation keys cannot run again, before
-  or after broker restart. Unknown outcomes and unfinished readers remain discoverable.
-  Unit tests additionally cover declared work before its first checkpoint, moving one
-  reader across 400 completed phases, a second reader pinning a completed phase until
-  moving away, never-completed phase preservation after readers move, completed-reader
-  capacity release, metadata-size
-  pressure, the true unfinished-record limit, preserved epoch watermarks, and v1 migration.
-
-The late-checkpoint-promotion stdio recovery run passed with two read-timeout retries.
-The existing one-second snapshot deadline can be hit under load; the fixture permits only that
-specific read failure to be retried, with unchanged last received cursor and a finite
-20-second recovery budget. Start/input are never retried by this read-recovery path;
-other errors remain test failures. Current/old-broker wait, diagnostics, stdio,
-and I/O-control regressions passed during the preceding phase-retention validation. No production state reset, restart, schema,
-auth, or subscription operation was performed.

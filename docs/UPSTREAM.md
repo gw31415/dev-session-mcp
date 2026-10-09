@@ -11,11 +11,11 @@ This repository maintains three necessary derived modules, `rust/src/base/{confi
 | Responsibility | Ownership |
 | --- | --- |
 | Bounded file tools, project metadata, Codex sandbox invocation | Adapted local-mcp source in rust/src/base |
-| MCP 2026 stdio lifecycle and transport | Official rmcp dependency; small Events discovery adapter |
+| MCP lifecycles (2026-07-28 and 2025) over stdio and Streamable HTTP | Official rmcp dependency; small Events discovery adapter; axum listener |
 | Single process owner, explicit execution API, bounded journal/cursors, PTY/pipes, input and signal routing | dev-session-mcp broker; pty-process dependency |
 | Events verification/signatures, durable bounded outbox, leases/retry | dev-session-mcp events module |
 | Attachment import/URL policy | dev-session-mcp files module |
-| Same-user clean environment launcher and systemd instructions | dev-session-mcp deploy files; official external tunnel-client |
+| Same-user launchers and systemd units | dev-session-mcp deploy files; external tunnel-client / cloudflared |
 
 Version 0.3 intentionally replaces the old tool contracts. Upstream approval console, execute/start/poll/stop/without_sandbox and the previous dual job/session maps are removed; no legacy compatibility is claimed. Sandbox restrictions remain explicit in the mandatory execution profile and file write path. Host profile openly grants the owner's normal OS rights. See [README](../README.md).
 
