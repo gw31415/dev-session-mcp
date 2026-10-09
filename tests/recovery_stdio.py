@@ -79,6 +79,21 @@ def run(binary):
                     return page, all_events
             raise AssertionError("short fixture did not finish")
 
+        def check_work_observations(c, job, expected):
+            fields = ("purpose", "completion_condition", "retain_work", "work_completed")
+            listed = next(v for v in c.tool("list_sessions")["executions"] if v["execution_id"] == job["execution_id"])
+            assert {k:listed.get(k) for k in fields} == expected
+            for tool in ("read_execution", "wait_execution"):
+                for view in ("summary", "detail"):
+                    extra = {"max_wait_ms":0} if tool == "wait_execution" else {}
+                    page = c.tool(tool,execution_id=job["execution_id"],cursor=job["cursor"],view=view,**extra)
+                    assert {k:page["execution"].get(k) for k in fields} == expected, (tool,view)
+                    assert page["execution"]["status"] == listed["status"]
+            uri = f"dev-session:///executions/{job['execution_id']}?cursor={quote(job['cursor'],safe='')}"
+            resource = c.request("resources/read",{"uri":uri})["result"]
+            observed = json.loads(resource["contents"][0]["text"])["execution"]
+            assert {k:observed.get(k) for k in fields} == expected
+
         try:
             broker = boot()
             c = frontend()
@@ -218,8 +233,11 @@ def run(binary):
             late = c.tool("start_execution",session_id=session,command=["/bin/cat"],profile="host",io="pipes")
             c.tool("checkpoint_execution",execution_id=late["execution_id"],reader_id="late-owner",cursor=late["cursor"],expected_revision=0,
                    purpose="late purpose",completion_condition="late condition")
+            late_metadata = dict(purpose="late purpose",completion_condition="late condition",retain_work=True,work_completed=None)
+            check_work_observations(c,late,late_metadata)
             c.tool("input_execution",execution_id=late["execution_id"],close_stdin=True)
             finish(c,late)  # Process events must preserve the checkpoint's promotion.
+            check_work_observations(c,late,late_metadata)
             next_phase = c.tool("start_execution",session_id=session,command=["/bin/true"],profile="host",io="pipes",work_id=late["execution_id"])
             finish(c,next_phase)
             c.tool("checkpoint_execution",execution_id=next_phase["execution_id"],reader_id="late-owner",cursor=next_phase["cursor"],expected_revision=1)
@@ -229,6 +247,8 @@ def run(binary):
                                work_id="continued-work",purpose="repair the same work",completion_condition="phase verified",**extra)
                 finish(c, short)
                 c.tool("checkpoint_execution",execution_id=short["execution_id"],reader_id="owner",cursor=short["cursor"],expected_revision=n,completed=True)
+                if n in (0, 201):
+                    check_work_observations(c,short,dict(purpose="repair the same work",completion_condition="phase verified",retain_work=True,work_completed=True))
                 if n == 127:
                     failed = c.tool("start_execution",session_id=session,command=["/bin/false"],profile="host",io="pipes",
                                     work_id="continued-work",purpose="repair the same work",completion_condition="phase verified")
@@ -270,6 +290,7 @@ def run(binary):
                            idempotency_key="after-retirement-restart",key_generation=c.tool("list_sessions")["recovery"]["key_generation"])
             finish(c,fresh)
             c.tool("checkpoint_execution",execution_id=late["execution_id"],reader_id="finisher",cursor=late["cursor"],expected_revision=0,completed=True)
+            check_work_observations(c,late,dict(late_metadata,work_completed=True))
             after = c.tool("start_execution",session_id=session,command=["/bin/true"],profile="host",io="pipes")
             finish(c,after)
             assert not any(v["execution_id"] == late["execution_id"] for v in c.tool("list_sessions")["executions"])

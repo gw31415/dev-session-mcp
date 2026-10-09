@@ -94,10 +94,32 @@ impl Ledger {
             return self.durable.read(args);
         }
         let record = execution
-            .map(|id| {
-                self.executions
+            .map(|id| -> Result<Value> {
+                let mut record = self
+                    .executions
                     .get(id)
-                    .context("execution unavailable; never use a bare PID")
+                    .context("execution unavailable; never use a bare PID")?
+                    .record
+                    .clone();
+                let durable = self
+                    .durable
+                    .record(id)
+                    .context("execution evidence unavailable")?;
+                // Checkpoints own work metadata; the live copy may predate them.
+                // Keep live process state, input receipts and cursor unchanged.
+                for field in [
+                    "purpose",
+                    "completion_condition",
+                    "retain_work",
+                    "work_completed",
+                ] {
+                    if let Some(value) = durable.get(field) {
+                        record[field] = value.clone();
+                    } else {
+                        record.as_object_mut().unwrap().remove(field);
+                    }
+                }
+                Ok(record)
             })
             .transpose()?;
         let earliest = self
@@ -137,7 +159,7 @@ impl Ledger {
             end = seq;
         }
         Ok(
-            json!({"execution":record.map(|r|r.record.clone()),"events":events,"cursor":format!("{}:{end}",self.epoch),"earliest_cursor":format!("{}:{}",self.epoch,earliest.saturating_sub(1)),"catch_up_required":gap,"more":more,"persistence_ok":self.durable.healthy(),"durable_cursor":execution.map(|id| self.durable.durable_cursor(id)),"observed_cursor":format!("{}:{}",self.epoch,self.sequence)}),
+            json!({"execution":record,"events":events,"cursor":format!("{}:{end}",self.epoch),"earliest_cursor":format!("{}:{}",self.epoch,earliest.saturating_sub(1)),"catch_up_required":gap,"more":more,"persistence_ok":self.durable.healthy(),"durable_cursor":execution.map(|id| self.durable.durable_cursor(id)),"observed_cursor":format!("{}:{}",self.epoch,self.sequence)}),
         )
     }
 }
@@ -1090,6 +1112,39 @@ mod recovery_tests {
     async fn input(ledger: Shared) -> Result<Value> {
         handle(json!({"op":"input_execution","execution_id":"fixture","text":"ONCE","close_stdin":true}),
             ledger, Arc::new(tokio::sync::Mutex::new(())),Arc::new(Notify::new())).await
+    }
+    #[test]
+    fn live_read_merges_checkpoint_metadata_without_replacing_process_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (ledger, _rx) = input_fixture(temp.path().join("recovery.json"))?;
+        let mut state = ledger.lock().unwrap();
+        state.durable.checkpoint(&json!({"execution_id":"fixture","reader_id":"owner","cursor":"epoch:0","expected_revision":0,
+            "purpose":"late purpose","completion_condition":"verified exit"}))?;
+        // Simulate a live process update not yet reflected in the durable snapshot.
+        state.executions.get_mut("fixture").unwrap().record["status"] = json!("exited");
+        state.executions.get_mut("fixture").unwrap().record["input"] =
+            json!({"delivery":"written"});
+        let args = json!({"execution_id":"fixture","cursor":"epoch:0"});
+        let read = state.read(&args)?;
+        assert_eq!(read["execution"]["status"], "exited");
+        assert_eq!(read["execution"]["input"]["delivery"], "written");
+        assert_eq!(read["execution"]["cursor"], "epoch:0");
+        assert_eq!(read["execution"]["purpose"], "late purpose");
+        assert_eq!(read["execution"]["retain_work"], true);
+        state.append_checked("fixture", "exited", json!({"exit_code":0}))?;
+        state.durable.checkpoint(&json!({"execution_id":"fixture","reader_id":"owner","cursor":"epoch:1","expected_revision":1,"completed":true}))?;
+        let read = state.read(&args)?;
+        let listed = &state.durable.records()[0];
+        for field in [
+            "purpose",
+            "completion_condition",
+            "retain_work",
+            "work_completed",
+        ] {
+            assert_eq!(read["execution"].get(field), listed.get(field));
+        }
+        assert_eq!(read["execution"]["work_completed"], true);
+        Ok(())
     }
     #[tokio::test]
     async fn input_requires_durable_preparation_at_every_storage_boundary() -> Result<()> {
