@@ -1,5 +1,6 @@
 #!/bin/sh
-# Fixed same-UID launcher; edit the existing user's paths at installation.
+# Fixed same-UID stdio launcher (SSH forced command, tunnel-client, local clients).
+# Keep DEV_SESSION_MCP_* identical to deploy/dev-session-mcp-http.service.
 set -eu
 if test "$#" -ne 0; then
   printf 'This launcher takes no arguments.\n' >&2

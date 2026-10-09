@@ -1,9 +1,0 @@
-attach reply owned-a {"status": {"Created": {"warnings": []}}}
-attach reply owned-a {"status": {"Attached": {"warnings": []}}}
-{"reattach_exit": {"code": 7, "final_output_tail_present": true}}
-PASS shpool headless private socket: attach, detach/reattach, stdin/output, actual exit 7
-attach reply owned-b {"status": {"Created": {"warnings": []}}}
-PASS separate session and named stop
-attach reply owned-c {"status": {"Created": {"warnings": []}}}
-attach reply owned-c {"status": {"Created": {"warnings": []}}}
-{"detached_completion_reattach": {"execution_count": 2, "exit_status": 9, "creates_new_command": true, "reply": {"status": {"Created": {"warnings": []}}}}}

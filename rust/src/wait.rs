@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 // Leave broker slots available for execution control. No queued background waiters.
-static WAITERS: Semaphore = Semaphore::const_new(4);
+static WAITERS: Semaphore = Semaphore::const_new(8);
 const SNAPSHOT_BUDGET: Duration = Duration::from_secs(1);
 
 async fn snapshot(broker: &Client, args: &Value) -> Result<Value> {
@@ -159,7 +159,7 @@ mod tests {
             }
         });
         let result = execution(
-            &Client::test_socket(path),
+            &Client::at(path),
             json!({"execution_id":"target","cursor":"epoch:3"}),
         )
         .await?;
@@ -189,7 +189,7 @@ mod tests {
         });
         let began = tokio::time::Instant::now();
         let result = execution(
-            &Client::test_socket(path),
+            &Client::at(path),
             json!({"execution_id":"target","cursor":"epoch:3","max_wait_ms":0}),
         )
         .await;

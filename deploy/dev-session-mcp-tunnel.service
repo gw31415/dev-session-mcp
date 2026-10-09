@@ -1,5 +1,5 @@
 [Unit]
-Description=dev-session-mcp via OpenAI Secure MCP Tunnel
+Description=dev-session-mcp via OpenAI Secure MCP Tunnel (stdio)
 After=network-online.target
 Wants=network-online.target
 

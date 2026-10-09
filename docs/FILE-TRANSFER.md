@@ -2,7 +2,7 @@
 
 [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) 由来のread_file/write_file等に対し、ここに記載するimport_fileとURL取得制限はdev-session-mcpの追加実装です。upstreamへの実装済み機能として扱いません。[由来と保守範囲](UPSTREAM.md)、[NOTICE](../NOTICE.md)。
 
-正式な入力仕様は [Plugins File APIs](https://developers.openai.com/plugins/reference#file-apis) です。ChatGPTがtool descriptorのopenai/fileParams指定に応じて一時download URL/file IDを渡します。使用中のrmcp 3.5.1はtool metadataを保持できます。import_fileを追加し、ファイルbytesを会話本文へ載せずHTTP bodyから作業ファイルへ直接保存します。
+正式な入力仕様は [Plugins File APIs](https://developers.openai.com/plugins/reference#file-apis) です。ChatGPTなどfileParams対応クライアントはtool descriptorの`openai/fileParams`指定に応じて一時download URL/file IDを渡します（非対応クライアントはこのmetadataを無視します）。使用中のrmcp 3.5.1はtool metadataを保持できます。import_fileを追加し、ファイルbytesを会話本文へ載せずHTTP bodyから作業ファイルへ直接保存します。
 
 ## import_file
 
@@ -18,7 +18,7 @@ DEV_SESSION_MCP_FILE_ORIGINSは管理者が固定wrapperに設定する完全一
 
 HTTPS/443、DNS hostname、userinfo/fragmentなしを要求します。解決した全IPを検査し、loopback/private/link-local/共有/Tailscaleアドレス/metadata endpoint/特別用途の範囲を拒否します。検査したIPをHTTP clientへ固定し、DNS再解決によるrebindingを避けます。[IANA IPv4](https://www.iana.org/assignments/iana-ipv4-special-registry)、[IPv6](https://www.iana.org/assignments/iana-ipv6-special-registry) を参照した保守的な範囲です。
 
-fileParamsやfile_id自体を暗号学的な認可証明とは扱いません。Tunnelの呼出認可と、管理者が選んだ配信originの制限に依存します。一般のユーザーURLを無制限fetchする機能ではありません。
+fileParamsやfile_id自体を暗号学的な認可証明とは扱いません。前段プロキシ（Tunnel / Access）の呼出認可と、管理者が選んだ配信originの制限に依存します。一般のユーザーURLを無制限fetchする機能ではありません。
 
 ## 検証範囲と残る出力経路
 

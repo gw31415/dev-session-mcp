@@ -308,10 +308,7 @@ hashはcanonicalな定義（id、実行パス、未展開argv）のSHA-256で、
 
 ### 互換性と本人用プリセット
 
-brokerの既存pingへ `admin_profiles:1` を追加する。新frontendはadmin指定を送信する前に
-これを確認し、旧brokerまたは確認不能ならコマンドを送らずエラーにする。
-旧frontendはadminを選べないが、host/sandboxはそのまま使える。
-新frontendが独自設定を公開しても、接続先の対応確認なしに成功扱いしない。
+frontendは接続時にbrokerのprotocol番号を確認し、異なる版のbrokerには一切コマンドを送らない。
 既存snapshotにはpolicy metadataを捏造せず、世代・cursor・checkpoint契約も変更しない。
 
 製品の標準はsandboxのまま、APIでは引き続きprofile必須。
@@ -427,48 +424,6 @@ profileをunloadすると使用中プロセスの制限を弱める可能性が�
 とは扱わない。復元後は新しい短命プロセスでlabelと元の拒否を確認し、loaded profile/起動時の定義/cacheに
 候補だけが残っていないことを点検する。共有cache全消去、AppArmorサービス全停止、sysctl変更はしない。
 復元結果を記録し、不一致なら本番sandboxの利用開始を見送る。
-
-## ローカル検証と残る実機検証
-
-- unit: 一般argv、operandとコマンド境界、空白を含むroot、placeholder、FD/未知option拒否、
-  定義hashと秘密値非転記、重複/不正設定。既存durable/reader/input契約も回帰する。
-- stdio: tempstateとfake bwrapで起動配線を確認。fakeはargvを記録し要求commandを直接execするため、
-  **sandboxの安全性を証明するtestではない**。設定変更中の実行、同key replay、restart後の旧hash保持、
-  新keyの新hash、list/read/wait/Resources/checkpoint後の一致、設定破損・権限・symlink拒否を検証する。
-- 実bwrapと標準sandboxは現VPSのAppArmor拒否をnegative結果として記録する。
-  payloadが起動していないことを確認し、OSポリシーを変更せず、成功扱いしない。
-- 旧broker fixtureはtempstateで起動し、新frontendがadmin開始を送らず拒否することを確認する。
-- 管理者設定を適用する将来の環境では、実bwrapのnamespace、capability、write範囲、network共有と
-  restrictedの差をtest用loopbackで検証する。今回のfake成功をその代用にしない。
-- ビルドは既存専用 `/tmp/dev-session-diagnostics-target`、直列、
-  `CARGO_INCREMENTAL=0 RUSTC_WRAPPER=`。空き200MiB未満で自分のbuild/testだけを停止する。
-  本番state、認証、サービス、Mycast targetには触れない。
-
-## 検証結果（ローカル変更、2026-10-09）
-
-全て一時stateと短命child。既存release `9b75422` は旧broker fixtureのbinaryとしてのみ使用し、
-既存broker socket/stateへは接続していない。
-
-| 検査 | 結果 |
-| --- | --- |
-| `cargo test --locked --offline --manifest-path rust/Cargo.toml -- --test-threads=1` | 34 passed |
-| 実行ファイル検証追加後の `cargo test ... profiles::tests -- --test-threads=1` | 3 passed |
-| `cargo build --locked --offline --manifest-path rust/Cargo.toml` | 成功、専用target再利用 |
-| `tests/admin_profiles_stdio.py NEW OLD` | 成功。argv、設定変更、旧hash replay、異常設定、未知結果、再起動、旧broker guard、確定失敗launcherのhost非再実行 |
-| `tests/recovery_stdio.py NEW` | 成功。400 same-work工程、失敗後repair、ACK喪失、2 reader、Resources、stdin保存失敗、retirement |
-| `tests/wait_execution_stdio.py NEW` | 成功。timeout/cancel、cursor/gap、terminal、旧broker互換 |
-| `tests/stdio.py NEW` | **未通過**。最初のsandbox `write_file` が `sandboxed file write failed`。後続項目未実施 |
-| `tests/io_control.py NEW` | **未通過**。同じ初期sandbox `write_file` で停止。後続項目未実施 |
-| 標準sandboxの短命payload | 起動失敗、payload未実行、hostへfallbackなし。既知AppArmor制約のnegative結果 |
-| 実 `/usr/bin/bwrap` の独自profile | exit 1。positiveな隔離動作確認とは扱わない |
-| fmt / diff whitespace / JSON例 / Python syntax | 成功 |
-
-総合stdio/I/Oのpositive試験は、管理者が正当に整備した隔離利用可能環境で残る。
-今回OS制限を回避してテストを緑にする変更はしていない。fake launcherの成功は実bwrapの保証ではない。
-未知結果fixtureは当初の正常shutdownではexitが保存されたため、temp brokerだけをcrashするfixtureに修正し、
-保存済み実行がoutcome_unknownとして再発見されることを確認した。
-実装後のビルド・検証完了時点で空き約1164MiB。ビルド中に200MiB閾値への到達なし。
-上記はcommit/push前のローカル検証記録であり、本番反映・設定有効化は含まない。
 
 ## 公式一次資料
 

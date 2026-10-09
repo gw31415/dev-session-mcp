@@ -12,7 +12,7 @@ const DEADLINE: Duration = Duration::from_secs(120);
 pub fn tool() -> Value {
     json!({
         "name":"import_file",
-        "description":"Save a ChatGPT-provided attachment directly into the session project without putting file bytes in model context. Requires administrator-configured trusted HTTPS attachment origins. No extraction or execution. Destination must have an existing parent inside the session cwd; existing files are preserved unless overwrite=true. Returns path, size and SHA256. No partial resume; failed transfers are discarded.",
+        "description":"Download a client-provided file (download_url from an HTTPS origin the operator allowed in DEV_SESSION_MCP_FILE_ORIGINS) into the session project without passing its bytes through model context. The destination parent must exist inside the session cwd; existing files are kept unless overwrite=true. Returns path, size and SHA256.",
         "inputSchema":{"type":"object","properties":{
             "session_id":{"type":"string","maxLength":64},
             "file":{"type":"object","properties":{
