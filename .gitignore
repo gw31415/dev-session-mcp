@@ -3,3 +3,4 @@
 *.env
 library-identity.json
 target/
+*.tunnel-token
