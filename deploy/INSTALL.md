@@ -49,11 +49,33 @@ The server has **no authentication**. It binds loopback by default, rejects unkn
    curl -fsS http://127.0.0.1:8808/healthz
    ```
 
-2. Publish it with [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/): see [cloudflared.yml.example](cloudflared.yml.example) (`mcp.example.com` → `http://127.0.0.1:8808`). No inbound port is opened.
+2. Create the tunnel, DNS record and Access application with [cloudflare/setup.sh](cloudflare/setup.sh) (run anywhere with `curl` and `jq`; it is idempotent and deletes nothing). It uses the existing Zero Trust organization and admits only an existing Access group (for example the project owners) and/or listed emails:
 
-3. Protect the hostname with a Cloudflare Access **self-hosted application** with an Allow policy for your own identity only, and turn on Access's OAuth support for MCP clients (Managed OAuth), so MCP clients complete OAuth against Access. See [Secure MCP servers](https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/secure-mcp-servers/) and [Linked apps](https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/linked-apps/). Check the current dashboard names there; they change.
+   ```sh
+   export CLOUDFLARE_API_TOKEN=...   # Account: Cloudflare Tunnel Edit, Access: Apps and Policies Edit,
+                                     # Access: Organizations, Identity Providers, and Groups Read; Zone: DNS Edit
+   export CLOUDFLARE_ACCOUNT_ID=... MCP_HOSTNAME=mcp.example.com
+   export ALLOW_GROUP='project owners'          # existing Access group name, and/or
+   export ALLOW_EMAILS='you@example.com'
+   DRY_RUN=1 deploy/cloudflare/setup.sh          # preview: only GET requests
+   deploy/cloudflare/setup.sh                    # apply; writes ./dev-session-mcp.tunnel-token (0600)
+   ```
 
-4. Add `https://mcp.example.com/mcp` as a custom connector (claude.ai: Settings → Connectors; Claude Code: `claude mcp add --transport http vps https://mcp.example.com/mcp`). Verify that an unauthenticated request is rejected by Access before using it.
+   It enables Access **Managed OAuth** with dynamic client registration (localhost/loopback redirects for Claude Code and similar CLIs, plus Claude's connector callbacks; add others such as ChatGPT's via `REDIRECT_URIS`). If an Access application already exists for the hostname, its other policies are replaced by the owners policy.
+
+3. On the VPS, install cloudflared 2025.4.0+ from Cloudflare's package repository, then run the tunnel:
+
+   ```sh
+   sudo install -d -m 0755 /etc/cloudflared
+   sudo install -m 0600 dev-session-mcp.tunnel-token /etc/cloudflared/dev-session-mcp.token
+   shred -u dev-session-mcp.tunnel-token
+   sudo install -m 0644 deploy/cloudflare/cloudflared-dev-session-mcp.service /etc/systemd/system/
+   sudo systemctl daemon-reload && sudo systemctl enable --now cloudflared-dev-session-mcp.service
+   ```
+
+   Re-run `setup.sh`: its last line should report that an unauthenticated request is rejected by Access.
+
+4. Add `https://mcp.example.com/mcp` as a custom connector (claude.ai: Settings → Connectors; Claude Code: `claude mcp add --transport http vps https://mcp.example.com/mcp`). The client opens an Access login in the browser. If a client sends a browser `Origin` header, allow it with `--allowed-origin` on the HTTP frontend.
 
 `--allow-remote-bind` exists only for proxies that cannot reach loopback; never expose the port directly.
 
