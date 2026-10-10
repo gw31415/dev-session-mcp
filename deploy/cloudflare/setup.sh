@@ -16,9 +16,10 @@
 #                         Zone: DNS Edit (for the zone of MCP_HOSTNAME)
 #   CLOUDFLARE_ACCOUNT_ID
 #   MCP_HOSTNAME          e.g. mcp.example.com (its zone must be in the account)
-#   ALLOW_GROUP and/or ALLOW_EMAILS
-#                         ALLOW_GROUP: name of an existing Access group (e.g. the
-#                         project owners); ALLOW_EMAILS: comma-separated emails.
+# Who may connect (at least one must be non-empty):
+#   ALLOW_GROUP           existing Access group name (default: プロジェクトオーナー;
+#                         set ALLOW_GROUP= to use emails only)
+#   ALLOW_EMAILS          comma-separated emails (optional)
 # Optional:
 #   TUNNEL_NAME (dev-session-mcp), ORIGIN (http://127.0.0.1:8808),
 #   APP_NAME (dev-session-mcp), SESSION_DURATION (24h),
@@ -30,7 +31,8 @@ set -euo pipefail
 : "${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN}"
 : "${CLOUDFLARE_ACCOUNT_ID:?set CLOUDFLARE_ACCOUNT_ID}"
 : "${MCP_HOSTNAME:?set MCP_HOSTNAME, e.g. mcp.example.com}"
-if [ -z "${ALLOW_GROUP:-}" ] && [ -z "${ALLOW_EMAILS:-}" ]; then
+ALLOW_GROUP=${ALLOW_GROUP-プロジェクトオーナー}
+if [ -z "$ALLOW_GROUP" ] && [ -z "${ALLOW_EMAILS:-}" ]; then
   echo "set ALLOW_GROUP (existing Access group name) and/or ALLOW_EMAILS" >&2
   exit 64
 fi
@@ -108,9 +110,14 @@ fi
 
 # --- Access policy: only the existing owners group and/or listed emails.
 include='[]'
-if [ -n "${ALLOW_GROUP:-}" ]; then
-  group_id=$(api GET "$ACCOUNT/access/groups?per_page=1000" | jq -r --arg n "$ALLOW_GROUP" 'map(select(.name == $n))[0].id // empty')
-  [ -n "$group_id" ] || { log "Access group not found: $ALLOW_GROUP"; exit 1; }
+if [ -n "$ALLOW_GROUP" ]; then
+  groups=$(api GET "$ACCOUNT/access/groups?per_page=1000")
+  group_id=$(jq -r --arg n "$ALLOW_GROUP" 'map(select(.name == $n))[0].id // empty' <<<"$groups")
+  if [ -z "$group_id" ]; then
+    log "Access group not found: $ALLOW_GROUP. Existing groups:"
+    jq -r '.[].name | "  " + .' <<<"$groups" >&2
+    exit 1
+  fi
   include=$(jq -c --arg g "$group_id" '. + [{group:{id:$g}}]' <<<"$include")
   log "allow group: $ALLOW_GROUP"
 fi

@@ -49,14 +49,13 @@ The server has **no authentication**. It binds loopback by default, rejects unkn
    curl -fsS http://127.0.0.1:8808/healthz
    ```
 
-2. Create the tunnel, DNS record and Access application with [cloudflare/setup.sh](cloudflare/setup.sh) (run anywhere with `curl` and `jq`; it is idempotent and deletes nothing). It uses the existing Zero Trust organization and admits only an existing Access group (for example the project owners) and/or listed emails:
+2. Create the tunnel, DNS record and Access application with [cloudflare/setup.sh](cloudflare/setup.sh) (run anywhere with `curl` and `jq`; it is idempotent and deletes nothing). It uses the existing Zero Trust organization and admits only the existing Access group `プロジェクトオーナー` (override with `ALLOW_GROUP`, or add `ALLOW_EMAILS`):
 
    ```sh
    export CLOUDFLARE_API_TOKEN=...   # Account: Cloudflare Tunnel Edit, Access: Apps and Policies Edit,
                                      # Access: Organizations, Identity Providers, and Groups Read; Zone: DNS Edit
    export CLOUDFLARE_ACCOUNT_ID=... MCP_HOSTNAME=mcp.example.com
-   export ALLOW_GROUP='project owners'          # existing Access group name, and/or
-   export ALLOW_EMAILS='you@example.com'
+   # ALLOW_GROUP defaults to the existing Access group プロジェクトオーナー
    DRY_RUN=1 deploy/cloudflare/setup.sh          # preview: only GET requests
    deploy/cloudflare/setup.sh                    # apply; writes ./dev-session-mcp.tunnel-token (0600)
    ```
