@@ -17,7 +17,7 @@ python3 tests/e2e.py rust/target/release/dev-session-mcp
 sudo install -d -m 0755 /opt/dev-session-mcp/bin /usr/local/libexec
 sudo install -m 0755 rust/target/release/dev-session-mcp /opt/dev-session-mcp/bin/dev-session-mcp
 sudo install -m 0755 deploy/dev-session-mcp-stdio /usr/local/libexec/dev-session-mcp-stdio
-mkdir -p /home/ubuntu/projects /home/ubuntu/.local/state/dev-session-mcp-v3
+mkdir -p /home/ubuntu/.local/state/dev-session-mcp-v3
 chmod 0700 /home/ubuntu/.local/state/dev-session-mcp-v3
 ```
 
