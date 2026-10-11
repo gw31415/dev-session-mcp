@@ -194,6 +194,16 @@ fn resource_args(uri: &str) -> anyhow::Result<Value> {
     Ok(args)
 }
 
+/// Build the image result with rmcp's constructor so it carries
+/// `resultType: "complete"`; deserializing the broker JSON would leave it unset.
+fn image_result(data: &Value) -> Option<CallToolResult> {
+    let image = data["content"].get(0)?;
+    Some(CallToolResult::success(vec![ContentBlock::image(
+        image["data"].as_str()?,
+        image["mimeType"].as_str()?,
+    )]))
+}
+
 fn tool_error(message: &str) -> CallToolResponse {
     CallToolResult::error(vec![ContentBlock::text(
         workspace::bounded(message, 1024, false).0,
@@ -293,11 +303,9 @@ impl ServerHandler for Server {
             self.broker.call(args).await
         };
         Ok(match response {
-            Ok(data) if request.name == "get_image" => {
-                serde_json::from_value::<CallToolResult>(data)
-                    .map_err(|_| McpError::internal_error("invalid image response", None))?
-                    .into()
-            }
+            Ok(data) if request.name == "get_image" => image_result(&data)
+                .ok_or_else(|| McpError::internal_error("invalid image response", None))?
+                .into(),
             Ok(data) => {
                 let mut result = CallToolResult::success(vec![ContentBlock::text(
                     serde_json::to_string(&data).unwrap(),
@@ -402,6 +410,18 @@ pub async fn stdio() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_result_is_complete() {
+        let data =
+            json!({"content":[{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}]});
+        let wire = serde_json::to_value(image_result(&data).unwrap()).unwrap();
+        assert_eq!(wire["resultType"], "complete");
+        assert_eq!(wire["content"][0]["type"], "image");
+        assert_eq!(wire["content"][0]["mimeType"], "image/png");
+        assert_eq!(wire["content"][0]["data"], "iVBORw0KGgo=");
+        assert!(image_result(&json!({"content":[]})).is_none());
+    }
 
     #[test]
     fn catalog_and_discovery_capability() {
