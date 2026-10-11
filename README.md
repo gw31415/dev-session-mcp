@@ -24,6 +24,7 @@ Linux ホストを複数プロジェクトの開発環境として MCP クライ
 | checkpoint_execution | 読者別 cursor・作業目的を CAS で永続化（[復旧契約](docs/DURABLE-RECOVERY.md)） |
 | read_file, write_file, list_directory, get_image | 上限付きファイル操作。write は sandbox 内・session roots のみ |
 | import_file | クライアントが渡した HTTPS ファイルを保存（許可 origin の設定が必要、[FILE-TRANSFER](docs/FILE-TRANSFER.md)） |
+| create_upload | 1 回だけ使えるアップロード URL を発行（HTTP frontend で `--upload-base-url` 指定時のみ。claude.ai の添付をホストへ送る用、[FILE-TRANSFER](docs/FILE-TRANSFER.md#create_upload)） |
 
 典型的な流れ: `open_session({"cwd":"/home/ubuntu/projects/app"})` → `start_execution({"session_id":…,"command":["cargo","test"],"profile":"host","io":"pipes"})` → 返った `cursor` で `wait_execution` を繰り返し、応答トップレベルの `cursor` を次に渡す。
 
@@ -43,7 +44,7 @@ Linux ホストを複数プロジェクトの開発環境として MCP クライ
    ```
 3. 会話でコネクタを有効にして依頼する。対象スキルが CLI を必要とすると、こちらのスキルが併せて読み込まれ、ホスト上で実行します。
 
-制約: claude.ai の添付ファイルは `import_file` で受け取れないため、CLI の入力にするファイルは先にホストへ置くか URL で渡してください（[スキル内の手順](skills/dev-session-cli/SKILL.md#5-ユーザーの添付ファイルをホストへ渡す)）。
+添付ファイル: claude.ai の添付は `import_file` で受け取れません。HTTP frontend を `--upload-base-url` 付きで動かすと `create_upload` が有効になり、会話のコード実行サンドボックスから `curl -T` で添付をホストへ直接送れます（バイト列はモデルを通りません）。設定は [INSTALL](deploy/INSTALL.md#claudeai-attachments-create_upload)、手順は[スキル](skills/dev-session-cli/SKILL.md#5-ユーザーの添付ファイルをホストへ渡す)。
 
 ## 権限と秘密
 

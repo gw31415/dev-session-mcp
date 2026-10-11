@@ -100,13 +100,25 @@ wait_execution(execution_id, cursor, max_wait_ms=10000, view="summary")
 上から順に試す。
 
 1. **`import_file`**: クライアントがダウンロード URL / file ID を渡せる場合（ChatGPT など `openai/fileParams`
-   対応）。許可 origin の設定が必要（[FILE-TRANSFER](../../docs/FILE-TRANSFER.md)）。claude.ai は現状非対応。
-2. **既にホストにある**: ユーザーにホスト上のパスを聞き、`cp` / `ln -s` する。同期フォルダや `scp` で
+   対応）。許可 origin の設定が必要（[FILE-TRANSFER](../../docs/FILE-TRANSFER.md)）。claude.ai は非対応。
+2. **`create_upload`**（claude.ai など、添付が会話側サンドボックスにある場合）: ツール一覧に `create_upload` があれば、
+   これを使う。バイト列はモデルを通らないので、サイズを気にしなくてよい（128 MiB まで）。
+   1. サンドボックスで添付のパス（claude.ai では通常 `/mnt/user-data/uploads/` 以下）を確かめ、`sha256sum` を取る。
+      PDF から必要なページだけ画像化するなど、加工はサンドボックスで先に済ませてよい。
+   2. `create_upload(session_id, path="input/score.pdf", expected_sha256=…)`（保存先の親ディレクトリは先に作る）。
+   3. サンドボックスで `curl -fsS -T /mnt/user-data/uploads/score.pdf '<upload_url>'`。201 と sha256 が返れば完了。
+   - URL は 1 回限り・15 分で失効。失敗したら `create_upload` からやり直す。
+   - curl が接続できない（プロキシの 403、名前解決の失敗など）なら、claude.ai のコード実行でこのホストへの
+     ネットワークが許可されていない。ユーザーに「設定 → 機能 → コード実行」でホストのドメインを許可してもらうか、
+     3 以降の方法に切り替える。
+   - `create_upload` がツール一覧に無ければ、サーバーが `--upload-base-url` 無しで動いている
+     （[INSTALL](../../deploy/INSTALL.md#claudeai-attachments-create_upload)）。管理者に有効化を頼むか、3 以降へ。
+3. **既にホストにある**: ユーザーにホスト上のパスを聞き、`cp` / `ln -s` する。同期フォルダや `scp` で
    置いてもらうのが最も確実。
-3. **URL がある**: `["curl","-fsSLo",NAME,URL]`（`host`）。
-4. **最後の手段（小さいファイルのみ）**: 会話側サンドボックスで `base64 -w0` し、60 KB 以下の断片ごとに
-   `write_file` で書いて `cat f.b64.* | base64 -d > f && rm f.b64.*`。バイト列がすべてモデルを通るので
-   遅く、大量のトークンを使う。数百 KB を超えるならユーザーに 2 か 3 を頼む。
+4. **URL がある**: `["curl","-fsSLo",NAME,URL]`（`host`）。
+5. **最後の手段（数十 KB までの小さいファイルのみ）**: 会話側サンドボックスで `base64 -w0` し、断片ごとに
+   `write_file` で書いて `cat f.b64.* | base64 -d > f && rm f.b64.*`。バイト列がすべてモデルの出力を通るので
+   遅く、大量のトークンを使い、1 文字の写し間違いで壊れる。それより大きければ 2〜4 を使う。
 
 添付画像を「見る」こと自体は添付のままでよい。CLI の入力としてホスト上のファイルが必要なときだけ転送する。
 

@@ -7,6 +7,7 @@ mod files;
 mod http;
 mod profiles;
 mod server;
+mod upload;
 mod wait;
 mod workspace;
 
@@ -36,6 +37,10 @@ enum Command {
         /// Allow a non-loopback listen address (only behind an authenticating proxy).
         #[arg(long)]
         allow_remote_bind: bool,
+        /// Public base URL (e.g. https://mcp.example.com) that enables create_upload
+        /// one-time upload URLs served at <base>/upload/<token>.
+        #[arg(long)]
+        upload_base_url: Option<String>,
     },
     /// Independent same-UID execution owner (normally started automatically).
     Broker,
@@ -63,12 +68,14 @@ fn main() -> Result<()> {
                     allowed_hosts,
                     allowed_origins,
                     allow_remote_bind,
+                    upload_base_url,
                 } => {
                     http::serve(http::Options {
                         listen,
                         allowed_hosts,
                         allowed_origins,
                         allow_remote_bind,
+                        upload_base_url,
                     })
                     .await
                 }

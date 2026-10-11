@@ -1,15 +1,18 @@
 //! Streamable HTTP frontend. It has no authentication of its own: bind it to
 //! loopback and publish it only through an authenticating proxy such as
 //! Cloudflare Tunnel + Access.
-use crate::server::{Server, advertise_events};
+use crate::{
+    server::{Server, advertise_events},
+    upload::Uploads,
+};
 use anyhow::{Result, ensure};
 use axum::{
     body::{Body, Bytes, to_bytes},
-    extract::Request,
-    http::header,
+    extract::{Path, Request},
+    http::{HeaderMap, header},
     middleware::{self, Next},
     response::Response,
-    routing::get,
+    routing::{get, put},
 };
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -24,6 +27,7 @@ pub struct Options {
     pub allowed_hosts: Vec<String>,
     pub allowed_origins: Vec<String>,
     pub allow_remote_bind: bool,
+    pub upload_base_url: Option<String>,
 }
 
 pub async fn serve(options: Options) -> Result<()> {
@@ -32,7 +36,12 @@ pub async fn serve(options: Options) -> Result<()> {
         "refusing to bind {} without authentication; put an authenticating proxy in front and pass --allow-remote-bind",
         options.listen
     );
-    let server = Server::new().await?;
+    let uploads = options
+        .upload_base_url
+        .as_deref()
+        .map(Uploads::new)
+        .transpose()?;
+    let server = Server::new(uploads.clone()).await?;
     let mut hosts = vec!["localhost".to_owned(), "127.0.0.1".into(), "::1".into()];
     hosts.extend(options.allowed_hosts);
     // Stateless JSON responses serve every protocol revision on any number of
@@ -53,6 +62,19 @@ pub async fn serve(options: Options) -> Result<()> {
         .route_service("/mcp", mcp)
         .route("/healthz", get(|| async { "ok" }))
         .layer(middleware::from_fn(discovery));
+    // Added after the discovery layer so upload bodies stream instead of being
+    // buffered; the unguessable single-use token is the only authorization.
+    let app = match uploads {
+        Some(uploads) => app.route(
+            "/upload/{token}",
+            put(
+                move |Path(token): Path<String>, headers: HeaderMap, body: Body| async move {
+                    uploads.receive(&token, &headers, body).await
+                },
+            ),
+        ),
+        None => app,
+    };
     let listener = tokio::net::TcpListener::bind(options.listen).await?;
     eprintln!("dev-session-mcp listening on http://{}/mcp", options.listen);
     axum::serve(listener, app)
