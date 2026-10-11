@@ -100,8 +100,8 @@ Limits per state directory:
 
 | Evidence | Bound and behavior |
 | --- | --- |
-| Execution records / retained start keys | 128 retained records; retire eligible completed history under pressure; refuse only if unfinished/pinned evidence occupies capacity |
-| Reader checkpoints | 128; retire eligible completed executions if needed; reject when remaining readers are unfinished |
+| Execution records / retained start keys | 128 retained records; retire completed history first, then the oldest finished-but-unacknowledged work; refuse only if `starting`/`running` executions occupy capacity |
+| Reader checkpoints | 128; retire completed executions first, then the oldest finished-but-unacknowledged one; reject only when the rest reference running executions |
 | Durable output history | 1 MiB / 1024 events globally, oldest events removed |
 | Recovery snapshot | 4 MiB hard bound; new starts target at most 2 MiB metadata to leave space for logs and receipt/checkpoint growth; atomic replacement may require another 4 MiB |
 | Source argv | Existing 64 KiB serialized command bound |
@@ -119,27 +119,40 @@ error, not an empty successful result. Epoch watermarks remain while any record 
 epoch survives, so a reader's valid global cursor does not become a false future cursor
 when another execution is retired.
 
-Unfinished `starting`/`running` and `outcome_unknown` records are never retired.
-An incomplete reader checkpoint pins only its referenced execution. Explicit `work_id`,
-`purpose`, or `completion_condition` also pins a declared phase before its first checkpoint;
-confirmed process exit alone does not prove completion. A first checkpoint also
-promotes a metadata-free start to durable declared work and preserves its purpose and
-completion condition on the execution. Process events and reader moves cannot undo
-this promotion; explicit completion is still required before retirement. After verifying the condition,
-a reader can CAS `completed:true` on a checkpoint for a confirmed exited execution.
-This persists completion evidence for that phase (the existing `work_completed` field),
-without completing other phases of the same work. Retirement requires this evidence for
-declared phases and no unfinished reader referencing that execution. Later incomplete
-checkpoints do not erase the evidence: they pin their referenced phase until completed
-or moved. Moving readers cannot release a phase that was never explicitly completed.
-Thus a failed new phase does not pin completed history or prevent a repair start when
-completed history can be retired. Work purpose and completion condition remain on
-retained records and reader checkpoints, including when readers move between phases.
-Running/unknown phases are never marked complete by another phase's checkpoint.
-This is an explicit caller assertion, not an automatic
-work-completion inference. A full window of genuinely unfinished/unknown work still
-refuses new starts without discarding evidence. Operators must resolve pending work;
-no state reset or automatic replay is a recovery path.
+The window is bounded and must never grow into a pin store. "Keep it just in case"
+is not a retention policy: a record that nobody acknowledges still leaves the window.
+
+Retirement order under pressure (oldest `retention_order` first within each tier):
+
+1. Released and completed history: every `exited`/`outcome_unknown` record of a closed
+   session (released ones go first), then exited records without declared work, or
+   with `work_completed`, and no incomplete reader checkpoint referencing them.
+2. Finished but unacknowledged work: any other `exited` or `outcome_unknown` record,
+   including declared work and records referenced by incomplete checkpoints. Each such
+   retirement increments `recovery.evicted_unfinished_records` so the loss is visible.
+
+Only `starting`/`running` executions of the current broker lifetime are never retired
+(the live process limit is 64, so they cannot fill the 128-record window alone).
+`outcome_unknown` records come from previous broker lifetimes; nothing will update them,
+so they are finished evidence too.
+
+Explicit `work_id`, `purpose`, or `completion_condition` declares a phase, and a first
+checkpoint promotes a metadata-free start to declared work, preserving its purpose and
+completion condition. Declared work orders retirement (it goes after completed history),
+it does not pin. After verifying the condition, a reader should CAS `completed:true` on
+a checkpoint for a confirmed exited execution. This persists completion evidence for that
+phase (the existing `work_completed` field), without completing other phases of the same
+work, and lets that record leave the window before unacknowledged work does. This is an
+explicit caller assertion, not an automatic work-completion inference. Running/unknown
+phases are never marked complete by another phase's checkpoint.
+
+`close_session` ends the session's work: after its processes are gone, every record of
+that session is marked `session_closed` (reported as `released_records`). Its declared
+work and reader checkpoints no longer hold it; it stays readable, so the close events can
+still be observed, until the window needs room. On broker start, records of sessions
+whose session file no longer exists (closed before this rule existed) are released the
+same way.
+No state reset or automatic replay is a recovery path.
 
 Legacy keys without a generation remain replayable while their intents are retained.
 A new legacy-key miss is accepted only until the first compaction; thereafter it is

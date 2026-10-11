@@ -51,6 +51,14 @@ struct Ledger {
 }
 impl Ledger {
     fn new() -> Result<Self> {
+        let mut durable =
+            crate::durable::Store::open(workspace::state_dir()?.join("recovery.json"))?;
+        // Sessions closed before release-on-close existed still hold their records.
+        for session in durable.sessions() {
+            if !config::session_path(&session).is_ok_and(|path| path.exists()) {
+                durable.release_session(&session)?;
+            }
+        }
         Ok(Self {
             epoch: uuid::Uuid::new_v4().simple().to_string(),
             sequence: 0,
@@ -58,7 +66,7 @@ impl Ledger {
             bytes: 0,
             executions: HashMap::new(),
             changed: Arc::new(Notify::new()),
-            durable: crate::durable::Store::open(workspace::state_dir()?.join("recovery.json"))?,
+            durable,
         })
     }
     fn append(&mut self, execution: &str, kind: &str, data: Value) -> u64 {
@@ -889,8 +897,10 @@ async fn handle(
                 }
             }
             tokio::fs::remove_file(path).await?;
-            ledger.lock().unwrap().changed.notify_waiters();
-            Ok(json!({"session_id":id,"closed":true,"pending":false}))
+            let mut state = ledger.lock().unwrap();
+            state.changed.notify_waiters();
+            let released = state.durable.release_session(id)?;
+            Ok(json!({"session_id":id,"closed":true,"pending":false,"released_records":released}))
         }
         "start_execution" => {
             let _guard = starts.lock().await;

@@ -5,7 +5,7 @@ Environment: Linux x86_64, Rust 1.97.0, bubblewrap 0.9.0. Temporary state direct
 | Check | Result |
 | --- | --- |
 | `cargo build --release --locked` | OK, no warnings |
-| `cargo test --locked` | 16 passed: durable store (corrupt snapshot refusal, intent replay, retirement, pinned work, reader CAS, restart summaries), webhook signing/retry/private-callback refusal, attachment transfer and origin policy, admin profiles, wait race/deadline, HTTP discovery patch, tool catalog |
+| `cargo test --locked` | 20 passed: durable store (corrupt snapshot refusal, intent replay, retirement, declared-work ordering, unacknowledged work cannot fill the window, only running executions refuse starts, closed-session release, reader CAS, restart summaries), webhook signing/retry/private-callback refusal, attachment transfer and origin policy, admin profiles, wait race/deadline, HTTP discovery patch, tool catalog |
 | `python3 tests/e2e.py <release binary>` | PASS. Two stdio frontends (2026-07-28 `server/discover` and 2025-06-18 `initialize`) and one Streamable HTTP frontend (both lifecycles) connected at once to one broker: shared sessions/executions, Host and Origin rejection, sandbox file writes and execution, pipes, PTY input/resize across a frontend reconnect, pipe EOF, Events listing and private-callback rejection from stdio and HTTP, confirmed session close, HTTP frontend restarting a stopped broker |
 | Claude Code 2.1.295 (`claude -p` with `.mcp.json`) | Connected to the HTTP (`type: http`) and stdio servers simultaneously, started a host execution over HTTP, waited for it, and read the same execution ID over stdio |
 

@@ -254,7 +254,7 @@ def main():
             # Closing confirms exit and is visible to every frontend.
             alive = a.tool('start_execution', session_id=session, command=['/bin/sleep', '30'], profile='host', io='pipes')
             closed = h.tool('close_session', session_id=session)
-            assert closed['closed'] and not closed['pending']
+            assert closed['closed'] and not closed['pending'] and closed['released_records'] >= 1
             r, events = wait_exit(b, alive['execution_id'], alive['cursor'])
             kinds = [e['kind'] for e in events]
             assert kinds.index('closing') < kinds.index('exit') < kinds.index('closed')
