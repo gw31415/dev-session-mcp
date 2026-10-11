@@ -1,12 +1,12 @@
 [Unit]
-Description=Cloudflare Tunnel for dev-session-mcp (remotely managed; see deploy/cloudflare/setup.sh)
+Description=Cloudflare Tunnel for dev-session-mcp (remotely managed)
 After=network-online.target dev-session-mcp-http.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 DynamicUser=yes
-# Token from setup.sh, root-owned 0600; systemd hands it over without exposing it in argv.
+# Tunnel token, root-owned 0600; systemd hands it over without exposing it in argv.
 LoadCredential=token:/etc/cloudflared/dev-session-mcp.token
 # --token-file requires cloudflared 2025.4.0 or later.
 ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token-file ${CREDENTIALS_DIRECTORY}/token
