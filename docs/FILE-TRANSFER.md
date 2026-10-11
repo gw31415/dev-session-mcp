@@ -12,6 +12,17 @@ fileというtop-level fieldへopenai/fileParamsを指定しています。file 
 
 128 MiB上限、全体120秒、接続10秒、read idle20秒です。Content-Lengthと実streamの双方を制限し、圧縮body、redirect、200以外を拒否します。proxy環境を継承せず、TLS検証を維持します。秘密のURL/署名やbytesを結果・エラーへ返しません。
 
+## create_upload
+
+claude.aiは添付ファイルのdownload URL/file IDをMCPツールへ渡しません。会話側のコード実行サンドボックスには添付の実ファイルがありますが、モデルがbase64をツール引数へ書き写す方法は数百KBで実用になりません（約19万文字を誤りなく写す必要があり、失敗しやすい）。そこで向きを逆にし、ホストが受け口を用意してサンドボックスから送らせます。
+
+1. `create_upload(session_id, path, overwrite?, expected_sha256?)` が、保存先1つに束縛した使い捨てURL `<upload-base-url>/upload/<token>` を返す。tokenは乱数244bit、有効15分、1回限り（受信開始時に消費し、失敗したら発行し直す）。同時に保留できるのは64件まで。
+2. サンドボックスで `curl -fsS -T FILE URL`（HTTP PUT）。応答は201とpath/bytes/sha256のJSON。
+
+保存先の検査、0600一時ファイル、128 MiB上限、SHA256照合、no-overwriteのhard link/明示overwriteのrename、失敗時の破棄は`import_file`と同じ実装です。受信全体は600秒で打ち切ります。tokenはSHA256で保持し、ログ・エラーへ返しません。
+
+有効化はHTTP frontendの`--upload-base-url https://<公開ホスト>`だけです。未指定ならツールも経路も存在しません（stdio frontendには常に無い）。`/upload/`は`/mcp`の前段認証（Access OAuth）を通れないクライアント（サンドボックスのcurl）から呼ばれるため、そのパスだけ認証プロキシをbypassし、tokenを唯一の認可とします。tokenは認証済みMCP呼び出しでしか発行されません。サンドボックスからホストへの通信には、claude.ai側でそのドメインへのネットワーク許可が必要です（[INSTALL](../deploy/INSTALL.md#claudeai-attachments-create_upload)）。
+
 ## URL取得の信頼範囲
 
 DEV_SESSION_MCP_FILE_ORIGINSは管理者が固定wrapperに設定する完全一致のHTTPS originリストです。既定は空で、取得は拒否します。実clientが渡した配信originを確認してから設定します。公式入力仕様は配信hostの固定値を示していないため、推測のドメインやwildcardを既定許可しません。設定は認証credentialではなく取得先の制限で、作業shell/brokerへ継承しません。

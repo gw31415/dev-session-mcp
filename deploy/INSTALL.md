@@ -91,3 +91,13 @@ Use the [official tunnel-client](https://github.com/openai/tunnel-client/release
 Events need no extra service: the client supplies the `whsec_` signing secret in `events/subscribe`, and the broker delivers signed webhooks to public HTTPS:443 callbacks. The private state directory stores those secrets. See [EVENTS](../docs/EVENTS.md).
 
 `import_file` is denied until `DEV_SESSION_MCP_FILE_ORIGINS` lists the exact HTTPS origins your client uses for file downloads. See [FILE-TRANSFER](../docs/FILE-TRANSFER.md).
+
+### claude.ai attachments (create_upload)
+
+claude.ai does not pass attachments to `import_file`, so they would otherwise have to be pasted through the conversation as base64. `create_upload` instead hands out a single-use URL, and the chat's code-execution sandbox sends the file there with `curl -T`.
+
+1. Add `--upload-base-url https://mcp.example.com` to the HTTP frontend's `ExecStart` (see [dev-session-mcp-http.service](dev-session-mcp-http.service)) and restart it. Without the flag, the tool and the `/upload/` route don't exist.
+2. In Cloudflare Access, add a second self-hosted application for the path `mcp.example.com/upload/` with a single **Bypass** policy (Everyone). The sandbox's curl cannot do the OAuth login. Each URL is unguessable, single-use, expires after 15 minutes and is only issued through the authenticated `/mcp`. Leave `/mcp` itself protected. Check that `curl -X POST https://mcp.example.com/mcp` is still rejected and `curl -X PUT https://mcp.example.com/upload/x` returns 404 from the server.
+3. In claude.ai, under Settings → Capabilities → code execution, allow network egress to `mcp.example.com` (add it as an allowed domain). Otherwise the sandbox's curl is blocked.
+
+Cloudflare's plan limit on request bodies (100 MB on Free/Pro) applies on top of the server's 128 MiB limit.
