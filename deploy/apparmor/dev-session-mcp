@@ -1,0 +1,14 @@
+# Lets the installed MCP executable create the user namespace its Codex
+# sandbox (bwrap) needs on hosts that restrict unprivileged user namespaces
+# (Ubuntu 24.04+: kernel.apparmor_restrict_unprivileged_userns=1).
+# This does not disable AppArmor or the restriction for anything else.
+#
+# AppArmor attaches by the executable's resolved path, so the pattern must
+# match the real binary, not a symlink to it. It covers both the plain
+# install path and per-commit release directories.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile dev-session-mcp /opt/dev-session-mcp/{bin,releases/*}/dev-session-mcp flags=(unconfined) {
+  userns,
+}
