@@ -23,6 +23,18 @@ chmod 0700 /home/ubuntu/.local/state/dev-session-mcp-v3
 
 **Every frontend must use the same `DEV_SESSION_MCP_STATE_DIR`** (and the same `DEV_SESSION_MCP_FILE_ORIGINS` / `DEV_SESSION_MCP_PROFILES`, since whichever frontend starts the broker passes them on). Then stdio and HTTP clients share one broker, one set of sessions and one Events store. Any number of frontends may run at once.
 
+## Allow the sandbox on hosts that restrict user namespaces
+
+Ubuntu 24.04 and later set `kernel.apparmor_restrict_unprivileged_userns=1`. There the `sandbox` profile and `write_file` fail with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` (or `setting up uid map: Permission denied`). Install the profile that grants `userns` to the installed executable only:
+
+```sh
+cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns   # 1 = restricted
+sudo install -m 0644 deploy/apparmor/dev-session-mcp /etc/apparmor.d/dev-session-mcp
+sudo apparmor_parser -r /etc/apparmor.d/dev-session-mcp
+```
+
+AppArmor attaches by the resolved executable path, so keep the binary under `/opt/dev-session-mcp/bin/` or `/opt/dev-session-mcp/releases/<id>/` (or edit the pattern). The profile applies to processes started after it is loaded. Restart the frontends and the broker, which runs `sandbox` and `write_file`. A process confined by it shows `dev-session-mcp (unconfined)` in `/proc/<pid>/attr/current`.
+
 ## Option A: stdio (Claude Code over SSH, local clients)
 
 ```sh
