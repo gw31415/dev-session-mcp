@@ -109,6 +109,15 @@ def broker(state, op):
         return json.loads(s.makefile('rb').readline())
 
 
+def put(url, data):
+    request = urllib.request.Request(url, data=data, method='PUT')
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.status, response.read().decode()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode()
+
+
 def wait_exit(m, execution, cursor):
     events = []
     deadline = time.monotonic() + 20
@@ -134,7 +143,8 @@ def main():
         port = socket.create_server(('127.0.0.1', 0)).getsockname()[1]  # closed immediately; reused below
         a = Stdio(state)
         b = Stdio(state, legacy=True)  # concurrent second stdio frontend, 2025 lifecycle
-        http = subprocess.Popen([binary, 'http', '--listen', f'127.0.0.1:{port}', '--allowed-host', 'mcp.example.test'],
+        http = subprocess.Popen([binary, 'http', '--listen', f'127.0.0.1:{port}', '--allowed-host', 'mcp.example.test',
+                                 '--upload-base-url', f'http://127.0.0.1:{port}'],
                                 stderr=subprocess.PIPE, env=environment(state))
         try:
             for _ in range(200):
@@ -154,8 +164,9 @@ def main():
             init = legacy_http.request('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
                                                       'clientInfo': {'name': 'e2e-http', 'version': '1'}})
             assert init['result']['protocolVersion'] == '2025-06-18', init
-            for client in (a, b, h, legacy_http):
-                assert {t['name'] for t in client.request('tools/list')['result']['tools']} == TOOLS
+            # create_upload exists only on the HTTP frontend that serves the URLs.
+            for client, tools in ((a, TOOLS), (b, TOOLS), (h, TOOLS | {'create_upload'}), (legacy_http, TOOLS | {'create_upload'})):
+                assert {t['name'] for t in client.request('tools/list')['result']['tools']} == tools
 
             # The HTTP frontend has no authentication: it must reject foreign Host and browser Origin values.
             status, _ = h.post({'jsonrpc': '2.0', 'id': 99, 'method': 'tools/list', 'params': {'_meta': META}},
@@ -177,6 +188,24 @@ def main():
             assert a.tool('read_file', session_id=session, path='note.txt')['text'] == '日本語\n'
             h.bad_tool('write_file', session_id=session, path=str(root / 'outside.txt'), content='blocked')
             assert not (root / 'outside.txt').exists()
+
+            # One-time upload URLs store raw bytes without passing them through MCP.
+            payload = bytes(range(256)) * 4000
+            digest = __import__('hashlib').sha256(payload).hexdigest()
+            upload = h.tool('create_upload', session_id=session, path='score.bin', expected_sha256=digest)
+            assert upload['upload_url'].startswith(f'http://127.0.0.1:{port}/upload/') and upload['method'] == 'PUT'
+            status, body = put(upload['upload_url'], payload)
+            assert status == 201 and json.loads(body)['sha256'] == digest, (status, body)
+            assert (project / 'score.bin').read_bytes() == payload
+            assert put(upload['upload_url'], payload)[0] == 404  # single use
+            assert put(f'http://127.0.0.1:{port}/upload/' + '0' * 64, b'x')[0] == 404
+            h.bad_tool('create_upload', session_id=session, path='score.bin')  # existing file needs overwrite
+            h.bad_tool('create_upload', session_id=session, path=str(root / 'outside.bin'))
+            mismatch = h.tool('create_upload', session_id=session, path='bad.bin', expected_sha256='0' * 64)
+            assert put(mismatch['upload_url'], payload)[0] == 400
+            assert sorted(p.name for p in project.iterdir()) == ['note.txt', 'score.bin']
+            replaced = h.tool('create_upload', session_id=session, path='score.bin', overwrite=True)
+            assert put(replaced['upload_url'], b'new')[0] == 201 and (project / 'score.bin').read_bytes() == b'new'
 
             # Pipes keep stdout/stderr apart; a sandbox execution runs without network.
             pipe = h.tool('start_execution', session_id=session, command=['/bin/sh', '-c', 'printf out; printf err >&2'],
@@ -241,7 +270,7 @@ def main():
             assert h.tool('open_session', cwd=str(project))['id']
             assert broker(state, 'ping')['result']['epoch'] != epoch
             print('PASS: stdio (2026 + 2025 lifecycles) and Streamable HTTP frontends concurrently on one broker; '
-                  'Host/Origin checks, sandbox files and executions, pipes, PTY input/resize/reconnect, EOF, '
+                  'Host/Origin checks, one-time upload URLs, sandbox files and executions, pipes, PTY input/resize/reconnect, EOF, '
                   'broker-owned Events, confirmed close, broker restart')
         finally:
             for client in (a, b):

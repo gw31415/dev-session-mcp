@@ -1,7 +1,7 @@
 //! MCP frontends. Every frontend is stateless: the broker owns executions, the
 //! journal and Events subscriptions, so any number of stdio (e.g. tunnel-client)
 //! and Streamable HTTP clients can be connected at the same time.
-use crate::{broker::Client, events::Events, workspace};
+use crate::{broker::Client, events::Events, upload::Uploads, workspace};
 use anyhow::Result;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, Service, ServiceExt,
@@ -24,12 +24,19 @@ const INSTRUCTIONS: &str = "Open a project with open_session, then start explici
 pub struct Server {
     broker: Client,
     tools: Arc<Vec<Tool>>,
+    uploads: Option<Arc<Uploads>>,
 }
 impl Server {
-    pub async fn new() -> Result<Self> {
+    /// `uploads` is set only by the HTTP frontend, which serves the URLs.
+    pub async fn new(uploads: Option<Arc<Uploads>>) -> Result<Self> {
+        let mut tools = definitions();
+        if uploads.is_some() {
+            tools.push(crate::upload::tool());
+        }
         Ok(Self {
             broker: Client::new().await?,
-            tools: Arc::new(serde_json::from_value(json!(definitions()))?),
+            tools: Arc::new(serde_json::from_value(json!(tools))?),
+            uploads,
         })
     }
 }
@@ -292,7 +299,11 @@ impl ServerHandler for Server {
             return Err(McpError::invalid_params("unknown tool", None));
         }
         let mut args = json!(request.arguments.unwrap_or_default());
-        let response = if request.name == "wait_execution" {
+        let response = if request.name == "create_upload"
+            && let Some(uploads) = &self.uploads
+        {
+            uploads.create(&args).await
+        } else if request.name == "wait_execution" {
             tokio::select! {
                 biased;
                 _ = context.ct.cancelled() => Err(anyhow::anyhow!("wait_execution cancelled")),
@@ -399,7 +410,7 @@ impl Service<RoleServer> for EventService {
     }
 }
 pub async fn stdio() -> Result<()> {
-    EventService(Server::new().await?)
+    EventService(Server::new(None).await?)
         .serve(rmcp::transport::stdio())
         .await?
         .waiting()

@@ -2,11 +2,15 @@ use crate::{config, workspace::text};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{net::IpAddr, path::PathBuf, time::Duration};
+use std::{
+    net::IpAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
-const MAX_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_BYTES: u64 = 128 * 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(120);
 
 pub fn tool() -> Value {
@@ -93,18 +97,8 @@ impl Drop for Partial {
     }
 }
 
-pub async fn import(args: &Value) -> Result<Value> {
-    let session = config::load_session(text(args, "session_id")?).await?;
-    ensure!(
-        session.state == config::SessionState::Open,
-        "session is closing"
-    );
-    let origins = std::env::var("DEV_SESSION_MCP_FILE_ORIGINS").unwrap_or_default();
-    let url = authorized_url(text(&args["file"], "download_url")?, &origins)?;
-    ensure!(
-        !text(&args["file"], "file_id")?.is_empty(),
-        "file_id is required"
-    );
+/// The `overwrite` and `expected_sha256` arguments shared by file transfers.
+pub(crate) fn write_options(args: &Value) -> Result<(bool, Option<&str>)> {
     let expected = args
         .get("expected_sha256")
         .map(|v| v.as_str().context("invalid expected_sha256"))
@@ -120,10 +114,33 @@ pub async fn import(args: &Value) -> Result<Value> {
         .map(|v| v.as_bool().context("invalid overwrite"))
         .transpose()?
         .unwrap_or(false);
-    let path = session.cwd.join(text(args, "path")?);
+    Ok((overwrite, expected))
+}
+pub async fn import(args: &Value) -> Result<Value> {
+    let session = config::load_session(text(args, "session_id")?).await?;
+    ensure!(
+        session.state == config::SessionState::Open,
+        "session is closing"
+    );
+    let origins = std::env::var("DEV_SESSION_MCP_FILE_ORIGINS").unwrap_or_default();
+    let url = authorized_url(text(&args["file"], "download_url")?, &origins)?;
+    ensure!(
+        !text(&args["file"], "file_id")?.is_empty(),
+        "file_id is required"
+    );
+    let (overwrite, expected) = write_options(args)?;
+    let destination = destination(&session.cwd, text(args, "path")?, overwrite)?;
+    tokio::time::timeout(DEADLINE, download(url, destination, overwrite, expected))
+        .await
+        .context("attachment transfer timed out")?
+}
+/// Resolves `path` against the session project; the parent must already exist
+/// inside it and an existing destination is only accepted with `overwrite`.
+pub(crate) fn destination(cwd: &Path, path: &str, overwrite: bool) -> Result<PathBuf> {
+    let path = cwd.join(path);
     let parent = std::fs::canonicalize(path.parent().context("destination needs a parent")?)?;
     ensure!(
-        parent.starts_with(&session.cwd),
+        parent.starts_with(cwd),
         "destination parent must be inside the session project"
     );
     let name = path.file_name().context("destination needs a filename")?;
@@ -142,9 +159,7 @@ pub async fn import(args: &Value) -> Result<Value> {
         existing.as_ref().is_none_or(|m| m.is_file()),
         "destination must be a regular file"
     );
-    tokio::time::timeout(DEADLINE, download(url, destination, overwrite, expected))
-        .await
-        .context("attachment transfer timed out")?
+    Ok(destination)
 }
 async fn download(
     url: Url,
@@ -206,54 +221,98 @@ async fn save_response(
         length.is_none_or(|n| n <= max_bytes),
         "attachment exceeds byte limit"
     );
-    let partial = Partial(
-        destination
-            .parent()
-            .context("missing parent")?
-            .join(format!(
-                ".dev-session-mcp-import-{}.part",
-                uuid::Uuid::new_v4()
-            )),
-    );
-    let mut output = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&partial.0)
-        .await?;
-    let mut bytes = 0_u64;
-    let mut hash = Sha256::new();
+    let mut sink = Sink::create(&destination, max_bytes).await?;
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|_| anyhow::anyhow!("attachment body transfer failed"))?
     {
-        bytes = bytes
+        sink.write(&chunk).await?;
+    }
+    sink.finish(destination, overwrite, expected, length).await
+}
+
+/// A bounded, hashed 0600 partial file next to the destination. It is
+/// published only by `finish`; dropping it on any failure removes the part.
+pub(crate) struct Sink {
+    partial: Partial,
+    output: tokio::fs::File,
+    bytes: u64,
+    hash: Sha256,
+    max_bytes: u64,
+}
+impl Sink {
+    pub(crate) async fn create(destination: &Path, max_bytes: u64) -> Result<Self> {
+        let partial = Partial(
+            destination
+                .parent()
+                .context("missing parent")?
+                .join(format!(
+                    ".dev-session-mcp-import-{}.part",
+                    uuid::Uuid::new_v4()
+                )),
+        );
+        let output = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&partial.0)
+            .await?;
+        Ok(Self {
+            partial,
+            output,
+            bytes: 0,
+            hash: Sha256::new(),
+            max_bytes,
+        })
+    }
+    pub(crate) async fn write(&mut self, chunk: &[u8]) -> Result<()> {
+        self.bytes = self
+            .bytes
             .checked_add(chunk.len() as u64)
             .context("attachment size overflow")?;
-        ensure!(bytes <= max_bytes, "attachment exceeds byte limit");
-        hash.update(&chunk);
-        output.write_all(&chunk).await?;
+        ensure!(
+            self.bytes <= self.max_bytes,
+            "attachment exceeds byte limit"
+        );
+        self.hash.update(chunk);
+        self.output.write_all(chunk).await?;
+        Ok(())
     }
-    ensure!(
-        length.is_none_or(|n| n == bytes),
-        "attachment length mismatch"
-    );
-    let hash = format!("{:x}", hash.finalize());
-    ensure!(
-        expected.is_none_or(|e| e.eq_ignore_ascii_case(&hash)),
-        "attachment SHA256 mismatch"
-    );
-    output.sync_all().await?;
-    drop(output);
-    if overwrite {
-        tokio::fs::rename(&partial.0, &destination).await?;
-    } else {
-        // link is atomic and refuses an existing target; exists()+rename would race.
-        tokio::fs::hard_link(&partial.0, &destination).await?;
+    pub(crate) async fn finish(
+        self,
+        destination: PathBuf,
+        overwrite: bool,
+        expected: Option<&str>,
+        length: Option<u64>,
+    ) -> Result<Value> {
+        let Self {
+            partial,
+            output,
+            bytes,
+            hash,
+            ..
+        } = self;
+        ensure!(
+            length.is_none_or(|n| n == bytes),
+            "attachment length mismatch"
+        );
+        let hash = format!("{:x}", hash.finalize());
+        ensure!(
+            expected.is_none_or(|e| e.eq_ignore_ascii_case(&hash)),
+            "attachment SHA256 mismatch"
+        );
+        output.sync_all().await?;
+        drop(output);
+        if overwrite {
+            tokio::fs::rename(&partial.0, &destination).await?;
+        } else {
+            // link is atomic and refuses an existing target; exists()+rename would race.
+            tokio::fs::hard_link(&partial.0, &destination).await?;
+        }
+        Ok(json!({"path":destination,"bytes":bytes,"sha256":hash}))
     }
-    Ok(json!({"path":destination,"bytes":bytes,"sha256":hash}))
 }
 
 #[cfg(test)]
