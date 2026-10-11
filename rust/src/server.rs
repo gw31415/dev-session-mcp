@@ -69,7 +69,7 @@ fn definitions() -> Vec<Value> {
     );
     add(
         "close_session",
-        "Kill the session's running executions, confirm their exit and remove the session. If pending=true, call again later. Project files are kept.",
+        "Kill the session's running executions, confirm their exit, remove the session and release its execution records so they leave the bounded record window first (released_records). If pending=true, call again later. Project files are kept.",
         json!({"session_id":id}),
         &["session_id"],
         false,
@@ -118,7 +118,7 @@ fn definitions() -> Vec<Value> {
     );
     add(
         "checkpoint_execution",
-        "Persist a reader's processed cursor and work purpose with compare-and-set (expected_revision, 0 creates). Set completed=true only after verifying the work is done and the process exited.",
+        "Persist a reader's processed cursor and work purpose with compare-and-set (expected_revision, 0 creates). Set completed=true only after verifying the work is done and the process exited; completed records leave the bounded record window before unacknowledged ones.",
         json!({"execution_id":id,"reader_id":id,"cursor":id,"completed":{"type":"boolean"},"expected_revision":{"type":"integer","minimum":0},"purpose":{"type":"string","maxLength":2048},"completion_condition":{"type":"string","maxLength":2048}}),
         &["execution_id", "reader_id", "cursor", "expected_revision"],
         false,

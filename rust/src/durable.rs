@@ -29,6 +29,8 @@ struct Data {
     epoch_positions: BTreeMap<String, u64>,
     #[serde(default)]
     retired: u64,
+    #[serde(default)]
+    evicted_unfinished: u64,
 }
 fn legacy_default() -> bool {
     true
@@ -298,41 +300,54 @@ impl Store {
     }
     pub fn recovery_info(&self) -> Value {
         json!({"key_generation":self.data.generation,"legacy_keys_accepted":self.data.legacy_keys,
-            "retired_records":self.data.retired,"record_limit":RECORDS,"checkpoint_limit":CHECKPOINTS})
+            "retired_records":self.data.retired,"evicted_unfinished_records":self.data.evicted_unfinished,"record_limit":RECORDS,"checkpoint_limit":CHECKPOINTS})
     }
-    fn retire_one(&mut self, exclude: Option<&str>, needs_checkpoint: bool) -> bool {
-        let candidate = self
-            .data
+    fn candidate(
+        &self,
+        exclude: Option<&str>,
+        needs_checkpoint: bool,
+        pinned: bool,
+    ) -> Option<String> {
+        let checkpoints = &self.data.checkpoints;
+        self.data
             .records
             .iter()
             .filter(|(id, record)| {
-                record["status"] == "exited"
-                    && (record["retain_work"] != true || record["work_completed"] == true)
-                    && exclude != Some(id.as_str())
-                    && (!needs_checkpoint
-                        || self
-                            .data
-                            .checkpoints
-                            .values()
-                            .any(|cp| cp["execution_id"] == id.as_str()))
-                    && !self
-                        .data
-                        .checkpoints
-                        .values()
-                        .any(|cp| cp["execution_id"] == id.as_str() && cp["completed"] != true)
+                let referenced = |unfinished: bool| {
+                    checkpoints.values().any(|cp| {
+                        cp["execution_id"] == id.as_str()
+                            && (!unfinished || cp["completed"] != true)
+                    })
+                };
+                let eligible = if pinned {
+                    // Only a live broker can still change these; everything else is
+                    // finished evidence whatever its declared work says.
+                    matches!(
+                        record["status"].as_str(),
+                        Some("exited" | "outcome_unknown")
+                    )
+                } else {
+                    (record["session_closed"] == true
+                        && matches!(
+                            record["status"].as_str(),
+                            Some("exited" | "outcome_unknown")
+                        ))
+                        || (record["status"] == "exited"
+                            && (record["retain_work"] != true || record["work_completed"] == true)
+                            && !referenced(true))
+                };
+                eligible && exclude != Some(id.as_str()) && (!needs_checkpoint || referenced(false))
             })
-            .min_by_key(|(id, _)| {
-                self.data
-                    .records
-                    .get(*id)
-                    .and_then(|v| v["retention_order"].as_u64())
-                    .unwrap_or(0)
+            .min_by_key(|(_, record)| {
+                (
+                    record["session_closed"] != true,
+                    record["retention_order"].as_u64().unwrap_or(0),
+                )
             })
-            .map(|(id, _)| id.clone());
-        let Some(id) = candidate else {
-            return false;
-        };
-        self.data.records.remove(&id);
+            .map(|(id, _)| id.clone())
+    }
+    fn remove(&mut self, id: &str) {
+        self.data.records.remove(id);
         self.data.intents.retain(|_, v| v["execution_id"] != id);
         self.data.checkpoints.retain(|_, v| v["execution_id"] != id);
         self.data.events.retain(|v| v["execution_id"] != id);
@@ -345,9 +360,56 @@ impl Store {
                     .is_some_and(|(e, _)| e == epoch)
             })
         });
+    }
+    // The window is bounded, never a pin store: closed sessions and completed history go first, then the
+    // oldest finished-but-unacknowledged work. Only live starting/running processes hold.
+    fn retire_one(&mut self, exclude: Option<&str>, needs_checkpoint: bool) -> bool {
+        if let Some(id) = self.candidate(exclude, needs_checkpoint, false) {
+            self.remove(&id);
+            return true;
+        }
+        let Some(id) = self.candidate(exclude, needs_checkpoint, true) else {
+            return false;
+        };
+        self.remove(&id);
+        self.data.evicted_unfinished = self.data.evicted_unfinished.saturating_add(1);
         true
     }
-    // Retire only completed and unpinned evidence; never forget an old key in a valid keyspace.
+    /// A closed session cannot continue its work, so its records stop waiting for an
+    /// acknowledgement nobody will send and become the first to leave the window.
+    /// They stay readable until room is needed, so the close events remain observable.
+    pub fn release_session(&mut self, session: &str) -> Result<usize> {
+        ensure!(
+            !self.fault,
+            "recovery persistence unavailable; session evidence kept"
+        );
+        let before = self.data.clone();
+        let mut released = 0;
+        for record in self.data.records.values_mut() {
+            if record["session_id"] == session
+                && record["session_closed"] != true
+                && !matches!(record["status"].as_str(), Some("starting" | "running"))
+            {
+                record["session_closed"] = json!(true);
+                released += 1;
+            }
+        }
+        if released > 0
+            && let Err(error) = self.save()
+        {
+            self.data = before;
+            return Err(error);
+        }
+        Ok(released)
+    }
+    pub fn sessions(&self) -> std::collections::BTreeSet<String> {
+        self.data
+            .records
+            .values()
+            .filter_map(|v| v["session_id"].as_str().map(str::to_owned))
+            .collect()
+    }
+    // Never forget an old key in a valid keyspace: retirement always rotates the generation.
     fn make_room(&mut self, incoming: usize) -> Result<()> {
         let mut retired = false;
         while self.data.records.len() + incoming > RECORDS
@@ -362,7 +424,7 @@ impl Store {
         {
             ensure!(
                 self.retire_one(None, false),
-                "recovery capacity occupied by unfinished/unknown work; no execution started"
+                "recovery capacity occupied by running executions; no execution started"
             );
             retired = true;
         }
@@ -433,6 +495,7 @@ impl Store {
         for field in [
             "work_completed",
             "retain_work",
+            "session_closed",
             "purpose",
             "completion_condition",
             "retention_order",
@@ -628,7 +691,7 @@ impl Store {
         if !self.data.checkpoints.contains_key(&key) && self.data.checkpoints.len() >= CHECKPOINTS {
             ensure!(
                 self.retire_one(Some(id), true),
-                "checkpoint capacity occupied by unfinished readers"
+                "checkpoint capacity occupied by running executions"
             );
             self.data.generation = uuid::Uuid::new_v4().simple().to_string();
             self.data.legacy_keys = false;
@@ -814,8 +877,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn declared_work_is_pinned_until_explicit_completion_even_without_initial_reader() -> Result<()>
-    {
+    fn declared_work_outlives_completed_history_until_explicit_completion() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut store = Store::open(temp.path().join("recovery.json"))?;
         let mut work = record("work", "exited");
@@ -828,6 +890,71 @@ mod tests {
         store.checkpoint(&json!({"execution_id":"work","reader_id":"owner","cursor":"epoch:0","expected_revision":0,"completed":true}))?;
         store.reserve(record("next", "exited"), None, "hash".into())?;
         assert!(store.record("work").is_none());
+        Ok(())
+    }
+    #[test]
+    fn unacknowledged_work_cannot_fill_the_window() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut store = Store::open(temp.path().join("recovery.json"))?;
+        store.reserve(record("live", "running"), None, "hash".into())?;
+        for n in 0..RECORDS + 10 {
+            let mut work = record(&format!("work{n}"), "exited");
+            work["retain_work"] = json!(true);
+            store.reserve(work, None, "hash".into())?;
+            store.checkpoint(&json!({"execution_id":format!("work{n}"),"reader_id":"reader","cursor":"epoch:0","expected_revision":0}))?;
+        }
+        assert_eq!(store.records().len(), RECORDS);
+        assert!(store.record("live").is_some());
+        assert!(store.record("work0").is_none());
+        assert!(store.record(&format!("work{}", RECORDS + 9)).is_some());
+        assert_eq!(store.recovery_info()["evicted_unfinished_records"], 11);
+        Ok(())
+    }
+    #[test]
+    fn only_running_executions_refuse_new_starts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut store = Store::open(temp.path().join("recovery.json"))?;
+        for n in 0..RECORDS {
+            store.reserve(record(&n.to_string(), "running"), None, "hash".into())?;
+        }
+        assert!(
+            store
+                .reserve(record("next", "exited"), None, "hash".into())
+                .is_err()
+        );
+        assert_eq!(store.records().len(), RECORDS);
+        Ok(())
+    }
+    #[test]
+    fn closing_a_session_releases_its_records_first() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("recovery.json");
+        let mut store = Store::open(path.clone())?;
+        let mut other = record("other", "exited");
+        other["session_id"] = json!("other-session");
+        store.reserve(other, None, "hash".into())?;
+        let mut work = record("work", "exited");
+        work["retain_work"] = json!(true);
+        store.reserve(work, None, "hash".into())?;
+        store.checkpoint(&json!({"execution_id":"work","reader_id":"reader","cursor":"epoch:0","expected_revision":0}))?;
+        store.reserve(record("unknown", "outcome_unknown"), None, "hash".into())?;
+        store.reserve(record("live", "running"), None, "hash".into())?;
+        assert_eq!(store.release_session("session")?, 2);
+        assert_eq!(store.release_session("session")?, 0);
+        // Still readable after close; the window only shrinks under pressure.
+        assert!(store.record("work").is_some());
+        drop(store);
+        let mut store = Store::open(path)?;
+        for n in 0..RECORDS - 2 {
+            let mut next = record(&n.to_string(), "exited");
+            next["session_id"] = json!("other-session");
+            store.reserve(next, None, "hash".into())?;
+        }
+        // Released records leave before older completed history of open sessions.
+        assert!(store.record("work").is_none() && store.record("unknown").is_none());
+        assert!(store.record("other").is_some() && store.record("live").is_some());
+        assert!(store.checkpoints().is_empty());
+        assert_eq!(store.recovery_info()["evicted_unfinished_records"], 0);
         Ok(())
     }
     #[test]
