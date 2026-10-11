@@ -32,6 +32,19 @@ Linux ホストを複数プロジェクトの開発環境として MCP クライ
 - 開始・入力の結果が不明な場合は自動再送せず、`idempotency_key` / execution_id で `list_sessions` から回収します。
 - 管理者定義 profile（`admin:<id>`）は `/etc/dev-session-mcp/profiles.json`（`DEV_SESSION_MCP_PROFILES` で変更可）から読み込む生 bubblewrap 設定です。[設計](docs/SANDBOX-PROFILES-DESIGN.md)、[例](examples/admin-profiles.json)。
 
+## claude.ai などで使う（スキル）
+
+ローカルの CLI を前提にしたスキルを、オンラインの会話（claude.ai、モバイル、Desktop のチャット、ChatGPT など）でも使えるように、汎用スキル [`skills/dev-session-cli/`](skills/dev-session-cli/SKILL.md) を同梱しています。dev-session-mcp の先のホストを「ローカル」とみなし、CLI の実行・ファイル操作・画像の確認・同梱スクリプトの配置を dev-session-mcp のツールへ読み替えます。対象のスキルは変更不要です。
+
+1. HTTP で公開し（[INSTALL](deploy/INSTALL.md)）、claude.ai の「設定 → コネクタ → カスタムコネクタを追加」で `https://<ホスト>/mcp` を登録する。
+2. スキルを zip にして、claude.ai の「設定 → 機能 → スキル」からアップロードする（コード実行の有効化が必要）。使いたい対象スキル（例: [audiveris-native の score-transcription](https://github.com/gw31415/audiveris-native/tree/main/skills/score-transcription)）も同じようにアップロードする。
+   ```sh
+   cd skills && zip -r dev-session-cli.zip dev-session-cli
+   ```
+3. 会話でコネクタを有効にして依頼する。対象スキルが CLI を必要とすると、こちらのスキルが併せて読み込まれ、ホスト上で実行します。
+
+制約: claude.ai の添付ファイルは `import_file` で受け取れないため、CLI の入力にするファイルは先にホストへ置くか URL で渡してください（[スキル内の手順](skills/dev-session-cli/SKILL.md#5-ユーザーの添付ファイルをホストへ渡す)）。
+
 ## 権限と秘密
 
 **`host` は本人の OS ユーザーの全ファイル・ネットワーク権限を承認なしで使います。** `sandbox` は session roots への書込みだけを許可し、ネットワークを遮断します（pipes のみ、host へ自動降格しません）。read_file / list_directory / get_image は OS ユーザーの権限で読みます。
