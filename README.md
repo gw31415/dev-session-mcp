@@ -32,6 +32,7 @@ Linux ホストを複数プロジェクトの開発環境として MCP クライ
 - journal は全体で直近 1 MiB / 1,024 events、ページは 32 KiB。`catch_up_required` は欠落、`more` は続きがあることを示します。
 - 開始・入力の結果が不明な場合は自動再送せず、`idempotency_key` / execution_id で `list_sessions` から回収します。
 - 管理者定義 profile（`admin:<id>`）は `/etc/dev-session-mcp/profiles.json`（`DEV_SESSION_MCP_PROFILES` で変更可）から読み込む生 bubblewrap 設定です。[設計](docs/SANDBOX-PROFILES-DESIGN.md)、[例](examples/admin-profiles.json)。
+- 運用者の追記（`/etc/dev-session-mcp/instructions.md`、`DEV_SESSION_MCP_INSTRUCTIONS` で変更可）は MCP の instructions の末尾に足され、接続したエージェント全員に届きます。後片付けの決まりなど、ホストごとの約束事に使います。無ければ追記しません。8 KiB まで。
 
 ## claude.ai などで使う（スキル）
 

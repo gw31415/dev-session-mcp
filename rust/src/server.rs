@@ -9,7 +9,11 @@ use rmcp::{
     service::{NotificationContext, RequestContext},
 };
 use serde_json::{Value, json};
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 /// 2026-07-28 uses `server/discover`; earlier revisions use `initialize`.
 const VERSIONS: [ProtocolVersion; 4] = [
@@ -20,11 +24,57 @@ const VERSIONS: [ProtocolVersion; 4] = [
 ];
 const INSTRUCTIONS: &str = "Open a project with open_session, then start explicit argv executions. profile=host has the OS user's full file and network rights; profile=sandbox limits writes to the session roots and disables network. Follow output with wait_execution (view=summary is compact) and pass back the returned top-level cursor; read_execution recovers after reconnects or gaps. Never blindly resend a start or stdin whose result was uncertain: recover through list_sessions/open_session by execution_id or idempotency_key. Events (execution.events, webhook) are optional push delivery.";
 
+/// Host-specific conventions (e.g. cleanup rules) that every connecting agent
+/// must see, appended to `INSTRUCTIONS`. Same layout as the admin profiles:
+/// an absolute path in the environment, else this default, absent means none.
+const OPERATOR_INSTRUCTIONS_ENV: &str = "DEV_SESSION_MCP_INSTRUCTIONS";
+const OPERATOR_INSTRUCTIONS_PATH: &str = "/etc/dev-session-mcp/instructions.md";
+/// Clients put instructions into the model context on every connection.
+const OPERATOR_INSTRUCTIONS_MAX: u64 = 8 * 1024;
+
+fn instructions() -> Result<String> {
+    let explicit = std::env::var_os(OPERATOR_INSTRUCTIONS_ENV).map(PathBuf::from);
+    instructions_from(
+        explicit
+            .as_deref()
+            .unwrap_or(Path::new(OPERATOR_INSTRUCTIONS_PATH)),
+        explicit.is_some(),
+    )
+}
+
+fn instructions_from(path: &Path, explicit: bool) -> Result<String> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "operator instructions path must be absolute"
+    );
+    let extra = match std::fs::metadata(path) {
+        // Fail at startup rather than silently dropping rules the operator asked for.
+        Err(e) if explicit || e.kind() != std::io::ErrorKind::NotFound => {
+            anyhow::bail!("operator instructions unavailable: {e}")
+        }
+        Err(_) => return Ok(INSTRUCTIONS.to_owned()),
+        Ok(meta) => {
+            anyhow::ensure!(
+                meta.is_file() && meta.len() <= OPERATOR_INSTRUCTIONS_MAX,
+                "operator instructions must be a regular file of at most {OPERATOR_INSTRUCTIONS_MAX} bytes"
+            );
+            std::fs::read_to_string(path)?
+        }
+    };
+    let extra = extra.trim();
+    Ok(if extra.is_empty() {
+        INSTRUCTIONS.to_owned()
+    } else {
+        format!("{INSTRUCTIONS}\n\n{extra}")
+    })
+}
+
 #[derive(Clone)]
 pub struct Server {
     broker: Client,
     tools: Arc<Vec<Tool>>,
     uploads: Option<Arc<Uploads>>,
+    instructions: Arc<str>,
 }
 impl Server {
     /// `uploads` is set only by the HTTP frontend, which serves the URLs.
@@ -37,6 +87,7 @@ impl Server {
             broker: Client::new().await?,
             tools: Arc::new(serde_json::from_value(json!(tools))?),
             uploads,
+            instructions: instructions()?.into(),
         })
     }
 }
@@ -229,7 +280,7 @@ impl ServerHandler for Server {
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
         ))
-        .with_instructions(INSTRUCTIONS)
+        .with_instructions(self.instructions.as_ref())
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tools.iter().find(|t| t.name == name).cloned()
@@ -432,6 +483,28 @@ mod tests {
         assert_eq!(wire["content"][0]["mimeType"], "image/png");
         assert_eq!(wire["content"][0]["data"], "iVBORw0KGgo=");
         assert!(image_result(&json!({"content":[]})).is_none());
+    }
+
+    #[test]
+    fn operator_instructions_are_appended() {
+        let dir = std::env::temp_dir().join(format!("dsm-instructions-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("instructions.md");
+        std::fs::write(&file, "  Clean up finished work.\n").unwrap();
+        assert_eq!(
+            instructions_from(&file, false).unwrap(),
+            format!("{INSTRUCTIONS}\n\nClean up finished work.")
+        );
+        std::fs::write(&file, "\n").unwrap();
+        assert_eq!(instructions_from(&file, true).unwrap(), INSTRUCTIONS);
+        std::fs::write(&file, "x".repeat(OPERATOR_INSTRUCTIONS_MAX as usize + 1)).unwrap();
+        assert!(instructions_from(&file, false).is_err());
+
+        let missing = dir.join("missing.md");
+        assert_eq!(instructions_from(&missing, false).unwrap(), INSTRUCTIONS);
+        assert!(instructions_from(&missing, true).is_err());
+        assert!(instructions_from(Path::new("relative.md"), true).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
